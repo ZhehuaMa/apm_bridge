@@ -11,3 +11,7 @@ build/
 src/test
 src/test.cpp
 **/__pycache__/
+dist/
+deploy/
+.github/
+.agents/
