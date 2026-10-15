@@ -1,5 +1,7 @@
 # 生产开发板部署与验收
 
+> 2026-10-15 开发环境迁移说明：源码位于 `mzh:/home/mzh/nickluo/apm_bridge`，见 `AGENTS.local.md`。本文的生产板路径与既往部署记录保留原义。`firefly-production` 是原工作站的 SSH 别名，远程开发机尚未配置；部署前须先验证访问配置。
+
 ## 环境与发布内容
 
 - SSH：`ssh firefly-production`，当前地址为 `root@192.168.77.218`。
@@ -12,6 +14,10 @@
 - 云台：`/dev/ttyS10`，115200 波特率，C20S。
 
 飞控需要运行启用 `USE_CUSTOM_LINK` 的定制 Betaflight 固件。飞控实际接线 UART 必须配置为 `CUSTOM_LINK` 功能，并与开发板使用相同波特率。
+
+## Build architecture and historical board procedure
+
+An ARM64 container is not required to compile this package. The current default x86_64 image can build native host tests and cross-compile both ARM64 executables with the real ARM64 `quadrotor_msgs` dependency. See [build and test instructions](build-and-test.md). The board build below remains a supported alternative and preserves the dated production procedure. Cross-build/link checks do not replace the physical protocol and ROS telemetry acceptance below.
 
 ## 1. 上传源码
 
