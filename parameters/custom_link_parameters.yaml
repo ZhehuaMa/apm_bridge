@@ -22,7 +22,7 @@ custom_link_bridge:
       D:  0.0119440187
       n:  1
       # 推力指令上限; 兼作 thrustToForce 反演曲线的拟合域上界 [0, thrust_limit]
-      thrust_limit: 0.5
+      thrust_limit: 0.6
       spin_k: 0.0
       vbat_a: -0.0776732
       vbat_b:  2.7346374
