@@ -87,7 +87,7 @@ custom_link_bridge:
       # roll_min: -50.0    # deg
       # roll_max: 50.0
       # pitch_min: -135.0
-      # pitch_max: 40.0
+      pitch_max: 85.0
       # pitch_roll_speed_scale: 12.0
       # yaw_speed_scale: 10.0
       # ---- C-20S HORIZON 单轴俯仰逻辑 ----
