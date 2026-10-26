@@ -1,0 +1,22 @@
+[Unit]
+Description=APM custom-link bridge and bench PID tuner (prebuilt)
+After=local-fs.target network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+CPUAffinity=0-3
+ExecStartPre=/bin/bash /opt/apm_bridge-binary/current/performance.sh
+ExecStart=/opt/apm_bridge-binary/current/run.sh
+WorkingDirectory=/opt/apm_bridge-binary/current
+Environment=ROS_LOG_DIR=/var/log/apm_bridge
+LogsDirectory=apm_bridge
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

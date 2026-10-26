@@ -5,7 +5,7 @@ The default development image is `drone-tracker-rk3576:humble-amd64-rknn2.3.2` (
 | Mode | Output | Checks and boundaries |
 | --- | --- | --- |
 | Native amd64 image | x86_64 `custom_link_bridge_node`, `gimbal_selftest` and message libraries | Real ROS dependencies; current test results are recorded below. |
-| Cross compiler in amd64 image | ARM64 versions of both executables and messages | Clean build, target dependency resolution and all three virtual-serial protocol simulations verified on 2026-10-15. Running needs ARM64 Linux or QEMU. |
+| Cross compiler in amd64 image | ARM64 versions of both executables and messages | Clean build, target dependency resolution and all three virtual-serial protocol simulations verified on 2026-10-26. Running needs ARM64 Linux or QEMU. |
 | Explicit ARM64 image | ARM64 versions of both executables and messages | Historical build and virtual-serial simulation verified under QEMU; hardware remains separate. |
 
 Always build the actual adjacent `quadrotor_msgs` source for the same target,
@@ -158,6 +158,61 @@ and protocol harness. Native tests do not establish ARM runtime behavior;
 run target tests on ARM64 or through an explicitly configured emulator.
 Compilation and loader inspection do not prove physical device behavior.
 
+## Package an ARM64 runtime
+
+Package the installed application and messages from the same ARM64 build.
+The collector reads these files; it does not compile them. It verifies that
+the collected Linux executables and Python extensions target ARM64.
+It can run on the x86_64 host or in the default image. This example collects
+the cross-build above with read-only input mounts:
+
+```bash
+mkdir -p /tmp/apm_bridge-packages
+docker run --rm --network none --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -e APM_BRIDGE_SOURCE_COMMIT="$(git -C /home/mzh/nickluo/apm_bridge rev-parse HEAD)" \
+  -v /home/mzh/nickluo/apm_bridge:/src/apm_bridge:ro \
+  -v /tmp/apm_bridge-cross/install:/inputs:ro \
+  -v /tmp/apm_bridge-packages:/packages \
+  drone-tracker-rk3576:humble-amd64-rknn2.3.2 bash -lc '
+    set -eo pipefail
+    source /opt/ros/humble/setup.bash
+    python3 /src/apm_bridge/deploy/binary/collect_runtime.py \
+      --templates /src/apm_bridge/deploy/binary \
+      --app-prefix /inputs/apm_bridge \
+      --messages-prefix /inputs/quadrotor_msgs \
+      --output /packages \
+      --source-commit "$APM_BRIDGE_SOURCE_COMMIT"
+  '
+```
+
+The package includes `custom_link_bridge_node`, the installed
+`bench_pid_tuner` and its Python helpers, both parameter files, and the
+custom message C/C++ libraries and Python bindings. The Python bindings are
+generated code and compiled extensions that let the tuner use custom ROS
+messages and services. ROS 2 Humble, system Python 3.10, `rclpy`, NumPy and
+PyYAML remain target runtime prerequisites. On the target, `install.sh --check`
+validates dynamic-library dependencies and Python imports against those
+installed runtimes before deployment.
+The launcher supervises both processes: if either exits unexpectedly, it
+stops the companion and returns failure so systemd can restart them together.
+All five bridge topic remappings from the source launch are retained.
+
+The tuner is packaged and started with both `enabled=false` and
+`rig_confirmed=false` by default. Append `--enable-bench-pid` to the collector
+command to set both packaged flags to true. This does not start a tuning
+trial; the tuner's existing telemetry checks and RC switch sequence still
+apply. To override a foreground launch, use `run.sh --enable-bench-pid` or
+`run.sh --disable-bench-pid`. For the installed service, set the single
+`BENCH_PID_ENABLED=true|false` switch in `/etc/apm_bridge/runtime.env` and
+restart `apm-bridge`. The launcher applies that value to both ROS parameters,
+including when it overrides a custom tuner YAML.
+
+See [production deployment](production-deployment.md#binary-release-deployment)
+for installation, configuration backups and target acceptance. Packaging
+checks do not replace the separate native tests or physical acceptance.
+
 ## Fallback and evidence
 
 For an explicit ARM64-image fallback, take the native recipe, change `--platform linux/amd64` to `--platform linux/arm64`, and select `drone-tracker-rk3576:humble-arm64-rknn2.3.2`. Use a separate host output directory such as `/tmp/apm_bridge-arm64-image`. That compiler produces ARM64 output without the cross toolchain. On this x86_64 host its compiler and test programs run through QEMU, an ARM instruction emulator. A failed build or test is not a reason to switch architecture silently.
@@ -172,7 +227,7 @@ its machine field identifies ARM64 or x86_64 output. The parent workspace's
 `docs/amd64-build-validation-20261015.md` retain the historical summaries.
 These dated results do not certify the current checkout or physical devices.
 
-## Current native verification (2026-10-23)
+## Historical native verification (2026-10-23)
 
 A clean native build of the adjacent messages and `apm_bridge` succeeded on
 image `025d0aa88983b0646a1b7a4d25cbc13dc96a6206e0148475bbfd5fad15057421`.
@@ -197,3 +252,91 @@ Build/test logs are under
 `/tmp/apm-bridge-cleanup-20261023-colvlfre/native/`; this temporary directory
 may be removed by the operating system. These results do not include an
 AirSim RPC build, new ARM64 validation, or physical device acceptance.
+
+## Native and ARM64 release verification (2026-10-26)
+
+Source branch `rk3576` at `ed0be957a1d393b06dda4776c7930a205bd9159c`
+was rebuilt from clean output directories with adjacent `quadrotor_msgs` at
+`bc8bf6cbf30f30593bf978d878ad448af5f9cc20`. The native build used the same
+`025d0aa8...` image ID recorded above with `BUILD_TESTING=ON`. The ARM64
+cross-build used its target toolchain with `BUILD_TESTING=OFF`. Both built
+`custom_link_bridge_node` and `gimbal_selftest`, with camera RPC disabled.
+Source mounts were read-only, and build, install and log outputs were outside
+source. The installed tuner and message files came from these fresh builds.
+
+The initial native CTest run discovered eight groups and passed six:
+
+| Group | Result |
+| --- | --- |
+| `gimbal_tracking_test` | Passed |
+| `sitl_bridge_test` | 17 cases passed; two failed for the thrust-limit expectation and missing CSV described above |
+| `bench_pid_test` | All 111 cases passed |
+| `bench_angle_link_test` | Failed to locate its hard-coded executable; its one case passed in a separate rerun with a matching read-only `/build` mount |
+| `gimbal_node_test` | All four cases passed |
+| `gimbal_protocol_test` | Passed |
+| `sitl_relay_test` | Passed |
+| `gimbal_interface_test` | Passed |
+
+The separate CLI service regression passed both cases. The full native suite
+is not reported as passing. The C200T protocol failure from 2026-10-23 was not
+observed in this run. All three protocol models also passed separately with
+the fresh ARM64 `gimbal_selftest` through QEMU 8.2.2.
+
+ARM64 runtime checks verified executable/library architecture, dependency
+resolution, `ControlCommand` and `LowLevelFeedback` serialization, and
+`CliCommand` request/response serialization and ROS CLI discovery. The
+release supervisor started both real ARM64 nodes, preserved all five bridge
+topic remappings, and stopped both on normal shutdown or a child failure.
+Startup used a virtual serial port with the absent gimbal and receiver
+binding disabled. That particular release explicitly enabled the tuner with
+both `enabled=true` and `rig_confirmed=true`; this is a release override of
+the disabled source defaults. Its installer and supervisor were copied from
+the previous deployment package, rather than generated by the repository's
+then-current deployment tools.
+
+The release report is
+`dist/apm_bridge-ubuntu22.04-arm64-20261026-ed0be957a1d3-42896589-cpu0-3-performance-two-nodes-enabled.BUILD-RESULT.txt`.
+Detailed logs remain under `/tmp/apm-bridge-release-20261026-Nt22FE/` and in
+the release archive's `validation/` directory. Temporary host files can be
+removed by the operating system. No board installation, systemd activation,
+physical FC/gimbal check, serial time-sync drift check, firmware SITL test or
+live AirSim camera/flight test ran. Emulated startup and protocol checks do
+not establish physical device or flight acceptance.
+
+## Deployment tooling verification (2026-10-26)
+
+The maintained repository deployment tools were verified separately from
+the earlier release above. Eight focused tests passed with:
+
+```bash
+python3 -B -m unittest discover -s deploy/binary/tests -v
+```
+
+All five deployment shell scripts passed Bash syntax checks. Default and
+enabled bundles were collected from the same fresh ARM64 application and
+message installs. With real ARM64 processes under QEMU, both bundles passed
+library dependency checks, custom interface serialization and discovery,
+two-node startup on CPUs 0–3, all five bridge remappings, clean shutdown,
+and companion cleanup after a child failure. The default tuner's actual
+parameters were `enabled=false` and `rig_confirmed=false`, with state
+`DISABLED`. The enabled variant loaded both as true and reached `IDLE`.
+The source deployment wrapper also started both native nodes with each
+choice, using the release's local install without the historical message
+workspace. `APM_MESSAGES_SETUP` is now an optional explicit override.
+
+The actual installer passed `--check`, default installation and enabled
+installation in a disposable ARM64 container. An injected service-start
+failure restored all three configuration files, the service unit, release
+link, service state and CPU/NPU performance settings. These transaction
+checks used simulated UART devices and sysfs files (the kernel's hardware
+settings interface), plus a `systemctl` stub that recorded service operations.
+They establish installer behavior in
+that controlled environment; no real board or systemd service was tested.
+
+Evidence is under `/tmp/apm-bridge-deployment-fix-20261026-YyCXH6/`, including
+`final/default-runtime.log`, `final/enabled-runtime.log`,
+`source-wrapper-checks.log` and `install-checks.log`. The native CTest suite
+was not rerun for this tooling change because C++, CMake and dependencies
+were unchanged. Its earlier failures remain recorded above. Physical
+devices, firmware, live AirSim and flight acceptance remain outside these
+deployment checks.

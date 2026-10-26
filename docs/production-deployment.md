@@ -28,8 +28,10 @@ adjacent `quadrotor_msgs` source for the same architecture, including its
 Review the current `parameters/custom_link_parameters.yaml` against the device:
 mass is 1.067 kg, gravity is 9.8065 m/s², the battery is 6S/1800 mAh, and the
 thrust limit is 0.9. The mission trigger is CH10/AUX6 (zero-based index 9).
-Gimbal AIM requests +75 degrees (`90 + pitch_aim`, with `pitch_aim=-15`);
-`pitch_max=85`. These are shipped settings, not measurements of a new device.
+Gimbal AIM requests +80 degrees (`90 + pitch_aim`, with `pitch_aim=-10`);
+pitch travel is configured as [-120,+120] degrees. The SITL YAML uses the
+same AIM offset and pitch limits. These shipped settings are not measurements
+of a new device; check its mechanical travel before use.
 The YAML also sets `cli.bind_rx_on_connect=true`, which starts receiver
 pairing on every link connection. Use false for normal operation after pairing.
 
@@ -38,6 +40,62 @@ pairing on every link connection. Use false for normal operation after pairing.
 Always pass the real ports when using that launch file. The current source
 launch starts only the bridge. `bench_pid.launch.py` separately starts the
 bench tuner and defaults both `enabled` and `rig_confirmed` to false.
+
+## Binary release deployment
+
+Use the maintained `deploy/binary/collect_runtime.py` entry point to collect
+the bridge and tuner from a matching ARM64 application/message install.
+The [packaging recipe](build-and-test.md#package-an-arm64-runtime) keeps inputs
+read-only and writes the package outside source. The bundle includes custom
+message Python bindings for the tuner. Ubuntu 22.04 ARM64, preinstalled ROS 2
+Humble, system Python 3.10, `rclpy`, NumPy and PyYAML are required on the target.
+The [binary deployment guide](../deploy/binary/README.md) describes the full
+installer checks and configuration.
+
+The default package starts `custom_link_bridge_node` and `bench_pid_tuner`
+together. The tuner remains disabled: both `enabled` and `rig_confirmed` are
+false. Use `--enable-bench-pid` when collecting a release to set both to true.
+For example, add that option to the collector command in the packaging recipe;
+the resulting package records the enabled choice in its tuner YAML and
+runtime environment.
+
+Copy the generated archive to the target and extract it into a new directory.
+From that extracted package directory, run:
+
+```bash
+bash install.sh --check
+sudo bash install.sh
+```
+
+The first command checks prerequisites without installing. The second
+installs under `/opt/apm_bridge-binary/releases/`, switches `current`, starts
+`apm-bridge.service`, and enables startup at boot. It replaces
+`/etc/apm_bridge/parameters.yaml`, `/etc/apm_bridge/bench_pid.yaml` and
+`/etc/apm_bridge/runtime.env` after backing up prior configuration. The
+installer reports the backup directory. Installation failure restores the
+previous configuration and service. Review the generated defaults and the
+target devices before installing; service startup is part of installation.
+
+After installation, set `BENCH_PID_ENABLED=true` or `false` in
+`/etc/apm_bridge/runtime.env` and restart the service to change both tuner
+flags together. This runtime switch overrides the two YAML flags. For a
+foreground check with the service stopped, use:
+
+```bash
+sudo systemctl stop apm-bridge
+sudo /opt/apm_bridge-binary/current/run.sh --enable-bench-pid
+# Stop the foreground pair with Ctrl+C, then restore the background service.
+sudo systemctl start apm-bridge
+```
+
+Use `--disable-bench-pid` for a foreground run with both flags false.
+Enabling the tuner leaves its existing telemetry checks and RC switch
+sequence in place; see [bench tuning](../parameters/bench_pid_README.md).
+The supervisor stops the companion if either process fails and returns a
+failure to systemd. Both launch paths preserve the five bridge remappings
+listed in section 4. Complete physical protocol and ROS checks below on
+each target. The source-release procedure that follows is an alternative
+when building directly on the board.
 
 ## 1. Prepare a new source release
 
@@ -191,21 +249,23 @@ the vehicle IMU rate; this is not evidence of serial gimbal communication.
 odometry while disarmed is expected. See [README](../README.md) for the wire
 contract and coordinate frames.
 
-## 5. Existing services and rollback
+## 5. Services and rollback
 
-The existing `deploy/` files describe two legacy bridge-only layouts:
+The maintained deployment files support two layouts:
 
 - `deploy/apm-bridge.service` uses `/opt/apm_bridge/current` and
-  `deploy/run-production.sh`. The script sources the historical message
-  workspace and then the release install.
+  `deploy/run-production.sh`. Use it with a source release containing both
+  the application and its matching message install.
 - `deploy/binary/` uses `/opt/apm_bridge-binary/current` and configuration
   under `/etc/apm_bridge`.
 
-Both launch only the bridge and omit the `~/offboard` to `/fpv/offboard`
-remapping present in the source launch. They do not implement the newer
-two-node package supervisor. Review the selected service and its actual
-configuration before reuse. Do not assume source launch behavior applies to
-those scripts. Service templates are outside this documentation update.
+Both wrappers start the bridge and tuner under one supervisor. They preserve
+`~/offboard` to `/fpv/offboard` along with the other four bridge remappings.
+Both default the tuner to disabled and accept `--enable-bench-pid` and
+`--disable-bench-pid` to set `enabled` and `rig_confirmed` together.
+For source releases, `BENCH_PID_ENABLED=true` in the service environment
+provides the same opt-in. The source ROS launch files remain separate;
+`custom_link.launch.py` itself starts only the bridge.
 
 Once a reviewed service points to the accepted release, stop foreground
 processes before starting it. The existing templates set CPU affinity to 0–3,

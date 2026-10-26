@@ -55,6 +55,15 @@ See [production deployment](docs/production-deployment.md) for device checks.
 The hardware YAML currently enables `cli.bind_rx_on_connect`; review that
 setting before connecting an already paired receiver.
 
+For a binary release that deploys the bridge and `bench_pid_tuner` together,
+follow [runtime packaging](docs/build-and-test.md#package-an-arm64-runtime)
+and [production deployment](docs/production-deployment.md#binary-release-deployment).
+The bridge executable is named `custom_link_bridge_node`; its ROS node name
+is `custom_link_bridge`. The deployment launcher starts both nodes and keeps
+the tuner disabled by default (`enabled=false`, `rig_confirmed=false`).
+Use the packager's `--enable-bench-pid` option to make both flags true in a
+release, or the launcher's option of the same name for a foreground run.
+
 ### Custom-link connection topology
 
 ```text
@@ -217,8 +226,8 @@ startup settings in degrees, **positive nose-up**:
 
 The class defaults use pitch travel **[-135,+40] degrees** and `pitch_aim=0`.
 Without YAML overrides, AIM is limited to +40 degrees and logs a warning.
-Both shipped YAML files set `pitch_max=85`: hardware sets `pitch_aim=-15`
-(AIM +75 degrees), while SITL sets `pitch_aim=-10` (AIM +80 degrees).
+Both shipped YAML files set pitch travel to **[-120,+120] degrees** and
+`pitch_aim=-10`, so both request AIM at **+80 degrees** relative to the body.
 Do not enlarge real mechanical limits without checking the device/drawing.
 `pitch_aim=-90` requests the former body-forward AIM direction.
 For exact +Z alignment in AirSim, use a simulation-only config with
@@ -679,12 +688,17 @@ That guide also runs `test/cli_service_test.py`, whose tests are not registered
 as their own CTest group. Firmware integration, AirSim flight, and physical
 device tests have separate prerequisites and commands.
 
-On 2026-10-23 the native build passed, five of eight CTest groups passed, and
-both separate CLI service tests passed. The failing groups were
-`sitl_bridge_test`, `bench_angle_link_test`, and `gimbal_protocol_test`.
-The build guide records their missing fixture, parameter/path mismatches,
-and protocol comparison failure. Historical results below describe the dated
-versions and environments in which they were obtained.
+On 2026-10-26, clean native and ARM64 cross-builds passed at source commit
+`ed0be957a1d3`. The initial native run passed six of eight CTest groups,
+including all 111 bench tuner cases. Both separate CLI service tests passed.
+`bench_angle_link_test` passed when a read-only mount supplied its hard-coded
+executable path. `sitl_bridge_test` still had two failing cases: a thrust-limit
+expectation mismatch and a missing motor-calibration CSV file.
+All three gimbal protocol simulations passed with the freshly built ARM64
+harness under QEMU. The build guide records the exact scope and the earlier
+2026-10-23 failures. These checks did not include physical devices or flight.
+Historical results below describe the dated versions and environments in
+which they were obtained.
 
 ## Real-physics validation (2026-10-10, historical)
 

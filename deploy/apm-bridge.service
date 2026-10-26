@@ -1,0 +1,19 @@
+[Unit]
+Description=APM custom-link bridge and bench PID tuner
+After=network.target
+
+[Service]
+Type=simple
+CPUAffinity=0-3
+Environment=APM_BRIDGE_RELEASE=/opt/apm_bridge/current
+Environment=ROS_LOG_DIR=/var/log/apm_bridge
+Environment=BENCH_PID_ENABLED=false
+LogsDirectory=apm_bridge
+ExecStart=/bin/bash /opt/apm_bridge/current/src/apm_bridge/deploy/run-production.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
