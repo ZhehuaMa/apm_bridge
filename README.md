@@ -7,14 +7,29 @@ share the AIM/MISSION/HORIZON state machine described below.
 
 ## Build and launch
 
+Use C++17 and ROS 2 Humble. Follow [build and test instructions](docs/build-and-test.md)
+to build the adjacent `quadrotor_msgs` source first, keep outputs outside source,
+and run the registered tests in the default Docker image. The default build
+sets `APM_BRIDGE_AIRSIM=OFF` and supports hardware and TCP custom-link simulation.
+SITL means software-in-the-loop: the flight-controller firmware runs as a process.
+
+For the optional AirSim camera, use the native recipe in that guide with the
+real Cosys-AirSim checkout mounted read-only at `/src/cosys_airsim`. Change the
+`apm_bridge` CMake arguments to `-DAPM_BRIDGE_AIRSIM=ON` and
+`-DAIRSIM_ROOT=/src/cosys_airsim`. Source the resulting install in a matching
+ROS 2 Humble environment before launching:
+
 ```bash
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-select apm_bridge --cmake-args \
-  -DAPM_BRIDGE_AIRSIM=ON -DAIRSIM_ROOT=/path/to/cosys_airsim
-source install/setup.bash
+source /opt/ros/humble/setup.bash
+source /tmp/apm_bridge-native/ws/install/setup.bash
 ros2 launch apm_bridge sitl.launch.py
 ```
 
+The example install path is the host output from the native recipe. Inside its
+container, use `/out/ws/install/setup.bash` instead. The running environment
+must also be able to reach the Betaflight TCP and AirSim RPC endpoints.
+
+RPC means remote procedure call: the camera API is served by the simulator.
 The CMake option builds **only the camera RPC dependency** from the Cosys-AirSim
 rpclib sources with the ROS compiler. It does not link Unreal's incompatible
 prebuilt libc++ libraries. Without this option, hardware and custom-link SITL
@@ -25,6 +40,20 @@ compensation, and disable the real gimbal serial port. Build/start Betaflight
 SITL with `USE_CUSTOM_LINK`, then start the bridge before starting AirSim.
 Use the calibrated 2 kg `BetaFlight` vehicle model and EEPROM described in
 Cosys-AirSim's `docs/betaflight_sitl.md`.
+
+For hardware, select both device ports explicitly:
+
+```bash
+ros2 launch apm_bridge custom_link.launch.py \
+  serial_port:=/dev/ttyS8 baudrate:=921600 \
+  gimbal_port:=/dev/ttyS10 gimbal_model:=C20S
+```
+
+The launch defaults are `/dev/ttyTHS1` for the FC and an empty gimbal port,
+which selects a fixed camera. They override the hardware YAML's device ports.
+See [production deployment](docs/production-deployment.md) for device checks.
+The hardware YAML currently enables `cli.bind_rx_on_connect`; review that
+setting before connecting an already paired receiver.
 
 ### Custom-link connection topology
 
@@ -126,13 +155,14 @@ startup settings in degrees, **positive nose-up**:
   commanded, and hardware rates cannot push farther outward at a limit.
 - HORIZON alone uses `pitch_hold`, relative to horizontal, exactly as before.
 
-**The existing default pitch travel is [-135,+40] degrees.** Consequently the
-default `pitch_aim=0` requests +90 but produces the reachable +40-degree AIM
-setpoint and logs a warning. Do not enlarge real mechanical limits without
-checking the device/drawing. `pitch_aim=-50` requests +40; `pitch_aim=-90`
-recovers the former body-forward AIM direction. To test exact +Z alignment in
-AirSim, use a simulation-only config with `pitch_max>=90` (and enough margin for
-the requested offset). Equal min/max retains the existing disabled-limit convention.
+The class defaults use pitch travel **[-135,+40] degrees** and `pitch_aim=0`.
+Without YAML overrides, AIM is limited to +40 degrees and logs a warning.
+Both shipped YAML files set `pitch_max=85`: hardware sets `pitch_aim=-15`
+(AIM +75 degrees), while SITL sets `pitch_aim=-10` (AIM +80 degrees).
+Do not enlarge real mechanical limits without checking the device/drawing.
+`pitch_aim=-90` requests the former body-forward AIM direction.
+For exact +Z alignment in AirSim, use a simulation-only config with
+`pitch_max>=90` and `pitch_aim=0`. Equal min/max disables that axis limit.
 
 AirSim AIM uses the explicit joint angles without folding pitch into ZYX's
 [-90,+90] branch. MISSION constraints use the vendor's yaw-roll-pitch joint order
@@ -149,16 +179,17 @@ limits and C20S roll-protection hysteresis. Exact horizon hold can be unreachabl
 at extreme body attitudes or mechanical limits. Mechanical/protection stops
 take priority over smoothing.
 
-MISSION parameters (same YAML keys on both backends):
+MISSION parameters (same YAML keys on both backends). The two shipped YAML
+files override several class defaults:
 
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `gimbal.tracking_gain` | 2.0 | Image-angle proportional gain, 1/s |
-| `gimbal.tracking_max_rate` | 30.0 | Per-axis limit, deg/s; the single speed cap for MISSION tracking and HORIZON leveling (absorbs the former `max_angle_speed`) |
-| `gimbal.tracking_max_accel` | 90.0 | Per-axis command slew limit, deg/s² |
-| `gimbal.tracking_filter_tau` | 0.15 | First-order commanded-rate filter, seconds |
-| `gimbal.tracking_rate_feedforward` | 1.0 | Gain on ego-compensated LOS angular-rate feedforward; 0 retains angle feedback only for noisy rendered-camera tracking |
-| `gimbal.los_timeout` | 0.3 | Maximum LOS sample age, including transport delay, seconds |
+| Parameter | Class default | Both shipped YAML files | Meaning |
+| --- | ---: | ---: | --- |
+| `gimbal.tracking_gain` | 2.0 | 2.0 | Image-angle proportional gain, 1/s |
+| `gimbal.tracking_max_rate` | 30.0 | 150.0 | Per-axis speed cap for MISSION tracking and HORIZON leveling, deg/s |
+| `gimbal.tracking_max_accel` | 90.0 | 600.0 | Per-axis command slew limit, deg/s² |
+| `gimbal.tracking_filter_tau` | 0.15 | 0.12 | Commanded-rate filter time constant, seconds |
+| `gimbal.tracking_rate_feedforward` | 1.0 | 1.0 (inherited) | Gain on LOS angular-rate prediction after removing camera rotation; 0 uses angle feedback only |
+| `gimbal.los_timeout` | 0.3 | 0.5 | Maximum LOS sample age, including transport delay, seconds |
 
 The shared controller converts the spherical LOS derivatives through the
 camera-frame LOS Jacobian before filtering/slew-limiting feedback and feedforward
@@ -199,9 +230,10 @@ terminated) requests MANUAL as well, so host authority is released even if no
 transitions as the explicit `~/offboard` topic below - entering a mission no
 longer requires the pilot's OFFBOARD aux switch.
 
-The RC trigger pulse is a `channel_trigger` channel (SITL default CH8/AUX4,
-zero-based index 7) held **above 1900 for more than 0.5 s**; it is one-shot per
-hold and re-arms when the channel drops below 1100. A pulse only starts a
+The RC trigger pulse uses `channel_trigger` (hardware YAML: CH10/AUX6,
+zero-based index 9; SITL YAML: CH8/AUX4, index 7). Hold it **above 1900 for
+more than 0.5 s**. It is one-shot per hold and re-arms when the channel drops
+below 1100. A pulse only starts a
 locked, idle mission or dismisses a running one - a pulse without a lock is
 ignored with a warning, and it never toggles the tracker (arming edges own
 tracker start/stop). The AirSim-only exception is a pulse while disarmed:
@@ -325,7 +357,12 @@ receiver into pairing mode (the serial CLI's `bind_rx`; CRSF/SRXL2/SPI) and
 replies `"binding..."`, and `CMD_SAVE` persists the RAM config to flash
 (what `MSP_EEPROM_WRITE` does) - by default followed by an FC reboot like
 the serial CLI's `save` (the link drops and reconnects; pass `noreboot` to
-persist without rebooting). SAVE is refused while armed. FC-side failures arrive as
+persist without rebooting). SAVE is refused while armed. `CMD_APPLY_PID=5`
+checks runtime PID support (`args: 'check'`), checks ANGLE-mode support
+(`args: 'angle'`), or applies a profile by index. PID coefficients control the
+flight controller's attitude/rate response. Applying them while armed requires
+OFFBOARD with zero output; see the bench tuning guide for the full sequence.
+FC-side failures arrive as
 `ok=true, status=ERR` with the text (`SET FAILED`, `NOT FOUND`, ...); local
 failures (link down, `timeout`, `chunk gap`, `length mismatch`, bad request)
 as `ok=false` with `error`. Writes are RAM-only (CLI `set` without `save`)
@@ -334,8 +371,10 @@ service responsible for what you set in flight.
 
 With `cli.bind_rx_on_connect: true` the node sends `bind_rx` automatically
 each time the link to the FC comes up (once per connection) and logs the FC's
-confirmation - enable it temporarily when pairing a new transmitter/receiver,
-keep it off otherwise so every power-up does not interrupt reception.
+confirmation. The class default is false, but `custom_link_parameters.yaml`
+currently sets it to true. Enable it temporarily when pairing a new
+transmitter/receiver; set it false for normal operation so reconnecting does
+not interrupt reception.
 
 ```bash
 ros2 service call /fpv/cli quadrotor_msgs/srv/CliCommand \
@@ -376,9 +415,12 @@ feeder stops). The RC trigger pulse
 (`channel_trigger`) defaults to CH8/AUX4, zero-based index 7, in the SITL
 parameters; see "Tracker trigger" above for its mission start/stop semantics.
 
-The **only** AirSim RPC is `simGetCameraInfo`. Camera FRD/NED orientation is
-converted to FLU/ENU; `/fpv/gimbal` preserves the hardware heading-relative
-Euler slots in `orientation_covariance[0:3]`. Angular velocity is derived from
+The AirSim camera backend calls `simGetCameraInfo`, `simGetVehiclePose`, and
+`simSetCameraPose` for camera observation and control. Vehicle pose supplies
+the camera's body-relative transform; flight telemetry still comes from custom-link.
+Camera FRD/NED orientation is converted to FLU/ENU. `/fpv/gimbal` preserves the
+hardware heading-relative Euler slots in `orientation_covariance[0:3]`.
+Angular velocity is derived from
 successive camera poses, and marked unavailable until two poses arrive.
 Camera API failure is logged and does not stop custom-link flight telemetry.
 
@@ -485,14 +527,17 @@ BF collective = 0.011891350984191815 * total force - 0.059949564628813956
 throttle RMSE = 0.0006232991, maximum error = 0.0016002142
 ```
 
-The raw FC measurements are in
-[sitl_motor_calibration.csv](parameters/sitl_motor_calibration.csv).
-After changing motors, physics or PWM endpoints, run an experiment with the
+The historical calibration recorded its raw measurements as
+`parameters/sitl_motor_calibration.csv`, but that file is absent from the current
+checkout. The measured coefficients remain in `sitl_parameters.yaml`; the
+original fit cannot be reproduced from this checkout alone.
+After changing motors, physics or PWM endpoints, run an experiment from this
+package directory with the
 SITL launch **running**, the vehicle disarmed and other ROS controllers stopped:
 
 ```bash
 ros2 run apm_bridge sitl_motor_calibration \
-  --parameters src/apm_bridge/parameters/sitl_parameters.yaml \
+  --parameters parameters/sitl_parameters.yaml \
   --collect /tmp/sitl_thrust.csv --output /tmp/sitl_fitted.yaml
 ros2 launch apm_bridge sitl.launch.py parameters:=/tmp/sitl_fitted.yaml
 ```
@@ -518,10 +563,8 @@ Offline refitting:
 
 ```bash
 ros2 run apm_bridge sitl_motor_calibration \
-  --parameters src/apm_bridge/parameters/sitl_parameters.yaml \
+  --parameters parameters/sitl_parameters.yaml \
   --fit /tmp/sitl_thrust.csv --degree 1 --output /tmp/sitl_fitted.yaml
-colcon test --packages-select apm_bridge
-colcon test-result --verbose
 ```
 
 Degree 1 is appropriate for AirSim's thrust-linear rotor signal.
@@ -532,7 +575,22 @@ The generated thrust limit never exceeds the highest sampled throttle. Before
 arming, the script verifies `airsim.enabled=true`, checks mass/gravity against
 the running node and rejects other control publishers.
 
-## Real-physics validation (2026-10-10)
+## Current regression checks
+
+With `BUILD_TESTING=ON`, CMake registers eight test groups. Run them with the
+native build/test recipe in [build and test instructions](docs/build-and-test.md).
+That guide also runs `test/cli_service_test.py`, whose tests are not registered
+as their own CTest group. Firmware integration, AirSim flight, and physical
+device tests have separate prerequisites and commands.
+
+On 2026-10-23 the native build passed, five of eight CTest groups passed, and
+both separate CLI service tests passed. The failing groups were
+`sitl_bridge_test`, `bench_angle_link_test`, and `gimbal_protocol_test`.
+The build guide records their missing fixture, parameter/path mismatches,
+and protocol comparison failure. Historical results below describe the dated
+versions and environments in which they were obtained.
+
+## Real-physics validation (2026-10-10, historical)
 
 The AirSim/UE custom-link chain passed calibrated mass-normalized takeoff,
 2 m hover, roll/pitch/yaw rate tracking, landing and confirmed disarming.
@@ -573,8 +631,8 @@ its processes.
 
 ```bash
 # From the apm_bridge package directory:
-source /opt/ros/jazzy/setup.bash
-source ../../install/setup.bash
+source /opt/ros/humble/setup.bash
+source /tmp/apm_bridge-native/ws/install/setup.bash
 python3 test/airsim_gimbal_flight.py \
   --binary /path/to/betaflight/obj/main/betaflight_SITL.elf \
   --eeprom /path/to/betaflight/eeprom.bin \

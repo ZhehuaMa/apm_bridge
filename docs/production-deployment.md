@@ -1,169 +1,249 @@
-# 生产开发板部署与验收
+# Production deployment and acceptance
 
-> 2026-10-15 开发环境迁移说明：源码位于 `mzh:/home/mzh/nickluo/apm_bridge`，见 `AGENTS.local.md`。本文的生产板路径与既往部署记录保留原义。`firefly-production` 是原工作站的 SSH 别名，远程开发机尚未配置；部署前须先验证访问配置。
+Use ROS 2 Humble on Ubuntu 22.04 ARM64 boards. Build and test instructions
+for the native x86_64 image and ARM64 output are in
+[build-and-test.md](build-and-test.md). A host build does not establish physical
+serial, gimbal or flight-controller acceptance.
 
-## 环境与发布内容
+The source workspace is `/home/mzh/nickluo/apm_bridge` on `mzh`.
+`firefly-production` is an SSH alias from the original workstation. This host
+has no configured board access. The board address and paths below describe
+the recorded deployment; verify them on the intended device before use.
 
-- SSH：`ssh firefly-production`，当前地址为 `root@192.168.77.218`。
-- 系统：Ubuntu 22.04，aarch64，ROS 2 Humble。
-- 发布目录：`/opt/apm_bridge/releases/76fd1ba-20260923`。
-- 当前版本链接：`/opt/apm_bridge/current`。
-- 源码基线：`76fd1ba`，另包含本次对时修复和验收工具。修复尚未提交 Git。
-- 消息依赖工作区：`/home/hzhy/workspace/fpv_ws`，提供 `quadrotor_msgs` 自定义 ROS 消息。
-- 飞控：`/dev/ttyS8`，921600 波特率。
-- 云台：`/dev/ttyS10`，115200 波特率，C20S。
+## Device and configuration requirements
 
-飞控需要运行启用 `USE_CUSTOM_LINK` 的定制 Betaflight 固件。飞控实际接线 UART 必须配置为 `CUSTOM_LINK` 功能，并与开发板使用相同波特率。
+| Item | Recorded board setup |
+| --- | --- |
+| SSH | `firefly-production`, originally `root@192.168.77.218` |
+| Flight controller (FC) | `/dev/ttyS8`, 921600 baud |
+| Gimbal | `/dev/ttyS10`, 115200 baud, C20S |
+| Source deployment link | `/opt/apm_bridge/current` |
+| Historical message workspace | `/home/hzhy/workspace/fpv_ws` |
 
-## Build architecture and historical board procedure
+The FC needs matching Betaflight firmware built with `USE_CUSTOM_LINK`.
+Assign its wired UART to `CUSTOM_LINK` and match the baud rate. Build the real
+adjacent `quadrotor_msgs` source for the same architecture, including its
+`CliCommand` service. A runtime bundle is not a development dependency.
 
-An ARM64 container is not required to compile this package. The current default x86_64 image can build native host tests and cross-compile both ARM64 executables with the real ARM64 `quadrotor_msgs` dependency. See [build and test instructions](build-and-test.md). The board build below remains a supported alternative and preserves the dated production procedure. Cross-build/link checks do not replace the physical protocol and ROS telemetry acceptance below.
+Review the current `parameters/custom_link_parameters.yaml` against the device:
+mass is 1.067 kg, gravity is 9.8065 m/s², the battery is 6S/1800 mAh, and the
+thrust limit is 0.9. The mission trigger is CH10/AUX6 (zero-based index 9).
+Gimbal AIM requests +75 degrees (`90 + pitch_aim`, with `pitch_aim=-15`);
+`pitch_max=85`. These are shipped settings, not measurements of a new device.
+The YAML also sets `cli.bind_rx_on_connect=true`, which starts receiver
+pairing on every link connection. Use false for normal operation after pairing.
 
-## 1. 上传源码
+`custom_link.launch.py` overrides the YAML ports with its launch defaults:
+`/dev/ttyTHS1` for the FC and an empty gimbal port. Empty selects a fixed camera.
+Always pass the real ports when using that launch file. The current source
+launch starts only the bridge. `bench_pid.launch.py` separately starts the
+bench tuner and defaults both `enabled` and `rig_confirmed` to false.
 
-在本地仓库根目录执行。后续新版本应改用新的发布目录，保留旧版以便回退。
+## 1. Prepare a new source release
+
+Use a new release directory and keep the previous one for rollback. The
+following example stages both real packages. Run it on the development host
+after confirming board access. Source files are only read during packaging.
 
 ```bash
-tar -czf /tmp/apm-bridge-source.tar.gz \
-  CMakeLists.txt package.xml include src launch parameters test deploy docs
+cd /home/mzh/nickluo/apm_bridge
+tar --exclude='__pycache__' --exclude='.pytest_cache' \
+  -czf /tmp/apm-bridge-source.tar.gz \
+  CMakeLists.txt package.xml include src launch parameters scripts test docs deploy
+tar -C /home/mzh/nickluo/quadrotor_msgs \
+  -czf /tmp/apm-bridge-messages.tar.gz CMakeLists.txt package.xml msg srv
 ssh firefly-production \
-  'mkdir -p /opt/apm_bridge/releases/76fd1ba-20260923/src/apm_bridge && tar -xzf - -C /opt/apm_bridge/releases/76fd1ba-20260923/src/apm_bridge' \
+  'mkdir -p /opt/apm_bridge/releases/20261023-source/src/apm_bridge /opt/apm_bridge/releases/20261023-source/src/quadrotor_msgs'
+ssh firefly-production \
+  'tar -xzf - -C /opt/apm_bridge/releases/20261023-source/src/apm_bridge' \
   < /tmp/apm-bridge-source.tar.gz
+ssh firefly-production \
+  'tar -xzf - -C /opt/apm_bridge/releases/20261023-source/src/quadrotor_msgs' \
+  < /tmp/apm-bridge-messages.tar.gz
 ```
 
-## 2. 在开发板构建
+Replace `20261023-source` throughout with the new release ID if it already
+exists. Including `scripts/` is required: CMake installs the calibration tool,
+bench tuner and their Python helper modules.
 
-后续命令均在开发板执行。使用系统 ROS 对应的工具链和 Python 环境；板上未配置 conda。单任务构建用于降低内存峰值。
+## 2. Build on the board
+
+Run on the board with its system ROS/Python environment. Build and install
+outputs stay outside the package source directories. One compiler job limits
+memory use. This example builds both packages rather than depending on a
+possibly older installed message service.
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/hzhy/workspace/fpv_ws/install/setup.bash
-cd /opt/apm_bridge/releases/76fd1ba-20260923
+cd /opt/apm_bridge/releases/20261023-source
 CMAKE_BUILD_PARALLEL_LEVEL=1 colcon build \
-  --packages-select apm_bridge --executor sequential \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG'
-source install/local_setup.bash
+  --packages-up-to apm_bridge --executor sequential \
+  --build-base build --install-base install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  '-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG' \
+  -DBUILD_TESTING=OFF -DAPM_BRIDGE_AIRSIM=OFF
+source install/setup.bash
 ```
 
-成功标志为 `1 package finished`。必须加载上述消息依赖工作区，仅加载基础 ROS 环境会找不到 `quadrotor_msgs`。
+Expect both `quadrotor_msgs` and `apm_bridge` to finish. This builds
+`custom_link_bridge_node`, `gimbal_selftest`, and the installed Python tools.
+Tests are disabled explicitly for this production build; it is not a test
+pass. Run the separate development checks in [build-and-test.md](build-and-test.md).
 
-## 3. 检查连接并验收飞控协议
+## 3. Check the physical protocol
 
-确认飞控与云台均已供电，串口 TX/RX 交叉连接且共地。同一串口只能由一个测试或桥接进程使用。
+Power both devices, cross TX/RX and connect grounds. Only one process may own
+a serial port. Stop any existing bridge service and other serial users first.
+The test receives telemetry and sends time-sync requests; it sends no arming
+or flight-control frames.
 
 ```bash
-ls -l /dev/ttyS8 /dev/ttyS10
-# 已安装服务时先停止，以释放串口。
+cd /opt/apm_bridge/releases/20261023-source
 systemctl stop apm-bridge
+ls -l /dev/ttyS8 /dev/ttyS10
 fuser /dev/ttyS8 /dev/ttyS10
 python3 src/apm_bridge/test/hw_custom_link_test.py \
-  --port /dev/ttyS8 --baud 921600 --duration 20 --inverted
+  --port /dev/ttyS8 --baud 921600 --duration 20
 ```
 
-`--inverted` 仅用于已确认倒放的飞控，仍会检查姿态范围。正放时去掉该参数。本次用户确认飞控倒放，使用约 12 V 适配器供电，没有接电池，因此没有更改生产配置中的 6S 电池参数。
+The current script supports `--port`, `--baud` and `--duration`. It has no
+`--inverted` option. Its attitude check requires roll/pitch magnitudes below
+90 degrees, so the inverted-board procedure from the historical acceptance
+cannot be reproduced with this script unchanged. Use a suitable upright test
+setup or a separately reviewed orientation-aware checker; do not disregard
+a failed attitude check.
 
-测试只接收遥测并发送对时请求，不发送解锁和飞行控制帧。预期结果：
+Expect three telemetry streams near 200/100/10 Hz, no sequence gaps, median
+time-sync round-trip latency below 20 ms, and absolute timestamp lag below
+50 ms. The script checks stationary sensors, plausible pressure/temperature
+and voltage, disarmed status and no failsafe. It prints `RESULT: PASS` or
+`RESULT: FAIL` and returns nonzero on failure.
 
-- 三类遥测约 200、100、10 Hz，序号连续。
-- 对时往返延迟中位数小于 20 ms，消息时间偏差小于 50 ms。
-- 静止传感器数值与放置姿态一致，飞控未解锁、无失效保护。
-- 最终输出 `RESULT: PASS`。失败时先处理具体失败项，再恢复服务并复测。
-
-## 4. 安装并启动服务
-
-首次部署创建当前版本链接；链接已存在时检查其目标，避免无意切换版本。
+For a longer drift investigation, keep the bridge stopped and run:
 
 ```bash
-readlink -f /opt/apm_bridge/current
-# 仅首次部署执行：
-# ln -s /opt/apm_bridge/releases/76fd1ba-20260923 /opt/apm_bridge/current
-cp /opt/apm_bridge/current/src/apm_bridge/deploy/apm-bridge.service \
-  /etc/systemd/system/apm-bridge.service
-systemctl daemon-reload
-systemctl start apm-bridge
+python3 src/apm_bridge/test/timesync_drift_test.py \
+  --port /dev/ttyS8 --baud 921600 --duration 180 \
+  --csv /tmp/apm-timesync.csv
+```
+
+This captures real exchanges and replays old/improved algorithms in Python,
+including injected clock steps and FC reboots. Its `A current` labels denote
+the old algorithm. Current C++ uses a monotonic clock, a latency-filtered sample
+window, a fitted clock offset/drift rate, and reset/relock logic. The script
+reports metrics and returns success after sufficient capture; it does not
+apply a numerical pass/fail threshold or directly execute the C++ model.
+`test/client_timesync_selftest.cpp` is absent from this checkout.
+
+## 4. Start the bridge and verify ROS data
+
+For a foreground check, load the new release and launch with explicit ports:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /opt/apm_bridge/releases/20261023-source/install/setup.bash
+ros2 launch apm_bridge custom_link.launch.py \
+  serial_port:=/dev/ttyS8 baudrate:=921600 \
+  gimbal_port:=/dev/ttyS10 gimbal_model:=C20S
+```
+
+Review the pairing setting before launching. This launch maps private topics
+`~/control_command`, `~/control_command_raw`, `~/arm`, `~/offboard`, and
+`~/low_level_feedback` to `/fpv/...`. A direct executable invocation must
+supply these mappings itself.
+
+In another sourced shell, inspect data using ROS 2 Humble CLI commands:
+
+```bash
+ros2 topic echo /mavros/state mavros_msgs/msg/State --once --no-daemon
+ros2 topic echo /mavros/imu/data sensor_msgs/msg/Imu \
+  --once --no-daemon --qos-reliability best_effort
+ros2 topic echo /fpv/gimbal sensor_msgs/msg/Imu --once --no-daemon
+ros2 topic hz /mavros/imu/data
+ros2 topic delay /mavros/imu/data
+```
+
+Stop each continuous `hz` or `delay` command with Ctrl+C. Repeat for the topics
+below, observing each for at least 60 seconds. The CLI's received rate can be
+lower than the publisher rate under load. Subscribers must accept best-effort
+sensor data; a reliable-only subscriber cannot match a best-effort publisher.
+
+| Topic | Nominal rate with the recorded hardware |
+| --- | ---: |
+| `/mavros/imu/data` | 200 Hz |
+| `/mavros/rc/in` | 100 Hz |
+| `/fpv/gimbal` with a responding serial gimbal | About 100 Hz |
+| `/mavros/state` | 10 Hz |
+| `/mavros/battery` | 10 Hz |
+| `/fpv/static_pressure` | 100 Hz |
+
+Verify `connected=true`, `armed=false`, continuous fresh samples, and absolute
+message timestamp differences below 50 ms. `topic delay` reports summary
+statistics, not an automated assertion that every sample met that bound.
+There is no current `test/ros_telemetry_test.py`; the historical six-topic
+`PASS` report below came from an earlier acceptance tool. Record current CLI
+observations separately rather than claiming that automated test ran.
+
+`Custom link up` proves only that the transport opened. Confirm increasing
+receive counts and actual gimbal status replies. A fixed camera publishes at
+the vehicle IMU rate; this is not evidence of serial gimbal communication.
+`/fpv/odom` requires an armed FC with valid GPS/origin/fusion flags, so no
+odometry while disarmed is expected. See [README](../README.md) for the wire
+contract and coordinate frames.
+
+## 5. Existing services and rollback
+
+The existing `deploy/` files describe two legacy bridge-only layouts:
+
+- `deploy/apm-bridge.service` uses `/opt/apm_bridge/current` and
+  `deploy/run-production.sh`. The script sources the historical message
+  workspace and then the release install.
+- `deploy/binary/` uses `/opt/apm_bridge-binary/current` and configuration
+  under `/etc/apm_bridge`.
+
+Both launch only the bridge and omit the `~/offboard` to `/fpv/offboard`
+remapping present in the source launch. They do not implement the newer
+two-node package supervisor. Review the selected service and its actual
+configuration before reuse. Do not assume source launch behavior applies to
+those scripts. Service templates are outside this documentation update.
+
+Once a reviewed service points to the accepted release, stop foreground
+processes before starting it. The existing templates set CPU affinity to 0–3,
+`ROS_LOG_DIR=/var/log/apm_bridge`, `LogsDirectory=apm_bridge`, and
+`Restart=on-failure`. Inspect the service and logs:
+
+```bash
+systemctl cat apm-bridge
 systemctl status apm-bridge --no-pager
+journalctl -u apm-bridge -n 50 --no-pager
+systemctl show apm-bridge -p CPUAffinity -p NRestarts
 ```
 
-启动脚本明确指定生产串口，并保持原 launch 的话题映射。不要直接使用原 launch 的默认参数：默认飞控端口 `/dev/ttyTHS1` 和空云台端口会覆盖 YAML 中的正确设置。
-
-服务通过 `LogsDirectory=apm_bridge` 创建日志目录，并设置 `ROS_LOG_DIR=/var/log/apm_bridge`。这是必要配置：systemd 环境缺少用户主目录信息时，ROS 曾因日志目录无法确定而退出。
-
-脚本直接执行节点，使 systemd 能检测节点退出并按 `Restart=on-failure` 重启。
-
-## 5. 验证真实 ROS 数据
-
-```bash
-source /home/hzhy/workspace/fpv_ws/install/setup.bash
-source /opt/apm_bridge/current/install/local_setup.bash
-python3 /opt/apm_bridge/current/src/apm_bridge/test/ros_telemetry_test.py --duration 60
-```
-
-此测试只订阅数据，不发布控制指令。它验证六个话题持续更新、发布频率正确、消息时间戳与开发板当前时间相差小于 50 ms，以及飞控已连接且未解锁。预期最终输出 `RESULT: PASS`。
-
-看到节点名称或 `Custom link up` 日志不等于验收通过；串口打开和有效遥测到达是不同条件。云台数据也必须结合实际串口回包和状态日志确认。
-
-## 6. 日常运行与开机启动
-
-完整验收通过后启用开机启动：
+Enable startup only after device and ROS acceptance. Record actual reboot
+verification separately from configuration state:
 
 ```bash
 systemctl enable apm-bridge
 systemctl is-enabled apm-bridge
 systemctl is-active apm-bridge
-journalctl -u apm-bridge -n 50 --no-pager
 ```
 
-常用管理命令：`systemctl restart apm-bridge` 和 `systemctl stop apm-bridge`。
+For rollback, stop the service and restore its previously accepted release,
+configuration and matching message environment. The dated backup
+`/opt/apm_bridge/backups/pre-timesync-fix.tar.gz` belongs to the 2026-09-23
+incident; it is not a general rollback target for current releases.
 
-需要前台排查时，先停服务，避免两个进程竞争串口：
+## Historical deployment context (2026-09-23)
 
-```bash
-systemctl stop apm-bridge
-APM_BRIDGE_RELEASE=/opt/apm_bridge/current \
-  bash /opt/apm_bridge/current/src/apm_bridge/deploy/run-production.sh
-# 前台退出后恢复服务：
-# systemctl start apm-bridge
-```
-
-## 排障与本次修复
-
-### 完全没有飞控遥测
-
-执行 `cat /proc/tty/driver/serial`。如果串口 8 的 `rx` 不增长，检查供电、接线、UART 选择及飞控固件配置。本次首次验收的 0 Hz 原因为飞控未供电，上电后通信恢复。
-
-### 遥测正常但时间戳越来越超前
-
-本次实测原版本消息时间戳超前约 0.3 秒，并持续增长。原对时逻辑将偏置变化视为异常，导致后续有效样本持续被拒绝。现改为使用通过往返延迟检查的最新偏置，避免持续漂移造成永久失准。
-
-回归测试模拟持续漂移与时钟跳变：旧代码偏差约 418 ms，修复后通过 15 ms 门限。运行方法：
-
-```bash
-cd /opt/apm_bridge/current/src/apm_bridge
-g++ -std=c++17 -pthread -I include \
-  test/client_timesync_selftest.cpp src/custom_link/client.cpp \
-  -o /tmp/client_timesync_selftest
-/tmp/client_timesync_selftest
-```
-
-### ROS CLI 后台缓存异常
-
-若 CLI 报 `xmlrpc.client.Fault` 和 `!rclpy.ok()`，可绕过后台缓存：
-
-```bash
-ros2 topic echo /fpv/gimbal sensor_msgs/msg/Imu --once --no-daemon
-```
-
-### 回退此次对时修复
-
-修复前源码和节点二进制已保存于 `/opt/apm_bridge/backups/pre-timesync-fix.tar.gz`。如需回退，停止服务后恢复，再启动：
-
-```bash
-systemctl stop apm-bridge
-tar -xzf /opt/apm_bridge/backups/pre-timesync-fix.tar.gz -C /opt/apm_bridge/current
-systemctl start apm-bridge
-```
-
-该回退会恢复原有时间戳缺陷，只作为紧急恢复手段。
+The acceptance below used release `/opt/apm_bridge/releases/76fd1ba-20260923`
+with source baseline `76fd1ba` plus then-uncommitted time-sync changes and
+acceptance tools. The FC was inverted and powered by an approximately 12 V
+adapter without a battery; the configured 6S battery settings were retained.
+Initial 0 Hz telemetry was traced to an unpowered FC. The original time-sync
+regression reported approximately 418 ms error before its fix and passed a
+15 ms limit afterward. These facts describe that deployment and its tools,
+not the current checker or a new test run. The original board evidence follows
+unchanged.
 
 ## 验收记录（2026-09-23）
 
