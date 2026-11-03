@@ -87,17 +87,19 @@ class ThrustModel:
 
     def force_to_throttle(self, force_n, kp, vbat):
         x = force_n / self.n
+        if self.baro_comp:
+            if not math.isfinite(kp) or kp <= 0.0:
+                raise ValueError("Air density ratio must be finite and positive")
+            x /= kp
         # 节点 ctrlCommandCallback 分支语义：voltage_compensation=false 时
         # 走 forceToThrust(无 vbat)（即 legacy 线性油门补偿），true 时走 vbat 模型
         vbat_on = self.voltage_comp and self.vbat_a != 0.0 and vbat > 0.0
         if vbat_on:
             x *= self._vbat_scale(vbat)
         t = ((self.A * x + self.B) * x + self.C) * x + self.D
-        if vbat > 0.0 and not vbat_on:
+        if self.voltage_comp and vbat > 0.0 and not vbat_on:
             t *= self.volt_max / vbat
         t = (1.0 - self.spin_k) * t + self.spin_k * t * t
-        if self.baro_comp:
-            t *= kp
         return min(t, self.thrust_limit)
 
     def force_for_throttle(self, target, kp, vbat, hi_n=200.0):

@@ -515,6 +515,12 @@ Command timeout behavior is unchanged.
 When `baro_compensation` is enabled, its factor is
 `(pressure_pa / 101325.0) * (273.15 / (273.15 + temperature_c))`, using measured
 FC pressure and temperature, not an ISA estimate derived from altitude.
+This is the air density ratio relative to 101325 Pa and 0 C. Requested
+physical force is divided by this ratio BEFORE the motor polynomial and
+spin correction; the inverse mapping multiplies the recovered force by it.
+Lower pressure or higher temperature therefore increases the required
+throttle, rather than reducing it. The motor curve must use the same
+reference density; recheck its calibration before real flight.
 Temperature initially defaults to 20 C. Zero pressure retains the previous
 factor; temperature at or below absolute zero retains the previous temperature.
 Both invalid readings are logged.

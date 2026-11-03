@@ -115,10 +115,13 @@ install(PROGRAMS scripts/bench_pid_tuner.py
 install(FILES scripts/bench_pid_core.py DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  add_executable(quadratic_thrust_model_test test/quadratic_thrust_model_test.cpp)
+  add_test(NAME quadratic_thrust_model_test COMMAND quadratic_thrust_model_test)
   add_executable(gimbal_tracking_test test/gimbal_tracking_test.cpp)
   add_test(NAME gimbal_tracking_test COMMAND gimbal_tracking_test)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(sitl_bridge_test test/sitl_bridge_test.py)
+  ament_add_pytest_test(thrust_model_test test/thrust_model_test.py)
   ament_add_pytest_test(bench_pid_test test/bench_pid_test.py TIMEOUT 240)
   ament_add_pytest_test(bench_angle_link_test test/bench_angle_link_test.py TIMEOUT 30)
   ament_add_pytest_test(gimbal_node_test test/gimbal_node_test.py TIMEOUT 30)
