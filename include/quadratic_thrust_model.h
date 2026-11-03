@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 
 namespace quadratic_thrust_model
 {
@@ -210,7 +211,9 @@ namespace quadratic_thrust_model
 
     double thrustToForce(const MotorParams &motor_params, double thrust, double kp, double battery_voltage = -1.0)
     {
-        auto throttle = thrust / kp;
+        if (!std::isfinite(kp) || kp <= 0.0)
+            throw std::invalid_argument("Air density ratio must be finite and positive");
+        auto throttle = thrust;
         if (std::abs(motor_params.spin_k) > EPSILON) {
             auto k_1 = motor_params.spin_k - 1.0;
             throttle = (k_1 + std::sqrt(k_1 * k_1 + 4.0 * motor_params.spin_k * throttle)) /
@@ -240,13 +243,16 @@ namespace quadratic_thrust_model
 
         if (vbat)
             x /= vbatScale(motor_params, battery_voltage);    // 标准口径力 -> 当前电压实际力
-        double force = motor_params.n_motors * x;
+        double force = motor_params.n_motors * x * kp;
         return force < 0.0 ? 0.0 : force;
     }
 
     double forceToThrust(const MotorParams &motor_params, double force, double kp, double battery_voltage = -1.0)
     {
-        force /= motor_params.n_motors;
+        if (!std::isfinite(kp) || kp <= 0.0)
+            throw std::invalid_argument("Air density ratio must be finite and positive");
+        // Density scales physical force, not throttle: convert before the nonlinear curve.
+        force /= motor_params.n_motors * kp;
 
         // vbat 补偿: 请求力换算到标准电压口径后进多项式 (入口缩放, 与标定端对称);
         // 未启用时退回线性补偿 (油门出口侧)。
@@ -260,7 +266,6 @@ namespace quadratic_thrust_model
         if (battery_voltage > 0 && !vbat)
             throttle *= motor_params.volt_max / battery_voltage;    // legacy linear voltage compensation
         auto thrust = (1.0 - motor_params.spin_k) * throttle + motor_params.spin_k * throttle * throttle; // linear compensation
-        thrust *= kp; // air pressure compensation
         if (motor_params.thrust_limit > 0.0 && thrust > motor_params.thrust_limit)
             thrust = motor_params.thrust_limit;
         return thrust; 
