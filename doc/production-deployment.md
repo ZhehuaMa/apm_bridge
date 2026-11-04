@@ -5,10 +5,11 @@ for the native x86_64 image and ARM64 output are in
 [build-and-test.md](build-and-test.md). A host build does not establish physical
 serial, gimbal or flight-controller acceptance.
 
-The source workspace is `/home/mzh/nickluo/apm_bridge` on `mzh`.
-`firefly-production` is an SSH alias from the original workstation. This host
-has no configured board access. The board address and paths below describe
-the recorded deployment; verify them on the intended device before use.
+Resolve the source workspace and board access from the development host's
+current configuration. The examples use `/home/mzh/nickluo/apm_bridge` and
+the SSH alias `firefly-production`. Confirm that the alias identifies the
+intended board before connecting. The address and paths below describe the
+recorded deployment; verify them on the intended device before use.
 
 ## Device and configuration requirements
 
@@ -28,16 +29,22 @@ adjacent `quadrotor_msgs` source for the same architecture, including its
 Review the current `parameters/custom_link_parameters.yaml` against the device:
 mass is 1.067 kg, gravity is 9.8065 m/s², the battery is 6S/1800 mAh, and the
 thrust limit is 0.9. The mission trigger is CH10/AUX6 (zero-based index 9).
-Gimbal AIM requests +80 degrees (`90 + pitch_aim`, with `pitch_aim=-10`);
-pitch travel is configured as [-120,+120] degrees. The SITL YAML uses the
-same AIM offset and pitch limits. These shipped settings are not measurements
-of a new device; check its mechanical travel before use.
+Gimbal AIM requests +80 degrees (`90 + pitch_aim`, with `pitch_aim=-10`).
+The hardware YAML sets pitch travel to [-40,+110] degrees. These are gimbal
+joint angles measured by motor encoders; positive pitch tilts the camera
+upward. The SITL YAML uses the same AIM offset but sets pitch travel to
+[-120,+120] degrees. These shipped settings are not measurements of a new
+device; check its mechanical travel before use.
 The YAML also sets `cli.bind_rx_on_connect=true`, which starts receiver
 pairing on every link connection. Use false for normal operation after pairing.
 
-`custom_link.launch.py` overrides the YAML ports with its launch defaults:
-`/dev/ttyTHS1` for the FC and an empty gimbal port. Empty selects a fixed camera.
-Always pass the real ports when using that launch file. The current source
+`custom_link.launch.py` loads `parameters/custom_link_parameters.yaml`.
+Launch arguments override individual settings only when given a nonempty
+value. With no port arguments, the shipped YAML selects `/dev/ttyS8` for the
+FC and `/dev/ttyS10` for the gimbal. Passing an empty `gimbal_port` launch
+argument keeps the YAML value. To select a fixed camera, set `gimbal_port`
+to an empty string in the YAML instead. Confirm the ports against the actual
+devices; the foreground example below supplies them explicitly. The source
 launch starts only the bridge. `bench_pid.launch.py` separately starts the
 bench tuner and defaults both `enabled` and `rig_confirmed` to false.
 
@@ -107,7 +114,7 @@ after confirming board access. Source files are only read during packaging.
 cd /home/mzh/nickluo/apm_bridge
 tar --exclude='__pycache__' --exclude='.pytest_cache' \
   -czf /tmp/apm-bridge-source.tar.gz \
-  CMakeLists.txt package.xml include src launch parameters scripts test docs deploy
+  CMakeLists.txt package.xml include src launch parameters scripts test doc deploy
 tar -C /home/mzh/nickluo/quadrotor_msgs \
   -czf /tmp/apm-bridge-messages.tar.gz CMakeLists.txt package.xml msg srv
 ssh firefly-production \

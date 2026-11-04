@@ -1,6 +1,6 @@
 # apm_bridge local development
 
-- Read `/home/mzh/nickluo/AGENTS.local.md`. Source is `/home/mzh/nickluo/apm_bridge`; shared messages are `/home/mzh/nickluo/quadrotor_msgs`.
-- Follow `docs/build-and-test.md`. Default image architecture is x86_64, with native x86_64 or cross-compiled ARM64 output. The ARM64 image remains an explicit fallback.
-- Put new evidence outside source, for example `/tmp/apm_bridge-native` and `/tmp/apm_bridge-cross`. Historical outputs under `/home/mzh/nickluo-validation-20261015/apm_bridge/` remain unchanged.
-- Board SSH aliases in production documentation belong to the original workstation. This host has no configured board access. Container checks do not establish serial, gimbal or Betaflight firmware acceptance.
+- Read [the parent workspace's local instructions](../AGENTS.local.md). Resolve this checkout and the adjacent `quadrotor_msgs` source from the current workspace before mounting them into containers.
+- Use the Docker workflows in [doc/build-and-test.md](doc/build-and-test.md). Check the selected image and toolchain before building, and choose native output, cross-compilation or emulated execution explicitly. Keep their output directories and caches separate.
+- Write build outputs and new validation evidence outside source. Treat temporary directories as disposable; retain required evidence before cleanup. Record the source revision, actual build environment, commands and results in dated reports rather than in this instruction file.
+- Resolve board access from current SSH or other connection configuration. Confirm the intended board, deployed revision, services and connected devices before hardware work. Historical aliases, deployment paths and reports do not establish current access or acceptance. Container checks do not establish physical serial, gimbal or Betaflight firmware acceptance.

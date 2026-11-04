@@ -7,7 +7,7 @@ share the AIM/MISSION/HORIZON state machine described below.
 
 ## Build and launch
 
-Use C++17 and ROS 2 Humble. Follow [build and test instructions](docs/build-and-test.md)
+Use C++17 and ROS 2 Humble. Follow [build and test instructions](doc/build-and-test.md)
 to build the adjacent `quadrotor_msgs` source first, keep outputs outside source,
 and run the registered tests in the default Docker image. The default build
 sets `APM_BRIDGE_AIRSIM=OFF` and supports hardware and TCP custom-link simulation.
@@ -49,15 +49,17 @@ ros2 launch apm_bridge custom_link.launch.py \
   gimbal_port:=/dev/ttyS10 gimbal_model:=C20S
 ```
 
-The launch defaults are `/dev/ttyTHS1` for the FC and an empty gimbal port,
-which selects a fixed camera. They override the hardware YAML's device ports.
-See [production deployment](docs/production-deployment.md) for device checks.
+The launch preserves the hardware YAML's device ports unless a nonempty
+launch argument overrides them. The shipped YAML selects `/dev/ttyS8` for
+the FC and `/dev/ttyS10` for the gimbal. An empty `gimbal_port` launch argument
+keeps the YAML value; an empty `gimbal_port` in the YAML selects a fixed camera.
+See [production deployment](doc/production-deployment.md) for device checks.
 The hardware YAML currently enables `cli.bind_rx_on_connect`; review that
 setting before connecting an already paired receiver.
 
 For a binary release that deploys the bridge and `bench_pid_tuner` together,
-follow [runtime packaging](docs/build-and-test.md#package-an-arm64-runtime)
-and [production deployment](docs/production-deployment.md#binary-release-deployment).
+follow [runtime packaging](doc/build-and-test.md#package-an-arm64-runtime)
+and [production deployment](doc/production-deployment.md#binary-release-deployment).
 The bridge executable is named `custom_link_bridge_node`; its ROS node name
 is `custom_link_bridge`. The deployment launcher starts both nodes and keeps
 the tuner disabled by default (`enabled=false`, `rig_confirmed=false`).
@@ -236,12 +238,14 @@ startup settings in degrees, **positive nose-up**:
 
 The class defaults use pitch travel **[-135,+40] degrees** and `pitch_aim=0`.
 Without YAML overrides, AIM is limited to +40 degrees and logs a warning.
-Both shipped YAML files set pitch travel to **[-120,+120] degrees** and
-`pitch_aim=-10`, so both request AIM at **+80 degrees** relative to the body.
+The hardware YAML sets pitch travel to **[-40,+110] degrees**; the SITL YAML
+sets it to **[-120,+120] degrees**. Both set `pitch_aim=-10`, so both request
+AIM at **+80 degrees** relative to the body.
 Do not enlarge real mechanical limits without checking the device/drawing.
 `pitch_aim=-90` requests the former body-forward AIM direction.
 For exact +Z alignment in AirSim, use a simulation-only config with
-`pitch_max>=90` and `pitch_aim=0`. Equal min/max disables that axis limit.
+`gimbal.pitch_travel_max>=90` and `gimbal.pitch_aim=0`. Equal min/max disables
+that axis limit.
 
 AirSim AIM uses the explicit joint angles without folding pitch into ZYX's
 [-90,+90] branch. MISSION constraints use the vendor's yaw-roll-pitch joint order
@@ -394,14 +398,17 @@ Nonempty hardware ports still select XFrobot; AirSim selection is unchanged.
 
 Set the shared `gimbal.pitch_hold` at startup. For strapdown it is in **degrees FLU**: positive points below
 the body forward axis, negative points above it. Default is 0.0; the accepted
-range is [-180,180]. For example, a camera tilted 20 degrees upward:
+range is [-180,180]. To use a fixed camera tilted 20 degrees upward, first
+set `gimbal_port: ""` in `parameters/custom_link_parameters.yaml`, rebuild
+the package to install that YAML, then launch:
 
 ```bash
 ros2 launch apm_bridge custom_link.launch.py pitch_hold:=-20.0
 ```
 
-The hardware launch defaults to an empty gimbal port. The equivalent parameters
-are `airsim.enabled: false`, `gimbal_port: ""`, and `gimbal.pitch_hold: -20.0`.
+With that YAML change, the effective parameters are `airsim.enabled: false`,
+`gimbal_port: ""`, and `gimbal.pitch_hold: -20.0`. The shipped hardware YAML
+uses a serial gimbal, so the pitch argument alone does not select a fixed camera.
 For an actuated gimbal, this parameter has the HORIZON-only meaning described
 above, not a body-relative mount angle. Vendor sign conventions are unchanged.
 The optional launch argument `pitch_hold` overrides this value only when set;
@@ -717,8 +724,10 @@ the running node and rejects other control publishers.
 
 ## Current regression checks
 
-With `BUILD_TESTING=ON`, CMake registers eight test groups. Run them with the
-native build/test recipe in [build and test instructions](docs/build-and-test.md).
+With `BUILD_TESTING=ON`, the default configuration registers eight test groups.
+Enabling both `APM_BRIDGE_AIRSIM` and `APM_BRIDGE_AIRSIM_LIVE_TEST` adds a live
+AirSim test. Run all registered groups for the selected configuration using
+the native build/test recipe in [build and test instructions](doc/build-and-test.md).
 That guide also runs `test/cli_service_test.py`, whose tests are not registered
 as their own CTest group. Firmware integration, AirSim flight, and physical
 device tests have separate prerequisites and commands.
