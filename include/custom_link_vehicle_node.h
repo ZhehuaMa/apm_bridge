@@ -203,7 +203,8 @@ namespace custom_link_bridge
         std::mutex mtx_cmd;
         // 控制设定点（FLU 系）：角速度模式 = 三轴 rad/s；角度模式 = roll/pitch rad + yaw rad/s
         std::array<double, 3> cmd_setpoints{{0.0, 0.0, 0.0}};
-        double cmd_thrust = 0.0;                             // 0..1
+        double cmd_thrust = 0.0; // 0..1.0 
+        double cmd_force = 0.0;  // Force (N)
         rclcpp::Time cmd_stamp{0, 0, RCL_ROS_TIME};
         bool cmd_valid = false;
         bool cmd_angle = false;

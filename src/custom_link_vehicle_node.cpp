@@ -974,6 +974,15 @@ void CustomLinkVehicleNode::pushControl()
                 input.rate_dps_or_angle_deg[0] = cmd_setpoints[0] * kRadToDeg;
                 input.rate_dps_or_angle_deg[1] = cmd_setpoints[1] * kRadToDeg;
                 input.rate_dps_or_angle_deg[2] = cmd_setpoints[2] * kRadToDeg;
+                if (cmd_thrust < 0.0)
+                {
+                    std::lock_guard<std::mutex> lk(mtx_kp);
+                    if (voltage_compensation)
+                        cmd_thrust = quadratic_thrust_model::forceToThrust(motor_params, cmd_force, kp, battery_voltage);
+                    else
+                        cmd_thrust = quadratic_thrust_model::forceToThrust(motor_params, cmd_force, kp);
+                    cmd_thrust = std::clamp(cmd_thrust, 0.0, 1.0);
+                }
                 input.throttle = cmd_thrust;
                 input.angle = cmd_angle;
                 fresh = true;
@@ -1083,20 +1092,14 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     }
     use_rate.store(!angle);
 
-    double thrust = 0.0;
-    {
-        std::lock_guard<std::mutex> lk(mtx_kp);
-        const double force = command->collective_thrust * mass;
-        if (voltage_compensation)
-            thrust = quadratic_thrust_model::forceToThrust(motor_params, force, kp, battery_voltage);
-        else
-            thrust = quadratic_thrust_model::forceToThrust(motor_params, force, kp);
-    }
+
+    const double force = command->collective_thrust * mass;
 
     std::lock_guard<std::mutex> lk(mtx_cmd);
     cmd_angle = angle;
     cmd_setpoints = setpoints;
-    cmd_thrust = std::clamp(thrust, 0.0, 1.0);
+    cmd_force = force;
+    cmd_thrust = -1.0;
     cmd_stamp = this->now();
     cmd_valid = true;
 }
