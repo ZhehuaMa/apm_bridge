@@ -187,7 +187,8 @@ namespace custom_link_bridge
 
         double control_timeout = 0.5;
         double airborne_altitude = 0.5;
-        double rate_limit_dps = 0.0;      // 发送前角速度限幅, 0 = 不限制
+        double rate_limit_dps = 0.0;      // 发送前角速度限幅 (deg/s), 0 = 不限制
+        double angle_limit_deg = 0.0;     // 角度模式 roll/pitch 限幅 (deg), 0 = 不限制
 
         std::unique_ptr<custom_link::Client> client;
         bool airsim_enabled = false;
@@ -200,7 +201,8 @@ namespace custom_link_bridge
         double battery_voltage = 0.0;
 
         std::mutex mtx_cmd;
-        std::array<double, 3> cmd_bodyrates{{0.0, 0.0, 0.0}}; // FLU rad/s
+        // 控制设定点（FLU 系）：角速度模式 = 三轴 rad/s；角度模式 = roll/pitch rad + yaw rad/s
+        std::array<double, 3> cmd_setpoints{{0.0, 0.0, 0.0}};
         double cmd_thrust = 0.0;                             // 0..1
         rclcpp::Time cmd_stamp{0, 0, RCL_ROS_TIME};
         bool cmd_valid = false;

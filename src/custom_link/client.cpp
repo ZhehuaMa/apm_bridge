@@ -575,7 +575,7 @@ namespace custom_link
                         if (mode_pending && !valid)
                         {
                             input.throttle = 0.0;
-                            std::fill(std::begin(input.rate_dps), std::end(input.rate_dps), 0.0);
+                            std::fill(std::begin(input.rate_dps_or_angle_deg), std::end(input.rate_dps_or_angle_deg), 0.0);
                         }
                     }
                     const bool arm = arm_request_.load();
@@ -618,7 +618,7 @@ namespace custom_link
         p.throttle = std::min<uint16_t>(std::max<uint16_t>(p.throttle, 1000), 2000);
         for (int i = 0; i < 3; ++i)
         {
-            const double v = input.rate_dps[i] * 10.0;
+            const double v = input.rate_dps_or_angle_deg[i] * 10.0;
             p.rate_x10[i] = static_cast<int16_t>(std::clamp(v, -32768.0, 32767.0));
         }
 

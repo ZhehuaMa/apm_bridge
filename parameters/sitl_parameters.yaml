@@ -55,6 +55,7 @@ custom_link_bridge:
       sync_rate: 1.0
       diag_rate: 0.2
       rate_limit_dps: 0.0
+      angle_limit_deg: 0.0 # Client-side ANGLE-mode roll/pitch clamp (deg, 0 = unlimited).
     rc:
       control_timeout: 0.5
     landed:

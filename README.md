@@ -436,7 +436,11 @@ FC ANGLE closed-loop angle-step trials (yaw remains a rate test), with the exist
 outer-loop settings fixed and recorded; it requires new firmware capability
 `CMD_APPLY_PID args="angle" -> ANGLE OFFBOARD 1`. The raw ATTITUDE path encodes
 roll/pitch targets in degrees and yaw in deg/s using `mode_req=3`; normal raw
-BODY_RATES remains `mode_req=2`. Mode feedback distinguishes `OFFBOARD|ANGLE`.
+BODY_RATES remains `mode_req=2`. ATTITUDE-mode `bodyrates.x/y` (reference-trajectory
+feedforward per the ControlCommand contract) are not carried by `mode_req=3` - the FC
+flies its pure angle-P loop; roll/pitch targets are bounded by the pid profile's
+`angle_limit` (CLI, default 60) and optionally by `link.angle_limit_deg` (0 = off).
+Mode feedback distinguishes `OFFBOARD|ANGLE`.
 Actual PID application still uses a short, guarded zero-output window. It cannot
 support an unbalanced rig after power loss or stopping. Runtime PID application
 requires the matching firmware/service extension; ordinary CLI SET readback alone
