@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Collect AirSim throttle/acceleration pulses or fit an existing CSV to A..D."""
+"""Collect AirSim throttle/acceleration pulses or fit an existing CSV to the fpv_test.md model.
+
+The model is F_std(u) = a3*u^3 + a2*u^2 + a1*u (total thrust, N) over the DShot duty
+u = motor_idle + (1 - motor_idle) * collective, fitted by the zero-intercept normal
+equations of fpv_test.md section 3.2 (scripts/propulsion_model.py). AirSim has no
+barometer, battery sag or RPM feedback, so the environment/voltage steps are skipped
+and both node compensations stay disabled.
+"""
 
 import argparse
 import csv
@@ -11,44 +18,45 @@ import time
 import numpy as np
 import yaml
 
-from sitl_support import MotorModel, VerticalEstimator, conjugate, euler, multiply
+import propulsion_model as pm
+from sitl_support import VerticalEstimator, conjugate, euler, multiply
 
 
-def fit_samples(samples, mass: float, gravity: float, degree: int,
-                thrust_limit: float, max_error: float):
+def fit_samples(samples, mass: float, gravity: float, max_error: float,
+                motor_idle: float = pm.DEFAULT_MOTOR_IDLE, u_idle: float = pm.DEFAULT_U_IDLE):
+    """(force_N, collective) samples -> (PropulsionModel, report)."""
     if not math.isfinite(mass) or mass <= 0 or not math.isfinite(gravity) or gravity <= 0:
         raise ValueError("mass and gravity must be finite and positive")
     values = np.asarray(samples, dtype=float)
-    if values.ndim != 2 or values.shape[1] != 2 or len(values) < degree + 2:
+    if values.ndim != 2 or values.shape[1] != 2 or len(values) < 4:
         raise ValueError("too few (force_N, throttle) samples")
-    force, throttle = values[:, 0], values[:, 1]
+    force, collective = values[:, 0], values[:, 1]
     if not np.isfinite(values).all() or np.any(force <= 0) or \
-            np.any(throttle < 0) or np.any(throttle > thrust_limit):
+            np.any(collective < 0) or np.any(collective > 1):
         raise ValueError("samples must be finite, airborne and inside the throttle domain")
-    if len(np.unique(throttle)) < degree + 2 or np.ptp(force) < mass * gravity * 0.2:
+    if len(np.unique(collective)) < 3 or np.ptp(force) < mass * gravity * 0.2:
         raise ValueError("insufficient throttle levels or force range")
-    poly = np.polynomial.Polynomial.fit(force, throttle, degree).convert()
-    coeff = np.zeros(4)
-    coeff[:len(poly.coef)] = poly.coef
-    predicted = poly(force)
-    error = predicted - throttle
+    duty = np.array([pm.collective_to_duty(c, motor_idle) for c in collective])
+    (a3, a2, a1), stats = pm.fit_zero_intercept_cubic(duty, force)
+    monotonic, min_slope = pm.monotonic_check(a3, a2, a1)
+    if not monotonic:
+        raise ValueError(f"fitted F(u) violates dF/du > 0 on [0,1] (min slope {min_slope:.4g})")
+    model = pm.PropulsionModel(a3=a3, a2=a2, a1=a1, u_idle=u_idle, motor_idle=motor_idle)
+    # Residual in throttle (duty) units: model inversion of each measured force.
+    error = np.array([model.solve_standard_throttle(f) for f in force]) - duty
     rmse, peak = float(np.sqrt(np.mean(error ** 2))), float(np.max(np.abs(error)))
     if peak > max_error:
         raise ValueError(f"fit residual {peak:.6f} exceeds {max_error:.6f}; inspect transient/drag samples")
-    domain = np.linspace(0, max(float(force.max()), mass * gravity * 1.5), 1000)
-    if np.any(poly.deriv()(domain) <= 0):
-        raise ValueError("fitted force -> throttle polynomial is not monotonic")
-    model = MotorModel(A=float(coeff[3]), B=float(coeff[2]), C=float(coeff[1]),
-                       D=float(coeff[0]), n=1,
-                       thrust_limit=min(thrust_limit, float(throttle.max())))
     hover = model.throttle(mass * gravity)
-    if not 0 < hover < thrust_limit:
+    if not u_idle < hover < 1.0:
         raise ValueError("fitted hover throttle lies outside the usable domain")
-    report = {"samples": len(values), "degree": degree, "mass_kg": mass,
-              "gravity_m_s2": gravity, "force_range_N": [float(force.min()), float(force.max())],
-              "throttle_rmse": rmse, "throttle_max_error": peak, "hover_throttle": hover,
-              "calibrated_thrust_limit": model.thrust_limit,
-              "r_squared": float(1 - np.sum(error ** 2) / np.sum((throttle - throttle.mean()) ** 2))}
+    report = {"samples": len(values), "mass_kg": mass, "gravity_m_s2": gravity,
+              "force_range_N": [float(force.min()), float(force.max())],
+              "duty_range": [float(duty.min()), float(duty.max())],
+              "throttle_rmse": rmse, "throttle_max_error": peak,
+              "force_rms_N": stats["rms"], "r_squared": stats["r_squared"],
+              "min_slope_N": min_slope, "hover_duty": hover,
+              "hover_collective": pm.duty_to_collective(hover, motor_idle)}
     return model, report
 
 
@@ -58,12 +66,17 @@ def read_samples(path: Path):
     return [(float(row["force_N"]), float(row["throttle"])) for row in rows]
 
 
-def write_parameters(template: Path, output: Path, model: MotorModel, mass: float, gravity: float):
+def model_parameters(model: pm.PropulsionModel):
+    return {"a3": model.a3, "a2": model.a2, "a1": model.a1, "u_idle": model.u_idle,
+            "motor_idle": model.motor_idle, "r_eq": 0.0, "k_i": 0.0}
+
+
+def write_parameters(template: Path, output: Path, model: pm.PropulsionModel, mass: float, gravity: float):
     with template.open() as stream:
         config = yaml.safe_load(stream)
     params = config["custom_link_bridge"]["ros__parameters"]
     params.update(mass=mass, gravity_const=gravity, voltage_compensation=False, baro_compensation=False)
-    params["motor_parameters"].update(vars(model), vbat_a=0.0, vbat_b=1.0)
+    params["motor_parameters"] = model_parameters(model)
     with output.open("w") as stream:
         yaml.safe_dump(config, stream, sort_keys=False)
 
@@ -127,9 +140,12 @@ def collect(args, config):
     owned, airborne = False, False
     csv_stream = None
     origin = None
-    bootstrap = MotorModel(**{k: config["motor_parameters"][k]
-                              for k in ("A", "B", "C", "D", "n", "thrust_limit", "spin_k")})
-    rotor_hover = 0.055 + 0.945 * bootstrap.throttle(args.mass * args.gravity)
+    bootstrap = pm.PropulsionModel.from_parameters(config["motor_parameters"], config.get("lipo_cells", 6))
+    model_error = bootstrap.validate()
+    if model_error:
+        raise RuntimeError(f"SITL parameters need a valid model to hover: {model_error}")
+    idle = bootstrap.motor_idle
+    rotor_hover = bootstrap.throttle(args.mass * args.gravity)  # hover DShot duty
     samples = []
 
     def command(rates, throttle):
@@ -168,7 +184,7 @@ def collect(args, config):
             rates = (max(-0.5, min(0.5, -4 * roll)),
                      max(-0.5, min(0.5, -4 * pitch)), 0.0)
             tilt = max(0.7, math.cos(roll) * math.cos(pitch))
-            throttle = (rotor_hover / tilt - 0.055) / 0.945 + \
+            throttle = (rotor_hover / tilt - idle) / (1 - idle) + \
                 rotor_hover / 0.587 * (0.05 * (target_height - height) - 0.10 * node.velocity)
             if pulse is not None:
                 throttle = pulse
@@ -269,10 +285,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="standalone fitted ROS parameters")
     parser.add_argument("--mass", type=float, default=2.0)
     parser.add_argument("--gravity", type=float, default=9.80665)
-    parser.add_argument("--degree", type=int, choices=(1, 2, 3), default=1,
-                        help="AirSim rotor signal is thrust-linear; default avoids cubic overfitting")
-    parser.add_argument("--thrust-limit", type=float, default=0.5)
-    parser.add_argument("--max-error", type=float, default=0.01)
+    parser.add_argument("--thrust-limit", type=float, default=0.5,
+                        help="maximum Betaflight collective commanded during the experiment")
+    parser.add_argument("--motor-idle", type=float, default=pm.DEFAULT_MOTOR_IDLE,
+                        help="FC dshot_idle_value/10000 (AirSim rotor signal = idle + (1-idle)*collective)")
+    parser.add_argument("--u-idle", type=float, default=pm.DEFAULT_U_IDLE)
+    parser.add_argument("--max-error", type=float, default=0.01,
+                        help="maximum inverse-model residual in throttle (duty) units")
     parser.add_argument("--levels", type=float, nargs="+", default=[0.08, 0.12, 0.17, 0.22, 0.3, 0.4, 0.5])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--pulse-time", type=float, default=0.3)
@@ -286,15 +305,15 @@ def main():
     if args.repeats < 1 or not 0 <= args.settle_time < args.pulse_time or \
             args.pulse_time > 0.3 or any(not 0 < v <= args.thrust_limit for v in args.levels):
         parser.error("invalid repeats, pulse duration or throttle levels")
-    if not 0 < args.thrust_limit <= 1 or args.max_error <= 0:
-        parser.error("invalid thrust limit or residual threshold")
+    if not 0 < args.thrust_limit <= 1 or args.max_error <= 0 or not 0 <= args.motor_idle < 1:
+        parser.error("invalid thrust limit, motor idle or residual threshold")
     with args.parameters.open() as stream:
         config = yaml.safe_load(stream)["custom_link_bridge"]["ros__parameters"]
     samples = collect(args, config) if args.collect else read_samples(args.fit)
-    model, report = fit_samples(samples, args.mass, args.gravity, args.degree,
-                                args.thrust_limit, args.max_error)
+    model, report = fit_samples(samples, args.mass, args.gravity, args.max_error,
+                                args.motor_idle, args.u_idle)
     write_parameters(args.parameters, args.output, model, args.mass, args.gravity)
-    print(json.dumps({"motor_parameters": vars(model), **report}, indent=2))
+    print(json.dumps({"motor_parameters": model_parameters(model), **report}, indent=2))
 
 
 if __name__ == "__main__":

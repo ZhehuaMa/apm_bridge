@@ -1,7 +1,6 @@
-"""Frame and motor-model helpers for SITL calibration tests."""
+"""Frame helpers for SITL calibration tests (the motor model lives in propulsion_model.py)."""
 
 import math
-from dataclasses import dataclass
 import numpy as np
 
 
@@ -41,35 +40,6 @@ class VerticalEstimator:
         self.state += gain * (altitude - self.state[0])
         correction = np.eye(2) - np.outer(gain, np.array([1.0, 0.0]))
         self.covariance = correction @ self.covariance @ correction.T + variance * np.outer(gain, gain)
-
-
-@dataclass(frozen=True)
-class MotorModel:
-    A: float
-    B: float
-    C: float
-    D: float
-    n: int = 1
-    thrust_limit: float = 0.5
-    spin_k: float = 0.0
-
-    def __post_init__(self):
-        if not all(math.isfinite(v) for v in
-                   (self.A, self.B, self.C, self.D, self.thrust_limit, self.spin_k)):
-            raise ValueError("motor parameters must be finite")
-        if self.n < 1 or not 0 < self.thrust_limit <= 1 or not 0 <= self.spin_k <= 1:
-            raise ValueError("invalid motor count, thrust limit or spin_k")
-        if self.C <= 0:
-            raise ValueError("motor_parameters.C must be positive")
-
-    def throttle(self, force: float) -> float:
-        if not math.isfinite(force):
-            raise ValueError("collective force must be finite")
-        # Same per-motor force -> throttle polynomial as quadratic_thrust_model.h.
-        x = max(0.0, force) / self.n
-        t = ((self.A * x + self.B) * x + self.C) * x + self.D
-        t = (1 - self.spin_k) * t + self.spin_k * t * t
-        return max(0.0, min(self.thrust_limit, t))
 
 
 def quaternion(q) -> tuple[float, float, float, float]:

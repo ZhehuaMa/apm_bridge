@@ -38,7 +38,9 @@ from std_msgs.msg import Bool, Float64, Header, String
 from vision_msgs.msg import Detection2D
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from sitl_support import MotorModel, VerticalEstimator, euler, enu_flu
+import propulsion_model as pm
+import yaml
+from sitl_support import VerticalEstimator, euler, enu_flu
 from airsim_tracker.target_los import TargetLosEstimator
 
 
@@ -188,7 +190,7 @@ class FlightObserver(Node):
                     return
             rates = np.clip([4 * (roll_goal - roll), 4 * (pitch_goal - pitch),
                              3 * math.atan2(math.sin(yaw_goal - yaw), math.cos(yaw_goal - yaw))], -.5, .5)
-            rotor_hover = .055 + .945 * self.model.throttle(2.0 * 9.80665)
+            rotor_hover = self.model.throttle(2.0 * 9.80665)  # hover DShot duty (fpv_test.md model)
             tilt = max(.7, math.cos(roll) * math.cos(pitch))
             throttle = (rotor_hover / tilt - .055) / .945 + rotor_hover / .587 * (
                 .05 * (self.height_goal - height) - .10 * velocity)
@@ -558,7 +560,9 @@ def main():
              "-r", "~/arm:=/fpv/arm", "-r", "~/offboard:=/fpv/offboard",
              "-r", "~/low_level_feedback:=/fpv/low_level_feedback"], stdout=bridge_log, stderr=bridge_log)
         stack.callback(stop_process, bridge)
-        model = MotorModel(0, 0, .011891350984191815, -.059949564628813956, thrust_limit=.5)
+        sitl_params = yaml.safe_load((Path(__file__).resolve().parents[1] / "parameters/sitl_parameters.yaml")
+                                     .read_text())["custom_link_bridge"]["ros__parameters"]
+        model = pm.PropulsionModel.from_parameters(sitl_params["motor_parameters"], 6)
         rclpy.init()
         node = FlightObserver(model, args.pitch_hold)
         executor = SingleThreadedExecutor()

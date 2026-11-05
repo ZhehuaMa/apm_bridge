@@ -24,18 +24,20 @@ custom_link_bridge:
       roll_hold_enter: 75.0
       roll_hold_exit: 70.0
 
-    # Measured on 2026-10-10: 42 steady-state samples, 2 repeats, throttle 0.08..0.50.
-    # Data: sitl_motor_calibration.csv; RMSE=0.0006233, max throttle error=0.0016002.
-    # A..D map total force [N] to BF collective, NOT ESC throttle/RPM.
+    # Measured on 2026-10-10: 42 steady-state samples, 2 repeats, collective 0.08..0.50
+    # (data: sitl_motor_calibration.csv). Fitted with the fpv_test.md model: zero-intercept
+    # cubic F_std(u) = a3*u^3 + a2*u^2 + a1*u over the DShot duty u = 0.055 + 0.945*collective
+    # (sitl_motor_calibration --fit): R^2=0.99998, max throttle error 0.0016, hover collective 0.1732.
+    # AirSim has no baro/voltage sag/RPM feedback: both compensations stay disabled, r_eq = k_i = 0.
     # Recalibrate after changing the vehicle, PWM endpoints or simulation environment.
     motor_parameters:
-      A: 0.0
-      B: 0.0
-      C: 0.011891350984191815
-      D: -0.059949564628813956
-      n: 1
-      thrust_limit: 1.0
-      spin_k: 0.0
+      a3: -1.3910762188770394
+      a2: -0.5510910291316834
+      a1: 89.87610919170108
+      u_idle: 0.05
+      motor_idle: 0.055
+      r_eq: 0.0
+      k_i: 0.0
 
     airsim:
       enabled: true

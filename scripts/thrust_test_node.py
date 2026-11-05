@@ -1,48 +1,41 @@
 #!/usr/bin/python3
-"""油门-拉力整机台架标定工具 (custom_link_bridge 专用, 见 fpv_test.md 工程规范)。
+"""整机拉力测试 (fpv_test.md §2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge)。
 
-台架标定: 无人机固定在台秤上 (DT30X 经 scale_reader_node 发布 /current_weight，
-或任何遵循 [weight_kg, stable_weight_kg(NaN=未稳定)] 约定的发布器)，通过
-custom_link_bridge_node 以 raw 通道直通油门，自动扫油门采集 (油门, 拉力) 数据点
-并拟合 quadratic_thrust_model 所需的 motor_parameters 系数 (即 fpv_test.md 第 3 节
-的推力-油门转换曲线, 与节点运行时 forceToThrust/thrustToForce 同口径):
+整机通过夹具固定在台秤上 (DT30X 经 scale_reader_node 发布 /current_weight =
+[weight_kg, stable_weight_kg(NaN=未稳定)])。工具经 /fpv/control_command_raw 直通油门,
+按 §2.2 阶梯测试动作采集稳态数据点 (u_i, V_i, I_i, RPM_1..4,i, F_i, P_i, t_meas,i):
 
-    thrust = kp * ((1-k)*thr + k*thr^2),  thr = A*f^3 + B*f^2 + C*f + D
-    f = F_total / n  (单电机受力)
-    系数为标准电压 V_ref = lipo_cells*3.7 (标称) 口径: 标定时实测力经
-    f_ref = f * (a*V+b)/(a*V_ref+b) 归一 (--map-a/--map-b 来自 --vbat 拟合),
-    运行时桥接在多项式入口施加同一因子 (motor_parameters.vbat_a/vbat_b)。
+  * 油门 (DShot 占空比 u) 从 0.05 起以 0.05 步进至 1.00 (可调), 共 20 阶;
+  * 每阶 2.5 s: 前 0.5 s 稳定等待丢弃, 后 2.0 s 内对所有数据流做同步均值;
+  * u >= 0.70 的每阶结束后回落怠速运行 5.0 s 降温/去极化。
 
-后端只支持 custom (custom_link_bridge_node, 定制链路 Betaflight / AirSim SITL):
-  解锁走 /fpv/arm (2 Hz level 重发)。OFFBOARD 授权有两种来源:
-    * 真机/有遥控: 飞手保持 BOXOFFBOARD 开关 (默认, 最安全);
-    * AirSim / 无遥控台架: 传 --offboard, 工具额外以 2 Hz 发布 /fpv/offboard
-      由主机请求 OFFBOARD。
+再按 §3 归一化与拟合 (scripts/propulsion_model.py):
+  1. 环境推力归一化 F0 = F·(101325/P)·((t+273.15)/273.15)
+  2. 四电机均方根转速 RPM_rms
+  3. 多元线性最小二乘 u·V = (1/K_v*)·RPM_rms + R_eq·I 辨识 R_eq, K_v*
+  4. 折算到 V_ref: F_std = F0·((u·V_ref − I_std·R_eq)/(u·V − I·R_eq))², I_std ≈ I·(V_ref/V)²
+  5. 无截距三次多项式 F_std(u) = a3u³ + a2u² + a1u (正规方程) + 单调性检验
+输出 CSV、带 motor_parameters 段的 *_result.yaml (直接粘贴进 custom_link_parameters.yaml)
+与 PNG。
 
-AirSim / SITL 兼容 (无气压、无电压下降、无转速反馈时自动降级):
-  * 无 /fpv/static_pressure 或 --no-voltage-comp: kp 默认 1.0, 不做环境归一;
-  * --no-voltage-comp 且不给 --map-*: 不做电压归一 (AirSim 无放电压降);
-  * /fpv/motor_rpm 缺失或全 NaN (双向 DShot 未开): rpm_rms 记为 NaN, 拟合不依赖
-    转速 —— 直接按 (油门, 拉力) 拟合三次曲线, 与 fpv_test.md 的 RMS-RPM 解耦等价
-    于理想定高工况。转速/电流列仅作离线高级归一化 (fpv_test.md 3.1 节) 的留档。
+油门域: Betaflight 集体油门 c 与占空比 u 的关系为 u = motor_idle + (1 − motor_idle)·c
+(dshot_idle_value, 默认 5.5%); 低于 motor_idle 的阶梯实际以 motor_idle 运行并按实际值记录。
 
-采集流程 (自动，无键盘交互):
-  从 --min-thrust 起，每档 +--step 直到 --max-thrust；每档等 --settle-time
-  稳定后以 10 Hz 连采 --samples-per-point 个稳定重量取平均记为一个数据点。
-  Ctrl+C 中止: 走安全关停 (油门回最低、上锁)，已采数据照常输出。
+AirSim / SITL (无气压、无电压下降、无转速反馈): 传 --no-env-comp --no-voltage-comp
+跳过步骤 1、3、4 (与节点 baro_compensation/voltage_compensation=false 对应);
+转速缺失时 RPM_rms 记 NaN, R_eq 辨识跳过。--offboard 由主机请求 OFFBOARD。
 
-安全: 采集中重量低于 --critical-weight 自动降油门 (防抬离秤)；扫描中意外
-掉锁则立即中止。
+安全: 台秤读数低于 --critical-weight (整机抬离) 或扫描中 FC 掉锁立即中止;
+Ctrl+C 安全关停 (油门回最低、上锁), 已采数据照常输出。
 
 用法 (需系统 python，conda 环境请先 deactivate):
-  ros2 run apm_bridge thrust_test_node --lipo-cells 6 --num-motors 4           # 真机 (飞手持 BOXOFFBOARD)
-  ros2 run apm_bridge thrust_test_node --offboard --no-voltage-comp --num-motors 4  # AirSim/SITL
+  ros2 run apm_bridge thrust_test_node --lipo-cells 6                    # 真机, 飞手持 BOXOFFBOARD
+  ros2 run apm_bridge thrust_test_node --offboard --no-env-comp --no-voltage-comp --yes   # AirSim
 """
 
 from __future__ import annotations
 
 import argparse
-import bisect
 import csv
 import datetime
 import math
@@ -54,6 +47,8 @@ import threading
 import time
 
 import numpy as np
+
+import propulsion_model as pm
 
 try:
     import rclpy
@@ -70,12 +65,11 @@ try:
     _ROS_IMPORT_ERROR = None
 except ImportError as exc:  # pragma: no cover - pure-function use (tests) needs no ROS
     _ROS_IMPORT_ERROR = exc
-    Node = object  # placeholder base so ThrustTestNode can still be defined
+    Node = object
 
-# custom 后端上锁后控制流需继续保持，arm=0 边沿随 0x20 帧送达 FC (SITL 验证语义)
+# 上锁后控制流继续保持, 让 arm=0 边沿随 0x20 帧送达 FC (SITL 验证语义)
 DISARM_STREAM_TIME = 2.0
-# 采集时重量样本最长等待 (无秤/秤一直不稳定则放弃该点)
-COLLECT_TIMEOUT_MARGIN = 5.0
+MIN_SCALE_RATE_HZ = 10.0  # §2.1 拉力采样率 >= 10 Hz
 
 
 class bcolors:
@@ -87,144 +81,72 @@ class bcolors:
 
 
 class FatalError(Exception):
-    """启动阶段不可恢复的错误 (安全关停后退出)。"""
+    """不可恢复的错误 (安全关停后退出)。"""
 
 
 # ======================================================================
-# 纯函数: 模型反解与拟合 (离线可测)
+# §2.2 阶梯测试动作 (纯函数, 离线可测)
 # ======================================================================
 
-def inv_spin_map(s, k):
-    """(1-k)t + k t^2 的逆映射: 已知 s 求 t。k 近 0 时直接返回 s。"""
-    if abs(k) <= 1e-9:
-        return s
-    k_1 = k - 1.0
-    inner = k_1 * k_1 + 4.0 * k * s
-    if inner < 0.0:
-        inner = 0.0
-    return (k_1 + math.sqrt(inner)) / (2.0 * k)
+def sop_levels(u_start, u_step, u_end):
+    """u_start 起以 u_step 递增至 u_end (含), 默认 0.05..1.00 共 20 阶。"""
+    if not (0.0 < u_start <= u_end <= 1.0) or not u_step > 0.0:
+        raise ValueError('require 0 < u_start <= u_end <= 1 and u_step > 0')
+    count = int(math.floor((u_end - u_start) / u_step + 1e-9)) + 1
+    levels = [round(u_start + i * u_step, 6) for i in range(count)]
+    if levels[-1] < u_end - 1e-9:
+        levels.append(u_end)
+    return levels
 
 
-def normalize_throttle(thrust_norm, kp, spin_k, voltage, volt_max, voltage_comp):
-    """把命令油门 t 反解为多项式输入 thr: t = kp*spin(thr*[volt_max/V])。
-
-    volt_max 归一化的系数在电压补偿开启时才是运行时正确的口径；
-    --map-a/--map-b (vbat) 模式下不走本函数的电压项，电压归一在力侧完成。
-    """
-    x = inv_spin_map(thrust_norm / kp, spin_k)
-    if voltage_comp and volt_max > 0.0 and voltage > 0.0:
-        x *= voltage / volt_max
-    return x
-
-
-def vbat_scale(a, b, vref, voltage):
-    """phi(V) = (a*V+b)/(a*V_ref+b): 当前电压力 <-> 标准电压口径力的换算因子。
-
-    与 quadratic_thrust_model.h 的 vbatScale 同口径，标定与运行时对称使用。
-    """
-    return (a * voltage + b) / (a * vref + b)
+def sop_timeline(levels, step_time, settle_time, cooldown_threshold, cooldown_time, u_idle):
+    """展开为 (动作, 占空比, 时长) 序列: hold_settle → hold_sample [→ cooldown]。"""
+    if not 0.0 <= settle_time < step_time:
+        raise ValueError('require 0 <= settle_time < step_time')
+    timeline = []
+    for u in levels:
+        timeline.append(('settle', u, settle_time))
+        timeline.append(('sample', u, step_time - settle_time))
+        if u >= cooldown_threshold - 1e-9 and cooldown_time > 0.0:
+            timeline.append(('cooldown', u_idle, cooldown_time))
+    return timeline
 
 
-def fit_motor_cubic(points, n_motors):
-    """拟合 x = A*y^3 + B*y^2 + C*y + D, y = F_total/n, x = 多项式输入油门。
+def average_window(window, tare_kg, gravity):
+    """一个稳态采样段的同步均值 -> 数据点 dict (缺失量为 NaN)。"""
+    def mean(values):
+        vals = [v for v in values if math.isfinite(v)]
+        return sum(vals) / len(vals) if vals else float('nan')
 
-    points: Recorder 的数据点列表。返回 (fit_dict, err_reason)。
-    """
-    if len(points) < 4:
-        return None, 'samples less than 4, cubic fit needs at least 4 points'
-    y = np.array([p['force_n'] / n_motors for p in points])
-    x = np.array([p['x_poly'] for p in points])
-    # Polynomial.fit 对自变量做窗口缩放，避免 y^3 量级 (1e5) 下的病态 Vandermonde
-    poly = np.polynomial.Polynomial.fit(y, x, 3)
-    coef = poly.convert().coef  # 升幂: D, C, B, A
-    D, C, B, A = (float(v) for v in coef)
-    rms = float(np.sqrt(np.mean((poly(y) - x) ** 2)))
-    ys = np.linspace(float(np.min(y)), float(np.max(y)), 200)
-    deriv_min = float(np.min(3.0 * A * ys * ys + 2.0 * B * ys + C))
-    return {'A': A, 'B': B, 'C': C, 'D': D, 'rms': rms,
-            'deriv_min': deriv_min, 'n_points': len(points)}, None
+    rpm = [mean(series) for series in window['rpm']] if window['rpm'] else []
+    weight = mean(window['weight'])
+    return {'u': window['u'], 'collective': window['collective'],
+            'V': mean(window['V']), 'I': mean(window['I']), 'rpm': rpm,
+            'F': (tare_kg - weight) * gravity if math.isfinite(weight) else float('nan'),
+            'P': mean(window['P']), 't': mean(window['t']),
+            'weight_kg': weight, 'n_weight': len(window['weight'])}
 
 
-def fit_voltage_linear(points):
-    """vbat 模式: 相对拉力 y = mean(F)/F 对整包电压 V 的一次拟合，返回 (a, b)。"""
-    if len(points) < 3:
-        return None, 'samples less than 3'
-    forces = np.array([p['force_n'] for p in points])
-    voltages = np.array([p['voltage'] for p in points])
-    y = float(np.mean(forces)) / forces
-    poly = np.polynomial.Polynomial.fit(voltages, y, 1).convert()
-    return (float(poly.coef[1]), float(poly.coef[0])), None
+def new_window(u, collective, n_motors=0):
+    return {'u': u, 'collective': collective, 'weight': [], 'V': [], 'I': [],
+            'rpm': [[] for _ in range(n_motors)], 'P': [], 't': []}
 
 
-def render_param_yaml(node_key, fit, n_motors, spin_k, vbat, notes):
-    """生成可直接并入 parameters/*.yaml 的 motor_parameters 片段。
-
-    vbat: (--map-a, --map-b) 元组，非 None 时一并写出 vbat_a/vbat_b。
-    """
-    lines = [f'{node_key}:',
+def render_param_yaml(result, args):
+    """生成可直接并入 custom_link_parameters.yaml 的片段。"""
+    lines = ['custom_link_bridge:',
              '  ros__parameters:',
-             '    motor_parameters:']
-    for key in ('A', 'B', 'C', 'D'):
-        lines.append(f'      {key}: {fit[key]:.9g}')
-    lines.append(f'      n: {n_motors}')
-    lines.append(f'      spin_k: {spin_k:.9g}')
-    if vbat is not None:
-        lines.append(f'      vbat_a: {vbat[0]:.9g}')
-        lines.append(f'      vbat_b: {vbat[1]:.9g}')
-    for note in notes:
-        lines.append(f'    # {note}')
+             f'    voltage_compensation: {str(not args.no_voltage_comp).lower()}',
+             f'    baro_compensation: {str(not args.no_env_comp).lower()}',
+             '    motor_parameters:',
+             f"      a3: {result['a3']:.9g}",
+             f"      a2: {result['a2']:.9g}",
+             f"      a1: {result['a1']:.9g}",
+             f'      u_idle: {args.u_idle:.6g}',
+             f'      motor_idle: {args.motor_idle:.6g}',
+             f"      r_eq: {result['r_eq']:.9g}",
+             f"      k_i: {result['k_i']:.9g}"]
     return '\n'.join(lines)
-
-
-# ======================================================================
-# 数据记录
-# ======================================================================
-
-class Recorder:
-    """数据点按 x 升序插入、按 key 去重 (对齐旧工具 insert_data/insert_vbat)。"""
-
-    def __init__(self):
-        self.points = []
-        self.keys = set()
-
-    def clear(self):
-        self.points = []
-        self.keys = set()
-
-    def insert_normal(self, *, throttle_pct, thrust_norm, voltage, weight_kg,
-                      force_n, kp, x_poly, current=float('nan'), rpm_rms=float('nan')):
-        key = round(throttle_pct, 3)
-        if key in self.keys:
-            return False
-        self.keys.add(key)
-        point = {'time': time.time(), 'throttle_pct': throttle_pct,
-                 'thrust_norm': thrust_norm, 'voltage': voltage,
-                 'current': current, 'rpm_rms': rpm_rms,
-                 'weight_kg': weight_kg, 'force_n': force_n,
-                 'kp': kp, 'x_poly': x_poly}
-        self._insert_sorted(point)
-        return True
-
-    def insert_vbat(self, *, voltage, force_n, weight_kg, vmin, vmax,
-                    current=float('nan'), rpm_rms=float('nan')):
-        if voltage < vmin or voltage > vmax:
-            return False
-        key = int(voltage * 100)
-        if key in self.keys:
-            return False
-        self.keys.add(key)
-        point = {'time': time.time(), 'throttle_pct': float('nan'),
-                 'thrust_norm': float('nan'), 'voltage': voltage,
-                 'current': current, 'rpm_rms': rpm_rms,
-                 'weight_kg': weight_kg, 'force_n': force_n,
-                 'kp': float('nan'), 'x_poly': float('nan')}
-        self._insert_sorted(point)
-        return True
-
-    def _insert_sorted(self, point):
-        pos = bisect.bisect([p['x_poly'] if not math.isnan(p['x_poly']) else math.inf
-                             for p in self.points], point['x_poly'])
-        self.points.insert(pos, point)
 
 
 # ======================================================================
@@ -239,73 +161,56 @@ class ThrustTestNode(Node):
         self.lock = threading.RLock()
         self.abort_event = threading.Event()
         self.state_event = threading.Event()
-        self.baro_event = threading.Event()
         self.weight_event = threading.Event()
 
         # ---- 共享状态 (lock 保护) ----
-        self.thrust_pct = args.min_thrust
+        self.collective = 0.0
         self.testing = False
         self.disarming = False
         self.armed = False
         self.mode = ''
-        self.whole_weight = 0.0            # 去皮基准 (kg)
-        self.stable_weight = float('nan')  # 合成后的稳定重量 (kg)
-        self.battery_voltage = 0.0         # 整包电压
-        self.battery_current = float('nan')  # 总回路电流 (A, 幅值; fpv_test.md 的 I_meas)
-        self.motor_rpm_rms = float('nan')  # 四电机均方根转速 (无双向 DShot 时 NaN)
-        self.orientation = None            # 最新 IMU 四元数 (姿态回显)
-        self.baro = 101325.0
-        self.temp = 25.0
-        self.kp_avg = 1.0
-        self.quiet = False                 # 采集进度期间抑制 1 Hz 状态行
-        self._arm_intent = False           # custom /fpv/arm 期望电平
-        self._offboard_intent = False      # --offboard: /fpv/offboard 期望电平
-        self._voltage_warned = False
+        self.orientation = None
+        self.last_weight = float('nan')
+        self.last_stable = float('nan')
+        self.last_voltage = float('nan')
+        self.tare_samples = None          # 去皮期间收集的稳定重量
+        self.window = None                # 当前稳态采样段 (None = 不采集)
+        self.quiet = False
+        self._arm_intent = False
+        self._offboard_intent = False
 
-        self.recorder = Recorder()
+        self.points = []
+        self.tare_kg = float('nan')
 
-        # ---- 发布 ----
         qos_be5 = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_be10 = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.cmd_pub = self.create_publisher(ControlCommand,
-                                             '/fpv/control_command_raw', qos_be5)
+        self.cmd_pub = self.create_publisher(ControlCommand, '/fpv/control_command_raw', qos_be5)
         self.arm_pub = self.create_publisher(Bool, '/fpv/arm', qos_be10)
-        # --offboard: 主机侧请求 OFFBOARD (AirSim / 无遥控台架)。真机默认不发,
-        # 由飞手持 BOXOFFBOARD 开关授权。
         self.offboard_pub = (self.create_publisher(Bool, '/fpv/offboard', qos_be10)
                              if args.offboard else None)
 
-        # ---- 订阅 ----
         self.create_subscription(State, '/mavros/state', self.on_state, 10)
-        self.create_subscription(BatteryState, '/mavros/battery',
-                                 self.on_battery, qos_be10)
-        self.create_subscription(Float32MultiArray, '/current_weight',
-                                 self.on_weight, qos_be10)
+        self.create_subscription(BatteryState, '/mavros/battery', self.on_battery, qos_be10)
+        self.create_subscription(Float32MultiArray, '/current_weight', self.on_weight, qos_be10)
         self.create_subscription(Imu, '/mavros/imu/data', self.on_imu, qos_be10)
-        # 环境气压/温度: custom_link_bridge 由 0x11 遥测统一发布 /fpv 话题, 供 kp 采集。
-        # AirSim SITL 无 baro 时不发/发 0, kp 退回 1.0。
-        self.create_subscription(FluidPressure, '/fpv/static_pressure',
-                                 self.on_pressure, qos_be10)
-        self.create_subscription(Temperature, '/fpv/temperature_baro',
-                                 self.on_temperature, qos_be10)
-        # 四电机机械转速 (0x16 ESC 遥测)。双向 DShot 未开/AirSim 时为 NaN, rpm_rms
-        # 记为 NaN, 拟合不依赖转速 (fpv_test.md 的 RMS-RPM 解耦仅作离线留档)。
-        self.create_subscription(Float32MultiArray, '/fpv/motor_rpm',
-                                 self.on_motor_rpm, qos_be10)
+        self.create_subscription(FluidPressure, '/fpv/static_pressure', self.on_pressure, qos_be10)
+        self.create_subscription(Temperature, '/fpv/temperature_baro', self.on_temperature, qos_be10)
+        self.create_subscription(Float32MultiArray, '/fpv/motor_rpm', self.on_motor_rpm, qos_be10)
 
-        # ---- 定时器 ----
-        self.control_timer = self.create_timer(1.0 / args.control_rate,
-                                               self.control_timer_cb)
-        self.arm_keepalive_timer = self.create_timer(0.5, self.arm_keepalive_cb)
-        self.status_timer = self.create_timer(1.0, self.status_timer_cb)
+        self.create_timer(1.0 / args.control_rate, self.control_timer_cb)
+        self.create_timer(0.5, self.arm_keepalive_cb)
+        self.create_timer(1.0, self.status_timer_cb)
 
     # ---------------------------------------------------------- 订阅回调
 
-    def on_state(self, msg: State):
+    def _append(self, key, value):
         with self.lock:
-            was_testing = self.testing
-            was_armed = self.armed
-            disarming = self.disarming
+            if self.window is not None:
+                self.window[key].append(value)
+
+    def on_state(self, msg):
+        with self.lock:
+            was_testing, was_armed, disarming = self.testing, self.armed, self.disarming
             self.armed = msg.armed
             self.mode = msg.mode
         self.state_event.set()
@@ -313,95 +218,77 @@ class ThrustTestNode(Node):
             print(f'\n{bcolors.ERROR}*** FC DISARMED during test! Aborting. ***{bcolors.ENDC}')
             self.abort_event.set()
 
-    def on_battery(self, msg: BatteryState):
-        voltage = 0.0
-        if len(msg.cell_voltage) > 0:
+    def on_battery(self, msg):
+        voltage = float('nan')
+        if len(msg.cell_voltage) > 0 and msg.cell_voltage[0] > 0.0:
             voltage = float(msg.cell_voltage[0])  # 本项目约定: cell_voltage[0] = 整包
-        elif not math.isnan(msg.voltage):
+        elif math.isfinite(msg.voltage) and msg.voltage > 0.0:
             voltage = float(msg.voltage)
-        # ROS 约定放电电流为负; fpv_test.md 的 I_meas 取幅值。NaN/0 (AirSim 无电流
-        # 遥测) 留 NaN, 只作离线留档, 不参与拟合。
-        current = float('nan')
-        if not math.isnan(msg.current) and msg.current != 0.0:
-            current = abs(float(msg.current))
+        # ROS 约定放电电流为负; §2.1 的 I 取幅值。NaN (无电流计) 保持 NaN。
+        current = abs(float(msg.current)) if math.isfinite(msg.current) else float('nan')
         with self.lock:
-            self.battery_voltage = voltage
-            self.battery_current = current
-            warned = self._voltage_warned
-        if (not warned and self.args.lipo_cells >= 2 and 0.0 < voltage < 2.0 * 3.0):
-            self._voltage_warned = True
-            print(f'{bcolors.WARNING}battery voltage {voltage:.2f} V looks like a single '
-                  f'cell -- is /mavros/battery really pack voltage?{bcolors.ENDC}')
+            self.last_voltage = voltage
+            if self.window is not None:
+                self.window['V'].append(voltage)
+                self.window['I'].append(current)
 
-    def on_motor_rpm(self, msg: Float32MultiArray):
-        # fpv_test.md 1.3: RPM_rms = sqrt(mean(RPM_k^2))。只对有效 (非 NaN) 电机求均方根;
-        # 全 NaN (双向 DShot 未开 / AirSim) 时 rpm_rms = NaN, 不参与拟合。
-        valid = [float(v) for v in msg.data if math.isfinite(v)]
-        rms = math.sqrt(sum(v * v for v in valid) / len(valid)) if valid else float('nan')
-        with self.lock:
-            self.motor_rpm_rms = rms
-
-    def on_weight(self, msg: Float32MultiArray):
+    def on_weight(self, msg):
         if len(msg.data) < 2:
             return
-        weight = float(msg.data[0])
-        stable = float(msg.data[1])
+        weight, stable = float(msg.data[0]), float(msg.data[1])
         with self.lock:
-            if math.isnan(stable):
-                self.stable_weight = weight
-            else:
-                self.stable_weight = stable
-                if not self.testing:
-                    self.whole_weight = stable
+            self.last_weight = weight
+            self.last_stable = stable
+            if self.tare_samples is not None and math.isfinite(stable):
+                self.tare_samples.append(stable)
+            if self.window is not None:
+                self.window['weight'].append(weight)
             testing = self.testing
         self.weight_event.set()
         if testing and weight < self.args.critical_weight:
-            # 防抬离秤: 每次回调降 0.5% (同旧工具)
-            print(f'{bcolors.ERROR}Current weight below CRITICAL_WEIGHT! '
-                  f'Forced to decrease throttle.{bcolors.ENDC}')
-            self.adjust_thrust(-0.5)
+            print(f'\n{bcolors.ERROR}*** scale weight {weight:.3f} kg below --critical-weight: '
+                  f'airframe lifting off the scale, aborting ***{bcolors.ENDC}')
+            self.abort_event.set()
 
-    def on_imu(self, msg: Imu):
+    def on_imu(self, msg):
         with self.lock:
             self.orientation = msg.orientation
 
-    def on_pressure(self, msg: FluidPressure):
-        with self.lock:
-            self.baro = msg.fluid_pressure
-        self.baro_event.set()
+    def on_pressure(self, msg):
+        if msg.fluid_pressure > 0.0:
+            self._append('P', float(msg.fluid_pressure))
 
-    def on_temperature(self, msg: Temperature):
-        with self.lock:
-            self.temp = msg.temperature
+    def on_temperature(self, msg):
+        self._append('t', float(msg.temperature))
 
-    # ---------------------------------------------------------- 定时器回调
+    def on_motor_rpm(self, msg):
+        with self.lock:
+            if self.window is None:
+                return
+            series = self.window['rpm']
+            while len(series) < len(msg.data):
+                series.append([])
+            for k, value in enumerate(msg.data):
+                series[k].append(float(value))  # NaN = 双向 DShot 无效位, 均值时剔除
+
+    # ---------------------------------------------------------- 定时器
 
     def control_timer_cb(self):
-        """50 Hz 控制流: ATTITUDE 模式 + 姿态回显 + 零角速度 + 直通油门。
-
-        APM 侧桥接生成 AttitudeTarget{orientation=回显, IGNORE_*_RATE, thrust}，
-        与旧工具线上格式一致；custom 侧忽略姿态、透传零角速度 + 油门。
-        """
+        """ATTITUDE 模式 + 姿态回显 + 零角速度 + 直通集体油门。"""
         cmd = ControlCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.control_mode = ControlCommand.ATTITUDE
         with self.lock:
             cmd.armed = self.testing
-            cmd.collective_thrust = min(max(self.thrust_pct / 100.0, 0.0), 1.0)
+            cmd.collective_thrust = min(max(self.collective, 0.0), 1.0)
             orientation = self.orientation
         if orientation is not None:
             cmd.orientation = orientation
         else:
-            # geometry_msgs/Quaternion 默认全零，非单位四元数，需显式置 w=1
-            cmd.orientation.x = 0.0
-            cmd.orientation.y = 0.0
-            cmd.orientation.z = 0.0
             cmd.orientation.w = 1.0
-        # bodyrates 保持 0
         self.cmd_pub.publish(cmd)
 
     def arm_keepalive_cb(self):
-        """custom 链路 arm/offboard 请求 2 Hz 重发 (level 语义)。"""
         with self.lock:
             armed_intent = self.testing or self._arm_intent
             offboard_intent = self._offboard_intent
@@ -413,86 +300,111 @@ class ThrustTestNode(Node):
         if self.quiet:
             return
         with self.lock:
-            thrust = self.thrust_pct
-            weight = self.stable_weight
-            voltage = self.battery_voltage
-            mode = self.mode
-            armed = self.armed
-        weight_s = f'{weight:.3f}' if not math.isnan(weight) else '--'
-        voltage_s = f'{voltage:.2f}' if voltage > 0.0 else '--'
-        print(f'\r[t={thrust:5.1f}%] [w={weight_s} kg] [V={voltage_s}] '
-              f'[mode={mode or "--"}{" armed" if armed else ""}] '
-              f'[pts={len(self.recorder.points)}]   ', end='', flush=True)
+            collective, weight, voltage = self.collective, self.last_weight, self.last_voltage
+            mode, armed = self.mode, self.armed
+        duty = pm.collective_to_duty(collective, self.args.motor_idle)
+        print(f'\r[u={duty:5.3f} c={collective:5.3f}] [w={weight:.3f} kg] [V={voltage:.2f}] '
+              f'[mode={mode or "--"}{" armed" if armed else ""}] [pts={len(self.points)}]   ',
+              end='', flush=True)
 
-    # ---------------------------------------------------------- 油门控制
+    # ---------------------------------------------------------- 动作
 
-    def set_thrust(self, value_pct, force=False):
-        """设定油门 (%，钳位 [min,100])。force=True 时直接压到 min (安全动作)。"""
+    def set_duty(self, duty):
         with self.lock:
-            if not force:
-                value_pct = min(max(value_pct, self.args.min_thrust), 100.0)
-            changed = self.thrust_pct != value_pct
-            self.thrust_pct = value_pct
-        if changed and not self.quiet:
-            print(f'thrust_req = {value_pct:.2f}%')
-
-    def adjust_thrust(self, delta_pct):
-        with self.lock:
-            self.thrust_pct = min(max(self.thrust_pct + delta_pct,
-                                      self.args.min_thrust), 100.0)
-
-    def get_thrust(self):
-        with self.lock:
-            return self.thrust_pct
+            self.collective = pm.duty_to_collective(duty, self.args.motor_idle)
+            return self.collective
 
     def sleep_abortable(self, seconds):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.abort_event.is_set():
                 return False
-            time.sleep(0.05)
+            time.sleep(0.02)
         return not self.abort_event.is_set()
 
-    # ---------------------------------------------------------- 解锁/上锁
+    def measure_tare(self, seconds):
+        """起桨前稳定重量均值 (§2.1: 拉力 = 相对起桨前减小的重量)。"""
+        with self.lock:
+            self.tare_samples = []
+        self.sleep_abortable(seconds)
+        with self.lock:
+            samples, self.tare_samples = self.tare_samples, None
+            fallback = self.last_weight
+        if samples:
+            self.tare_kg = sum(samples) / len(samples)
+        elif math.isfinite(fallback):
+            self.tare_kg = fallback
+        else:
+            raise FatalError('no /current_weight data -- is scale_reader_node running?')
+        print(f'{bcolors.OKBLUE}tare = {self.tare_kg:.4f} kg ({len(samples)} stable samples)'
+              f'{bcolors.ENDC}')
+
+    def run_sop(self, timeline):
+        for action, duty, duration in timeline:
+            if self.abort_event.is_set():
+                return
+            collective = self.set_duty(duty)
+            if action == 'sample':
+                with self.lock:
+                    self.window = new_window(pm.collective_to_duty(collective, self.args.motor_idle),
+                                             collective)
+                ok = self.sleep_abortable(duration)
+                with self.lock:
+                    window, self.window = self.window, None
+                if not ok:
+                    return
+                self.record(window, duration)
+            else:
+                if action == 'cooldown':
+                    print(f'cooldown at idle for {duration:.1f} s')
+                if not self.sleep_abortable(duration):
+                    return
+
+    def record(self, window, duration):
+        point = average_window(window, self.tare_kg, self.args.gravity)
+        rate = point['n_weight'] / duration
+        if not math.isfinite(point['F']):
+            print(f'\n{bcolors.WARNING}u={point["u"]:.3f}: no scale data, point skipped{bcolors.ENDC}')
+            return
+        if rate < MIN_SCALE_RATE_HZ:
+            print(f'\n{bcolors.WARNING}u={point["u"]:.3f}: scale rate {rate:.1f} Hz < '
+                  f'{MIN_SCALE_RATE_HZ:.0f} Hz required by fpv_test.md{bcolors.ENDC}')
+        self.points.append(point)
+        rpm_rms = pm.rpm_rms(point['rpm'])
+        print(f'\nu={point["u"]:.3f} (c={point["collective"]:.3f}): F={point["F"]:.3f} N, '
+              f'V={point["V"]:.2f} V, I={point["I"]:.2f} A, RPMrms={rpm_rms:.0f}, '
+              f'P={point["P"]:.0f} Pa, t={point["t"]:.1f} C')
 
     def start_testing(self):
-        """解锁 + 油门至 MIN，进入采集状态。失败抛 FatalError。"""
-        self.recorder.clear()
-        # 先冻结去皮基准: 解锁等待期间电机已在 MIN 油门转动，重量不再是空载值
         with self.lock:
             self.testing = True
             self._arm_intent = True
-            if self.offboard_pub is not None:
-                self._offboard_intent = True
+            self._offboard_intent = self.offboard_pub is not None
+            self.collective = 0.0
         try:
             if self.offboard_pub is not None:
                 self.offboard_pub.publish(Bool(data=True))
             self.arm_pub.publish(Bool(data=True))
-            if not self._wait_armed(True, timeout=15.0):
-                raise FatalError('FC did not ARM (is BOXOFFBOARD held, or pass '
-                                 '--offboard for host OFFBOARD request?)')
+            if not self._wait_armed(True, 15.0):
+                raise FatalError('FC did not ARM (is BOXOFFBOARD held, or pass --offboard?)')
         except Exception:
             with self.lock:
                 self.testing = False
                 self._offboard_intent = False
             raise
-        self.set_thrust(self.args.min_thrust, force=True)
         print(f'{bcolors.OKGREEN}START TESTING...{bcolors.ENDC}')
 
-    def stop_testing(self):
-        """油门至 MIN + 上锁。"""
-        self.set_thrust(self.args.min_thrust, force=True)
-        self._disarm_backend()
-        print('STOP TESTING...')
-
-    def _disarm_backend(self):
-        """上锁并等待确认。期间控制流保持 (armed 字段)，让 arm=0 边沿随帧送达。"""
+    def shutdown_sequence(self):
+        """油门回最低 + 上锁并等待确认 (executor 仍在 spin)。"""
+        self.quiet = True
         with self.lock:
+            self.collective = 0.0
+            self.window = None
             self.disarming = True
-        try:
             self._arm_intent = False
+        try:
             self.arm_pub.publish(Bool(data=False))
-            self._wait_armed(False, timeout=max(DISARM_STREAM_TIME, 5.0))
+            self._wait_armed(False, max(DISARM_STREAM_TIME, 5.0))
         finally:
             with self.lock:
                 self.testing = False
@@ -500,215 +412,187 @@ class ThrustTestNode(Node):
                 self._offboard_intent = False
             if self.offboard_pub is not None:
                 self.offboard_pub.publish(Bool(data=False))
+            self.quiet = False
 
-    def _wait_armed(self, target: bool, timeout: float):
-        reminded = False
+    def _wait_armed(self, target, timeout):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.abort_event.is_set():
+            if self.abort_event.is_set() and target:
                 return False
             with self.lock:
                 if self.armed == target:
                     return True
-            if (target and not reminded
-                    and time.monotonic() > deadline - timeout + 3.0):
-                hint = ('BOXOFFBOARD switch' if self.offboard_pub is None
-                        else 'FC OFFBOARD authorization')
-                print(f'{bcolors.WARNING}waiting for FC to ARM -- '
-                      f'check {hint}{bcolors.ENDC}')
-                reminded = True
             time.sleep(0.1)
-        with self.lock:
-            state_now = self.armed
-        print(f'{bcolors.ERROR}timeout waiting for armed={target} '
-              f'(current: {state_now}){bcolors.ENDC}')
+        print(f'{bcolors.ERROR}timeout waiting for armed={target}{bcolors.ENDC}')
         return False
 
-    # ---------------------------------------------------------- kp
 
-    def live_kp(self):
-        with self.lock:
-            kp = self.baro / 101325.0
-            temp = self.temp - self.args.temp_offset
-            kp *= 273.15 / (273.15 + temp)
-        return kp
+# ======================================================================
+# 结果输出
+# ======================================================================
 
-    def collect_kp(self):
-        if self.args.kp is not None:
-            self.kp_avg = self.args.kp
-            print(f'{bcolors.OKBLUE}KP (user) = {self.kp_avg}{bcolors.ENDC}')
-            return
-        if not self.baro_event.wait(timeout=5.0):
-            print(f'{bcolors.WARNING}no /fpv/static_pressure data, KP defaults to 1.0 '
-                  f'(use --kp to override){bcolors.ENDC}')
-            self.kp_avg = 1.0
-            return
-        print('Collecting KP...')
-        val = 0.0
-        for _ in range(10):
-            if self.abort_event.is_set():
-                break
-            val += self.live_kp()
-            time.sleep(0.5)
-        self.kp_avg = val / 10.0
-        print(f'{bcolors.OKBLUE}KP = {self.kp_avg}{bcolors.ENDC}')
+def write_outputs(points, args, aborted):
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs(args.output_dir, exist_ok=True)
+    base = os.path.join(args.output_dir, f'thrust_curve_{stamp}')
+    v_ref = args.lipo_cells * pm.V_REF_PER_CELL
 
-    # ---------------------------------------------------------- 采集
+    result, error = None, None
+    try:
+        result = pm.calibrate(points, v_ref, voltage_normalization=not args.no_voltage_comp,
+                              environment_normalization=not args.no_env_comp)
+    except (ValueError, np.linalg.LinAlgError) as e:
+        error = str(e)
+    rows = result['rows'] if result else [{**p, 'F0': float('nan'), 'F_std': float('nan'),
+                                            'I_std': float('nan'), 'rpm_rms': pm.rpm_rms(p['rpm'])}
+                                           for p in points]
+    n_rpm = max((len(p['rpm']) for p in points), default=0)
 
-    def collect_average(self, samples, period=0.1):
-        """采 samples 个稳定重量/电压均值。返回 (weight, voltage, n) 或 None。"""
-        self.quiet = True
-        w_sum = v_sum = 0.0
-        c_sum = r_sum = 0.0
-        c_n = r_n = 0
-        n = 0
-        deadline = time.monotonic() + samples * period * 3.0 + COLLECT_TIMEOUT_MARGIN
-        try:
-            while n < samples and not self.abort_event.is_set():
-                with self.lock:
-                    sw = self.stable_weight
-                    bv = self.battery_voltage
-                    bc = self.battery_current
-                    rr = self.motor_rpm_rms
-                if not math.isnan(sw):
-                    w_sum += sw
-                    v_sum += bv
-                    n += 1
-                    if math.isfinite(bc):
-                        c_sum += bc
-                        c_n += 1
-                    if math.isfinite(rr):
-                        r_sum += rr
-                        r_n += 1
-                    sys.stdout.write(f'\r  collecting {n}/{samples}...')
-                    sys.stdout.flush()
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(period)
-        finally:
-            self.quiet = False
-        print()
-        if n == 0:
-            return None
-        current = c_sum / c_n if c_n else float('nan')
-        rpm_rms = r_sum / r_n if r_n else float('nan')
-        return w_sum / n, v_sum / n, current, rpm_rms, n
+    csv_path = base + '.csv'
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['u', 'collective', 'V', 'I'] + [f'rpm{k + 1}' for k in range(n_rpm)] +
+                        ['rpm_rms', 'F_N', 'P_Pa', 't_C', 'F0_N', 'F_std_N', 'I_std_A', 'n_weight'])
+        for r in rows:
+            rpm = list(r['rpm']) + [float('nan')] * (n_rpm - len(r['rpm']))
+            writer.writerow([f"{r['u']:.6f}", f"{r['collective']:.6f}", f"{r['V']:.4f}", f"{r['I']:.4f}"] +
+                            [f'{v:.2f}' for v in rpm] +
+                            [f"{r['rpm_rms']:.2f}", f"{r['F']:.4f}", f"{r['P']:.1f}", f"{r['t']:.2f}",
+                             f"{r['F0']:.4f}", f"{r['F_std']:.4f}", f"{r['I_std']:.4f}", r['n_weight']])
+    print(f'CSV written to {csv_path}')
 
-    def record_point(self):
-        """采集并记录当前油门下的一个数据点。"""
-        result = self.collect_average(self.args.samples_per_point)
-        if result is None:
-            print(f'{bcolors.WARNING}no stable scale data at this step, '
-                  f'point skipped{bcolors.ENDC}')
-            return
-        weight, voltage, current, rpm_rms, _ = result
-        # 安全降油门后油门可能低于名义档位，按实际值记录
-        throttle_pct = self.get_thrust()
-        thrust_norm = throttle_pct / 100.0
-        volt_max = self.args.lipo_cells * 4.2
-        use_map = self.args.map_a != 0.0 or self.args.map_b != 0.0
-        x_poly = normalize_throttle(thrust_norm, self.kp_avg, self.args.spin_k,
-                                    voltage, volt_max,
-                                    not self.args.no_voltage_comp and not use_map)
-        with self.lock:
-            tare = self.whole_weight
-        force_n = (tare - weight) * self.args.gravity
-        if use_map:
-            # vbat 归一: 实测力换算到标准电压 V_ref = cells*3.7 口径
-            force_n *= vbat_scale(self.args.map_a, self.args.map_b,
-                                  self.args.lipo_cells * 3.7, voltage)
-        ok = self.recorder.insert_normal(throttle_pct=throttle_pct,
-                                         thrust_norm=thrust_norm,
-                                         voltage=voltage, current=current,
-                                         rpm_rms=rpm_rms, weight_kg=weight,
-                                         force_n=force_n, kp=self.kp_avg,
-                                         x_poly=x_poly)
-        if ok:
-            rpm_s = f', RPMrms={rpm_rms:.0f}' if math.isfinite(rpm_rms) else ''
-            print(f'Collected Force Data: {tare - weight:.2f} kgF '
-                  f'at {throttle_pct:.2f}% throttle, V={voltage:.2f}{rpm_s}')
+    yaml_path = base + '_result.yaml'
+    with open(yaml_path, 'w') as f:
+        f.write('# fpv_test.md thrust test result\n')
+        f.write(f'date: {datetime.datetime.now().isoformat(timespec="seconds")}\n')
+        f.write(f'aborted: {str(aborted).lower()}\n')
+        f.write(f'points: {len(points)}\n')
+        f.write(f'v_ref: {v_ref:.2f}\n')
+        f.write(f'environment_normalization: {str(not args.no_env_comp).lower()}\n')
+        f.write(f'voltage_normalization: {str(not args.no_voltage_comp).lower()}\n')
+        if result:
+            st = result['stats']
+            f.write(f"fit_rms_N: {st['rms']:.6g}\n")
+            f.write(f"fit_max_error_N: {st['max_error']:.6g}\n")
+            f.write(f"fit_r_squared: {st['r_squared']:.8f}\n")
+            f.write(f"monotonic: {str(result['monotonic']).lower()}\n")
+            f.write(f"min_slope_N: {result['min_slope']:.6g}\n")
+            f.write(f"kv_rpm_per_volt: {result['kv']:.6g}\n")
+            f.write(f"ke_volt_per_rpm: {result['ke']:.6g}\n")
+            f.write(f"r_eq_ohm: {result['r_eq']:.6g}\n")
+            f.write(f"k_i_A_per_N: {result['k_i']:.6g}\n")
+            for w in result['warnings']:
+                f.write(f'# warning: {w}\n')
+            if result['monotonic']:
+                f.write('\n# ---- paste into parameters/custom_link_parameters.yaml ----\n')
+                f.write(render_param_yaml(result, args) + '\n')
+            else:
+                f.write('# NOT MONOTONIC on [0,1]: model rejected (fpv_test.md 3.2), repeat the test\n')
         else:
-            print(f'{bcolors.WARNING}Data {throttle_pct:.2f}% Repeated!{bcolors.ENDC}')
+            f.write(f'# fit failed: {error}\n')
+    print(f'result YAML written to {yaml_path}')
 
-    # ---------------------------------------------------------- 关停
+    if result:
+        print(f"{bcolors.OKGREEN}F_std(u) = {result['a3']:.6g} u^3 + {result['a2']:.6g} u^2 + "
+              f"{result['a1']:.6g} u   (RMS {result['stats']['rms']:.4g} N, "
+              f"R^2 {result['stats']['r_squared']:.6f}){bcolors.ENDC}")
+        print(f"R_eq = {result['r_eq']:.5g} ohm, K_v* = {result['kv']:.5g} rpm/V, k_i = {result['k_i']:.5g} A/N")
+        for w in result['warnings']:
+            print(f'{bcolors.WARNING}warning: {w}{bcolors.ENDC}')
+        if not result['monotonic']:
+            print(f'{bcolors.ERROR}fitted curve violates dF/du > 0 on [0,1] (min slope '
+                  f"{result['min_slope']:.4g}): rejected{bcolors.ENDC}")
+    else:
+        print(f'{bcolors.ERROR}fit failed: {error}{bcolors.ENDC}')
 
-    def shutdown_sequence(self):
-        """安全关停 (executor 仍在 spin，顺序关键)。"""
-        print('\nSTOP TESTING...')
-        self.quiet = True
-        try:
-            self.set_thrust(self.args.min_thrust, force=True)
-            self._disarm_backend()
-        finally:
-            self.quiet = False
+    if not args.no_plot and result:
+        plot_results(result, base + '.png')
+    return csv_path, yaml_path, result
+
+
+def plot_results(result, png_path):
+    try:
+        import matplotlib
+        if not os.environ.get('DISPLAY'):
+            matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f'{bcolors.WARNING}matplotlib unavailable ({e}), skipping plot{bcolors.ENDC}')
+        return
+    try:
+        rows = result['rows']
+        plt.figure()
+        plt.plot([r['u'] for r in rows], [r['F'] for r in rows], 'bx', label='measured F')
+        plt.plot([r['u'] for r in rows], [r['F_std'] for r in rows], 'go', label='normalized F_std')
+        u = np.linspace(0.0, 1.0, 200)
+        plt.plot(u, result['a3'] * u ** 3 + result['a2'] * u ** 2 + result['a1'] * u, '-r',
+                 label='F_std(u) fit')
+        plt.xlabel('throttle duty u')
+        plt.ylabel('total thrust [N]')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(png_path)
+        print(f'plot written to {png_path}')
+    except Exception as e:
+        print(f'{bcolors.WARNING}plotting failed ({e}){bcolors.ENDC}')
 
 
 # ======================================================================
-# 扫描流程
+# main
 # ======================================================================
 
-def thrust_grid(args):
-    grid = []
-    t = args.min_thrust
-    while t < args.max_thrust - 1e-6:
-        grid.append(round(t, 3))
-        t += args.step
-    grid.append(args.max_thrust)
-    return grid
-
-
-def run_sweep(node: ThrustTestNode, args):
-    grid = thrust_grid(args)
-    print(f'{bcolors.OKBLUE}Sweeping throttle: {grid} %{bcolors.ENDC}')
-    for target in grid:
-        if node.abort_event.is_set():
-            break
-        node.set_thrust(target)
-        if not node.sleep_abortable(args.settle_time):
-            break
-        node.record_point()
-        if node.abort_event.is_set():
-            break
-
-
-def run_vbat_drain(node: ThrustTestNode, args):
-    """vbat 模式: 固定油门放电，每 10 s 记一组 (V, F)，直到电压低于下限。"""
-    vmin = args.lipo_cells * 3.6333
-    vmax = args.lipo_cells * 4.2
-    print(f'{bcolors.WARNING}START TESTING AT {args.vbat_thrust}% IN 3 SECONDS...{bcolors.ENDC}')
-    node.sleep_abortable(3.0)
-    node.set_thrust(args.vbat_thrust)
-    node.sleep_abortable(2.0)
-    while not node.abort_event.is_set():
-        with node.lock:
-            voltage_now = node.battery_voltage
-        if 0.0 < voltage_now <= vmin:
-            print('battery reached minimum voltage, drain collection done')
-            break
-        result = node.collect_average(10, period=1.0)
-        if result is None:
-            print(f'{bcolors.WARNING}no stable scale data, sample skipped{bcolors.ENDC}')
-            continue
-        weight, voltage, current, rpm_rms, _ = result
-        with node.lock:
-            tare = node.whole_weight
-        force_n = (tare - weight) * args.gravity
-        if node.recorder.insert_vbat(voltage=voltage, force_n=force_n,
-                                     weight_kg=weight, vmin=vmin, vmax=vmax,
-                                     current=current, rpm_rms=rpm_rms):
-            print(f'Collected {voltage:.2f} V, {tare - weight:.2f} kgF')
-        node.sleep_abortable(1.0)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description='fpv_test.md bench thrust test + propulsion model fit (custom_link_bridge)')
+    parser.add_argument('--offboard', action='store_true',
+                        help='publish /fpv/offboard to request OFFBOARD from the host (AirSim / '
+                             'pilotless bench); omit when the pilot holds BOXOFFBOARD')
+    parser.add_argument('--u-start', type=float, default=0.05, help='first throttle duty (§2.2)')
+    parser.add_argument('--u-step', type=float, default=0.05, help='throttle duty step (§2.2)')
+    parser.add_argument('--u-end', type=float, default=1.00, help='last throttle duty (§2.2, adjustable)')
+    parser.add_argument('--step-time', type=float, default=2.5, help='duration of each step [s]')
+    parser.add_argument('--settle-time', type=float, default=0.5,
+                        help='discarded settling part of each step [s]; the rest is averaged')
+    parser.add_argument('--cooldown-threshold', type=float, default=0.70,
+                        help='steps at or above this duty are followed by an idle cooldown')
+    parser.add_argument('--cooldown-time', type=float, default=5.0, help='idle cooldown [s]')
+    parser.add_argument('--u-idle', type=float, default=pm.DEFAULT_U_IDLE,
+                        help='idle duty floor written to the result (§4 step 4)')
+    parser.add_argument('--motor-idle', type=float, default=pm.DEFAULT_MOTOR_IDLE,
+                        help='FC dshot_idle_value/10000: duty at Betaflight collective 0')
+    parser.add_argument('--lipo-cells', type=int, default=6, help='V_ref = cells*3.7 V')
+    parser.add_argument('--gravity', type=float, default=9.80665)
+    parser.add_argument('--tare-time', type=float, default=2.0,
+                        help='scale averaging before arming for the zero-thrust reference [s]')
+    parser.add_argument('--critical-weight', type=float, default=0.3,
+                        help='abort if the scale reads below this [kg] (lift-off protection)')
+    parser.add_argument('--no-env-comp', action='store_true',
+                        help='skip §3.1 step 1 (no baro, e.g. AirSim; pairs with baro_compensation=false)')
+    parser.add_argument('--no-voltage-comp', action='store_true',
+                        help='skip §3.1 steps 3-4 (no voltage sag, e.g. AirSim; pairs with '
+                             'voltage_compensation=false)')
+    parser.add_argument('--control-rate', type=float, default=50.0, help='command stream rate [Hz]')
+    parser.add_argument('--yes', action='store_true', help='skip the Enter confirmation')
+    parser.add_argument('--output-dir', type=str, default='.')
+    parser.add_argument('--no-plot', action='store_true')
+    args = parser.parse_args(argv)
+    try:
+        args.levels = sop_levels(args.u_start, args.u_step, args.u_end)
+        args.timeline = sop_timeline(args.levels, args.step_time, args.settle_time,
+                                     args.cooldown_threshold, args.cooldown_time, args.u_idle)
+    except ValueError as e:
+        parser.error(str(e))
+    if not 0.0 <= args.motor_idle < 1.0 or not 0.0 <= args.u_idle < 1.0:
+        parser.error('--motor-idle and --u-idle must be in [0, 1)')
+    return args
 
 
 def confirm_start(args, abort_event):
-    if args.yes:
+    if args.yes or not sys.stdin.isatty():
         return True
-    if not sys.stdin.isatty():
-        print(f'{bcolors.WARNING}stdin is not a tty and --yes not given; '
-              f'proceeding anyway{bcolors.ENDC}')
-        return True
-    print(f'{bcolors.OKGREEN}Press Enter to START the sweep (Ctrl+C to abort)...{bcolors.ENDC}',
-          flush=True)
+    print(f'{bcolors.OKGREEN}Airframe fixed on the scale? Press Enter to START '
+          f'({len(args.levels)} steps, u {args.levels[0]:.2f}..{args.levels[-1]:.2f}; '
+          f'Ctrl+C to abort)...{bcolors.ENDC}', flush=True)
     while not abort_event.is_set():
         r, _, _ = select.select([sys.stdin], [], [], 0.2)
         if r:
@@ -717,242 +601,14 @@ def confirm_start(args, abort_event):
     return False
 
 
-# ======================================================================
-# 结果输出
-# ======================================================================
-
-def write_outputs(node: ThrustTestNode, args, aborted):
-    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    os.makedirs(args.output_dir, exist_ok=True)
-    base = os.path.join(args.output_dir, f'thrust_curve_{stamp}')
-    points = node.recorder.points
-
-    # ---- CSV ----
-    csv_path = base + '.csv'
-    try:
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time', 'throttle_pct', 'thrust_norm', 'voltage',
-                             'current_A', 'rpm_rms', 'weight_kg', 'force_N',
-                             'kp', 'x_poly'])
-            for p in points:
-                writer.writerow([f"{p['time']:.3f}", f"{p['throttle_pct']:.3f}",
-                                 f"{p['thrust_norm']:.6f}", f"{p['voltage']:.3f}",
-                                 f"{p.get('current', float('nan')):.4f}",
-                                 f"{p.get('rpm_rms', float('nan')):.2f}",
-                                 f"{p['weight_kg']:.4f}", f"{p['force_n']:.3f}",
-                                 f"{p['kp']:.5f}", f"{p['x_poly']:.6f}"])
-        print(f'CSV written to {csv_path}')
-    except OSError as e:
-        print(f'{bcolors.ERROR}cannot write CSV: {e}{bcolors.ENDC}')
-        csv_path = None
-
-    # ---- 拟合 ----
-    node_key = 'custom_link_bridge'
-    volt_max = args.lipo_cells * 4.2
-    vref = args.lipo_cells * 3.7
-    use_map = args.map_a != 0.0 or args.map_b != 0.0
-    vbat = (args.map_a, args.map_b) if use_map else None
-    notes = [f'fitted {datetime.datetime.now().isoformat(timespec="seconds")}, '
-             f'{len(points)} points, kp={node.kp_avg:.5f}, '
-             f'gravity={args.gravity}',
-             f'compensations divided out: kp, spin_k={args.spin_k}'
-             + (f', voltage via vbat map to V_ref={vref:.1f} '
-                f'(a={args.map_a:.6g}, b={args.map_b:.6g})' if use_map else
-                (', voltage normalized to volt_max=' + format(volt_max, '.1f')
-                 if not args.no_voltage_comp else ''))]
-    fit = None
-    vbat_fit = None
-    if args.vbat:
-        vbat_fit, err = fit_voltage_linear(points)
-        if vbat_fit is None:
-            print(f'{bcolors.ERROR}{err}{bcolors.ENDC}')
-        else:
-            print(f'{bcolors.OKGREEN}VBAT fitted curve coefficients (a, b): '
-                  f'{vbat_fit}{bcolors.ENDC}')
-            print(f'{bcolors.OKBLUE}sweep with: --map-a {vbat_fit[0]:.10g} '
-                  f'--map-b {vbat_fit[1]:.10g}  (force normalized to '
-                  f'V_ref={args.lipo_cells * 3.7:.1f}; paste the same values as '
-                  f'motor_parameters.vbat_a/vbat_b){bcolors.ENDC}')
-    else:
-        fit, err = fit_motor_cubic(points, args.num_motors)
-        if fit is None:
-            print(f'{bcolors.ERROR}{err}{bcolors.ENDC}')
-        else:
-            print(f'{bcolors.OKGREEN}Fitted motor parameters '
-                  f'(A, B, C, D): ({fit["A"]:.9g}, {fit["B"]:.9g}, '
-                  f'{fit["C"]:.9g}, {fit["D"]:.9g}){bcolors.ENDC}')
-            print(f'residual RMS = {fit["rms"]:.6f} throttle')
-            if fit['deriv_min'] <= 0.0:
-                print(f'{bcolors.WARNING}WARNING: fitted curve is not monotonic '
-                      f'over the sampled range (min dP/df = {fit["deriv_min"]:.4g}){bcolors.ENDC}')
-            if not -0.2 <= fit['D'] <= 0.3:
-                print(f'{bcolors.WARNING}WARNING: D = {fit["D"]:.4g} outside the '
-                      f'usual [-0.2, 0.3] band{bcolors.ENDC}')
-
-    # ---- 结果 sidecar YAML ----
-    yaml_path = base + '_result.yaml'
-    try:
-        with open(yaml_path, 'w') as f:
-            f.write('# thrust test result\n')
-            f.write(f'date: {datetime.datetime.now().isoformat(timespec="seconds")}\n')
-            f.write(f'aborted: {aborted}\n')
-            f.write(f'points: {len(points)}\n')
-            f.write(f'kp: {node.kp_avg:.6f}\n')
-            f.write(f'gravity: {args.gravity}\n')
-            f.write(f'num_motors: {args.num_motors}\n')
-            f.write(f'spin_k: {args.spin_k}\n')
-            f.write(f'voltage_compensation: {not args.no_voltage_comp}\n')
-            f.write(f'volt_max: {volt_max:.1f}\n')
-            f.write(f'volt_ref: {vref:.1f}\n')
-            if vbat:
-                f.write(f'vbat_a: {vbat[0]!r}\n')
-                f.write(f'vbat_b: {vbat[1]!r}\n')
-            if fit:
-                f.write(f'fit_rms: {fit["rms"]:.6f}\n')
-            if vbat_fit:
-                f.write(f'vbat_a: {vbat_fit[0]!r}\n')
-                f.write(f'vbat_b: {vbat_fit[1]!r}\n')
-            f.write('\n# ---- paste into parameters/*.yaml ----\n')
-            if fit:
-                f.write(render_param_yaml(node_key, fit, args.num_motors,
-                                          args.spin_k, vbat, notes) + '\n')
-        print(f'result YAML written to {yaml_path}')
-    except OSError as e:
-        print(f'{bcolors.ERROR}cannot write result YAML: {e}{bcolors.ENDC}')
-
-    # ---- 绘图 (惰性 import，失败不丢数据) ----
-    if not args.no_plot:
-        plot_results(points, fit, vbat_fit, args, node.kp_avg, base + '.png')
-    return csv_path
-
-
-def plot_results(points, fit, vbat_fit, args, kp, png_path):
-    try:
-        import matplotlib
-        if not os.environ.get('DISPLAY'):
-            matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f'{bcolors.WARNING}matplotlib unavailable ({e}), skipping plot '
-              f'(data is in the CSV){bcolors.ENDC}')
-        return
-    try:
-        plt.figure()
-        if vbat_fit:
-            voltages = [p['voltage'] for p in points]
-            forces = [p['force_n'] for p in points]
-            mean_f = sum(forces) / len(forces)
-            rel = [mean_f / f for f in forces]
-            plt.plot(voltages, rel, 'go', label='Samples')
-            v_t = [v for v in voltages]
-            plt.plot(v_t, [vbat_fit[0] * v + vbat_fit[1] for v in v_t], '-r',
-                     label='Fitted a*V+b')
-            plt.xlabel('pack voltage [V]')
-            plt.ylabel('relative thrust')
-        else:
-            xs = [p['thrust_norm'] for p in points]
-            ys = [p['force_n'] for p in points]
-            plt.plot(xs, ys, 'go', label='Samples')
-            if fit:
-                k = args.spin_k
-                f_grid = np.linspace(0.0, max(ys) / args.num_motors * 1.05, 200)
-                thr = fit['A'] * f_grid ** 3 + fit['B'] * f_grid ** 2 + \
-                    fit['C'] * f_grid + fit['D']
-                # 参考电压 (V=volt_max) 下的命令油门: t = kp * spin(thr)
-                t_model = ((1.0 - k) * thr + k * thr * thr) * kp
-                mask = (t_model >= 0.0) & (t_model <= 1.0)
-                plt.plot(t_model[mask], args.num_motors * f_grid[mask], '-r',
-                         label='Fitted model')
-            plt.xlabel('throttle [0..1]')
-            plt.ylabel('thrust [N]')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(png_path)
-        print(f'plot written to {png_path}')
-        if os.environ.get('DISPLAY'):
-            plt.show()
-    except Exception as e:
-        print(f'{bcolors.WARNING}plotting failed ({e}), data is in the CSV{bcolors.ENDC}')
-
-
-# ======================================================================
-# main
-# ======================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Automatic throttle-thrust curve calibration tool for '
-                    'custom_link_bridge (bench scale + Betaflight / AirSim SITL)')
-    parser.add_argument('--backend', choices=['custom'], default='custom',
-                        help='custom_link_bridge_node backend (the only one on this '
-                             'branch); kept for CLI compatibility')
-    parser.add_argument('--offboard', action='store_true',
-                        help='also publish /fpv/offboard at 2 Hz to request OFFBOARD '
-                             'from the host (AirSim / benches without a pilot). '
-                             'Omit on real aircraft where the pilot holds BOXOFFBOARD')
-    parser.add_argument('--vbat', action='store_true',
-                        help='battery voltage compensation test '
-                             '(fixed throttle drain)')
-    parser.add_argument('--map-a', type=float, default=0.0, dest='map_a',
-                        help='vbat fit coefficient a (--vbat output); normalizes '
-                             'measured force to the V_ref=lipo_cells*3.7 curve; '
-                             'paste as motor_parameters.vbat_a')
-    parser.add_argument('--map-b', type=float, default=0.0, dest='map_b',
-                        help='vbat fit coefficient b, paired with --map-a '
-                             '(paste as motor_parameters.vbat_b)')
-    parser.add_argument('--min-thrust', type=float, default=5.0, dest='min_thrust',
-                        help='sweep start / idle throttle [%%]')
-    parser.add_argument('--max-thrust', type=float, default=50.0, dest='max_thrust',
-                        help='sweep end throttle [%%]')
-    parser.add_argument('--step', type=float, default=5.0,
-                        help='throttle step between sweep points [%%]')
-    parser.add_argument('--settle-time', type=float, default=3.0, dest='settle_time',
-                        help='stabilization wait at each step [s]')
-    parser.add_argument('--samples-per-point', type=int, default=100,
-                        dest='samples_per_point',
-                        help='scale samples averaged per point (10 Hz)')
-    parser.add_argument('--yes', action='store_true',
-                        help='skip the Enter confirmation before starting')
-    parser.add_argument('--vbat-thrust', type=float, default=25.0, dest='vbat_thrust',
-                        help='fixed throttle for --vbat drain test [%%]')
-    parser.add_argument('--critical-weight', type=float, default=1.0,
-                        dest='critical_weight',
-                        help='abort if scale weight drops below this while '
-                             'testing [kg]')
-    parser.add_argument('--gravity', type=float, default=9.801)
-    parser.add_argument('--lipo-cells', type=int, default=6, dest='lipo_cells',
-                        help='LiPo cell count (defines volt_max and vbat bounds)')
-    parser.add_argument('--num-motors', type=int, default=1, dest='num_motors',
-                        help='motor count (per-motor force = total/n)')
-    parser.add_argument('--spin-k', type=float, default=0.0, dest='spin_k',
-                        help='MOT_THST_EXPO style spin compensation already '
-                             'applied by the FC (divided out before fitting)')
-    parser.add_argument('--kp', type=float, default=None,
-                        help='air-density factor override (default: auto from the '
-                             'bridge /fpv/static_pressure topic, 1.0 if absent)')
-    parser.add_argument('--temp-offset', type=float, default=0.0, dest='temp_offset',
-                        help='baro temperature offset used with --kp-temp [degC]')
-    parser.add_argument('--no-voltage-comp', action='store_true', dest='no_voltage_comp',
-                        help='do not normalize fitted coefficients to volt_max '
-                             '(use for AirSim / no battery sag)')
-    parser.add_argument('--control-rate', type=float, default=50.0, dest='control_rate',
-                        help='control command stream rate [Hz]')
-    parser.add_argument('--output-dir', type=str, default='.', dest='output_dir')
-    parser.add_argument('--no-plot', action='store_true', dest='no_plot',
-                        help='never open a matplotlib window (still saves PNG '
-                             'when possible)')
-    return parser.parse_args()
-
-
 def install_signal_handlers(abort_event):
     state = {'first': True}
 
     def handler(signum, frame):
         if state['first']:
             state['first'] = False
-            print(f'\n{bcolors.WARNING}abort requested (signal {signum}), '
-                  f'shutting down safely... (again = force exit){bcolors.ENDC}')
+            print(f'\n{bcolors.WARNING}abort requested (signal {signum}), shutting down safely... '
+                  f'(again = force exit){bcolors.ENDC}')
             abort_event.set()
         else:
             os._exit(1)
@@ -964,16 +620,13 @@ def install_signal_handlers(abort_event):
 def main():
     args = parse_args()
     if _ROS_IMPORT_ERROR is not None:
-        sys.exit(f'ROS 2 (rclpy/quadrotor_msgs/mavros_msgs) not importable '
-                 f'({_ROS_IMPORT_ERROR}); source the workspace setup.bash and run '
-                 f'with the system python3')
+        sys.exit(f'ROS 2 not importable ({_ROS_IMPORT_ERROR}); source the workspace and use system python3')
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = ThrustTestNode(args)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
     def spin_guarded():
-        # executor 线程崩溃会让所有回调停摆而主线程无感知，兜底转为 abort
         try:
             executor.spin()
         except rclpy.executors.ExternalShutdownException:
@@ -981,55 +634,49 @@ def main():
         except Exception:
             import traceback
             traceback.print_exc()
-            print(f'{bcolors.ERROR}executor thread died, aborting{bcolors.ENDC}')
             node.abort_event.set()
 
     spin_thread = threading.Thread(target=spin_guarded, daemon=True)
     spin_thread.start()
     install_signal_handlers(node.abort_event)
 
-    exit_code = 0
-    aborted = False
+    total = sum(d for _, _, d in args.timeline)
+    print(f'{bcolors.OKBLUE}SOP: {len(args.levels)} steps u={args.levels[0]:.2f}..{args.levels[-1]:.2f}, '
+          f'{args.step_time:.1f} s/step ({args.settle_time:.1f} s settle + '
+          f'{args.step_time - args.settle_time:.1f} s sample), cooldown {args.cooldown_time:.1f} s '
+          f'after u>={args.cooldown_threshold:.2f}; total {total:.0f} s{bcolors.ENDC}')
+
+    exit_code, aborted, started = 0, False, False
     try:
         if not node.state_event.wait(timeout=15.0):
-            raise FatalError('no /mavros/state within 15 s -- '
-                             'is custom_link_bridge_node running?')
-        if args.offboard:
-            print(f'{bcolors.OKBLUE}custom-link: requesting OFFBOARD from host via '
-                  f'/fpv/offboard (ensure no RC pilot contends){bcolors.ENDC}')
-        else:
-            print(f'{bcolors.OKBLUE}custom-link: the pilot must hold the BOXOFFBOARD '
-                  f'switch for host arming (pass --offboard for AirSim){bcolors.ENDC}')
-        if args.map_a != 0.0 or args.map_b != 0.0:
-            print(f'{bcolors.OKBLUE}vbat map active: measured force normalized to '
-                  f'V_ref={args.lipo_cells * 3.7:.1f}V (phi=(a*V+b)/(a*V_ref+b)), '
-                  f'volt_max normalization skipped{bcolors.ENDC}')
-        node.collect_kp()
-        if not node.weight_event.wait(timeout=3.0):
-            print(f'{bcolors.WARNING}no /current_weight data -- is '
-                  f'scale_reader_node running? Points will be skipped.{bcolors.ENDC}')
+            raise FatalError('no /mavros/state within 15 s -- is custom_link_bridge_node running?')
+        if not node.weight_event.wait(timeout=5.0):
+            raise FatalError('no /current_weight data -- is scale_reader_node running?')
         if not confirm_start(args, node.abort_event):
             aborted = True
         else:
+            node.measure_tare(args.tare_time)
+            started = True
             node.start_testing()
-            if node.abort_event.is_set():
-                aborted = True
-            elif args.vbat:
-                run_vbat_drain(node, args)
-            else:
-                run_sweep(node, args)
-            node.stop_testing()
+            node.run_sop(args.timeline)
     except FatalError as e:
         print(f'{bcolors.ERROR}FATAL: {e}{bcolors.ENDC}')
         exit_code = 1
     finally:
         aborted = aborted or node.abort_event.is_set()
-        node.shutdown_sequence()
+        if started:
+            node.shutdown_sequence()
+        print('\nSTOP TESTING')
         executor.remove_node(node)
         rclpy.shutdown()
         spin_thread.join(timeout=2.0)
 
-    write_outputs(node, args, aborted)
+    if node.points:
+        _, _, result = write_outputs(node.points, args, aborted)
+        if result is None or not result['monotonic']:
+            exit_code = exit_code or 2
+    else:
+        print(f'{bcolors.WARNING}no data points collected{bcolors.ENDC}')
     return exit_code
 
 

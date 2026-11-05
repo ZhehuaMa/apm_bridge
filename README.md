@@ -655,27 +655,110 @@ hardware compass preset. See the Betaflight checkout's
 `src/test/sitl/airsim_compass.cfg` and `airsim_odom_hold_test.py` for native
 POS HOLD/ALT HOLD truth-versus-odometry validation.
 
-## Motor calibration
+## Propulsion model (fpv_test.md)
 
-The analytic reference for the 2 kg F70/HQ7040 simulation is:
+Collective force commands (`~/control_command`, `collective_thrust · mass` = F_req)
+are converted to throttle exactly as fpv_test.md §4 specifies, in
+[`quadratic_thrust_model.h`](include/quadratic_thrust_model.h) (Python mirror and
+§3 fitting pipeline: [`scripts/propulsion_model.py`](scripts/propulsion_model.py)):
 
-```text
-rotor signal = 0.055 + 0.945 * BF collective
-total force = 4 * 22.76123465 N * rotor signal
-BF collective = C * total force + D
-C = 0.011622843339487498, D = -0.058201058201058205
-2 kg hover collective = 0.16976126
+- **Model** — standard-state total thrust over the throttle duty `u`:
+  `F_std(u) = a3·u³ + a2·u² + a1·u` (zero intercept), standard state
+  `V_ref = lipo_cells·3.7 V` (6S: 22.20 V), `T0 = 273.15 K`, `P0 = 101325 Pa`.
+  `u` is the DShot duty; Betaflight's collective `c` maps to it as
+  `u = motor_idle + (1 − motor_idle)·c` (`dshot_idle_value`, default 5.5 %),
+  so the bridge sends `c = (u − motor_idle)/(1 − motor_idle)`.
+- **Step 1** — `F_std_target = F_req·(P0/P)·(T/T0)` from the 0x11 baro
+  (`baro_compensation`; factor 1 until the first sample).
+- **Step 2** — Newton-Raphson on `a3u³ + a2u² + a1u − F_std_target = 0`
+  (≤ 4 iterations, 1e-5, projected to [0, 1.2]). The initial guess is a cubic
+  fit of the inverse function over the valid range `[u_idle, 1]` in
+  `w = sqrt(F/F(1))` — exact for quadratic or linear thrust, < 2e-3 otherwise —
+  so Newton usually converges in one step.
+- **Step 3** (`voltage_compensation`) — bus voltage and current from 0x12,
+  first-order low-pass at `voltage_lpf_hz` (2–5 Hz, default 3), voltage floored
+  at `lipo_cells·2.0 V` (6S: 12 V). With `r_eq` and `k_i` calibrated:
+  `u_cmd = (u_std·V_ref + (I − I_std)·R_eq)/V`, `I_std = k_i·F_std_target`;
+  otherwise `u_cmd = u_std·V_ref/V`.
+- **Step 4** — `u = clip(u_cmd, u_idle, 1.0)`; `F_req ≤ 0.001 N` → `u_idle`.
+
+```yaml
+motor_parameters:      # paste the block produced by thrust_test_node
+  a3: …                # N
+  a2: …                # N
+  a1: …                # N, must be > 0; dF/du > 0 on [0,1] is enforced
+  u_idle: 0.05         # §4 step 4 idle floor (duty)
+  motor_idle: 0.055    # FC dshot_idle_value / 10000
+  r_eq: …              # Ω, identified on the bench (0 = first-order step 3)
+  k_i: …               # A/N, I_std = k_i·F_std (0 = first-order step 3)
+voltage_lpf_hz: 3.0
 ```
 
-These are simulation collective coefficients, not ESC throttle/RPM.
-The shipped parameters were subsequently measured with the real AirSim/UE
-simulation on 2026-10-10: 42 steady-state samples over seven throttle levels,
-repeated twice. The measured curve is:
+The node rejects an invalid calibrated model (non-finite, `a1 ≤ 0`,
+`dF/du ≤ 0` somewhere on [0, 1], out-of-range idle/`r_eq`/`k_i`) and any legacy
+`motor_parameters` key (`A..D`, `n`, `thrust_limit`, `spin_k`, `vbat_*`) at
+startup. With all-zero `a3..a1` (uncalibrated) it starts but drops force
+commands; `~/control_command_raw` still works, which is what the calibration
+tools use. Non-finite `collective_thrust` or body rates are dropped as well.
+
+## Bench thrust test (fpv_test.md §2–§3)
+
+`thrust_test_node` runs the whole-craft pull test on a load cell and fits the
+model above. **The shipped hardware parameters are uncalibrated placeholders:
+run this test before flying with force commands.**
+
+Inputs: `/current_weight` (`[weight_kg, stable_weight_kg]`, ≥ 10 Hz, e.g.
+`scale_reader_node` for a DT30X), `/mavros/battery` (V, I), `/fpv/motor_rpm`
+(bidirectional DShot), `/fpv/static_pressure`, `/fpv/temperature_baro`.
+
+Procedure (§2.2, all adjustable): tare before arming, then duty steps
+`u = 0.05, 0.10 … 1.00` (20 steps); each step lasts 2.5 s — the first 0.5 s is
+discarded, every stream is averaged over the remaining 2.0 s into one point
+`(u, V, I, RPM1..4, F, P, t)`; after each step with `u ≥ 0.70` the motors return
+to idle for 5.0 s. A scale reading below `--critical-weight` (lift-off) or an
+unexpected disarm aborts safely; collected points are still written.
+
+Fit (§3): environment normalization `F0 = F·(P0/P)·(T/T0)`; RMS RPM; least
+squares `u·V = (1/K_v*)·RPM_rms + R_eq·I`; standard-voltage thrust
+`F_std = F0·((u·V_ref − I_std·R_eq)/(u·V − I·R_eq))²` with
+`I_std = I·(V_ref/V)²` (first-order `(V_ref/V)²` when RPM/current are
+missing); zero-intercept cubic via the normal equations; monotonicity check
+(`a1 > 0`, `dF/du > 0` on [0, 1]); `k_i` by least squares of `I_std` on
+`F_std`. Output: CSV with raw and normalized values, `*_result.yaml` with a
+ready-to-paste `motor_parameters` block (written only if the check passes),
+and a PNG.
+
+```bash
+# real stand, 6S, pilot holds the BOXOFFBOARD switch:
+ros2 run apm_bridge scale_reader_node --ros-args -p port:=/dev/ttyUSB0 &
+ros2 run apm_bridge thrust_test_node --lipo-cells 6 --output-dir /tmp
+```
+
+**AirSim / SITL** — no barometer, voltage sag, RPM or current sensor. Use
+`--no-env-comp --no-voltage-comp` (pairs with `baro_compensation` /
+`voltage_compensation: false` in the node) and `--offboard` to request OFFBOARD
+from the host; missing RPM is recorded as NaN and `R_eq` identification is
+skipped. AirSim thrust is linear in the duty, which the model represents
+exactly (`a1` only).
+
+```bash
+ros2 run apm_bridge thrust_test_node --offboard --no-env-comp --no-voltage-comp \
+  --yes --output-dir /tmp
+```
+
+`motor_check_node` is a props-off link/arm/throttle smoke test (no scale needed).
+
+## SITL motor calibration (flight pulses)
+
+The shipped [sitl_parameters.yaml](parameters/sitl_parameters.yaml) model comes
+from 42 steady-state FC samples measured in the AirSim/UE simulation on
+2026-10-10 (seven collective levels 0.08–0.50, two repeats;
+`parameters/sitl_motor_calibration.csv`), fitted
+with the fpv_test.md model over the duty `u = 0.055 + 0.945·collective`:
 
 ```text
-BF collective = 0.011891350984191815 * total force - 0.059949564628813956
-2 kg hover collective = 0.17327906962943534
-throttle RMSE = 0.0006232991, maximum error = 0.0016002142
+F_std(u) = -1.39108 u^3 - 0.55109 u^2 + 89.8761 u   [N]
+R^2 = 0.99998, max throttle error = 0.0016, 2 kg hover collective = 0.1732
 ```
 
 The historical calibration recorded its raw measurements as
@@ -705,101 +788,32 @@ altitude in a vertical estimator; the recorded acceleration used for fitting
 is not filtered or pressure-compensated.
 Pulses last 0.30 s and only the final 0.06 s is sampled, allowing the firmware's
 acceleration filter and command transport to settle. The maximum accepted
-throttle residual remains 0.01; transient samples are not used to fit the curve.
+inverse-model residual is 0.01 throttle; transient samples are not used.
 In SITL, landed-state detection uses a filtered height relative to the disarmed
 ground reference, while `/fpv/altitude` retains the original absolute FC
 barometric altitude. Hardware altitude behavior is unchanged.
 
-Offline refitting:
+Offline refitting (writes a standalone YAML with both compensations disabled):
 
 ```bash
 ros2 run apm_bridge sitl_motor_calibration \
   --parameters parameters/sitl_parameters.yaml \
-  --fit /tmp/sitl_thrust.csv --degree 1 --output /tmp/sitl_fitted.yaml
+  --fit /tmp/sitl_thrust.csv --output /tmp/sitl_fitted.yaml
 ```
 
-Degree 1 is appropriate for AirSim's thrust-linear rotor signal.
-Degrees 2/3 populate B/A for supported nonlinear experimental data. The fit
-checks monotonicity and a maximum throttle residual, writes a standalone ROS
-YAML with `n=1` (total force) and keeps both compensations disabled.
-The generated thrust limit never exceeds the highest sampled throttle. Before
-arming, the script verifies `airsim.enabled=true`, checks mass/gravity against
-the running node and rejects other control publishers.
+Before arming, the script verifies `airsim.enabled=true`, checks mass/gravity
+against the running node and rejects other control publishers.
 
-## Bench throttle-thrust calibration (physical test stand)
+### Tests
 
-`sitl_motor_calibration` fits the model by *flying* the simulator. For a real
-aircraft bolted to a load cell, `thrust_test_node` fits the same
-`motor_parameters` (the throttle↔force "conversion" of
-[`quadratic_thrust_model.h`](include/quadratic_thrust_model.h) and
-[fpv_test.md](../../../Documents/fpv_test.md)) from a bench sweep, driving the
-`custom_link_bridge` raw channel. Three tools:
-
-- `scale_reader_node` — reads a DT30X-style serial scale and publishes
-  `/current_weight` = `[weight_kg, stable_weight_kg(NaN=unsettled)]`. Any
-  publisher honouring that contract works (e.g. a SITL weight simulator).
-- `thrust_test_node` — arms via `/fpv/arm`, steps the throttle, averages the
-  steady weight at each step, and fits
-  `thrust = kp·((1-k)·thr + k·thr²)`, `thr = A·f³ + B·f² + C·f + D`,
-  `f = F_total/n`. Writes a CSV, a `*_result.yaml` with a ready-to-paste
-  `motor_parameters:` block, and a PNG.
-- `motor_check_node` — a props-off link/arm/throttle smoke test (no scale
-  needed).
-
-```bash
-# real stand, 6S quad, pilot holds the BOXOFFBOARD switch:
-ros2 run apm_bridge scale_reader_node --ros-args -p port:=/dev/ttyUSB0 &
-ros2 run apm_bridge thrust_test_node --lipo-cells 6 --num-motors 4 \
-  --min-thrust 5 --max-thrust 100 --step 5 --output-dir /tmp
-```
-
-Environment (`kp`), battery-sag (`vbat`/`volt_max`) and RPM-RMS compensation
-mirror fpv_test.md and the node's runtime inversion. The fitted coefficients are
-reported at the **standard reference state (P₀ = 101325 Pa, T₀ = 0 °C,
-V_ref = cells·3.7 V)**; the node de-normalizes them with live baro/voltage at
-run time. Each CSV row also records `current_A` and `rpm_rms` (RMS of the valid
-`/fpv/motor_rpm` entries) for offline advanced normalization; neither is
-required for the fit.
-
-Runtime safeguards in `quadratic_thrust_model.h` (applied by the bridge):
-
-- **Startup validation** — a calibrated model (any of A..D non-zero) must have
-  finite coefficients, `C > 0`, `thrust_limit ∈ (0, 1]`, `spin_k ∈ [0, 1]`, a
-  positive vbat curve over `[volt_min, volt_max]`, and must rise monotonically
-  until it reaches the throttle limit (fpv_test.md §3.2); otherwise the node
-  refuses to start. An all-zero model only warns (raw control still works).
-- **Monotone saturation** — if the cubic turns over (e.g. `A < 0`), force
-  requests beyond its maximum saturate at that maximum instead of collapsing
-  toward zero throttle.
-- **Voltage floor** — compensation uses `max(V, cells·3.0 V)`, so a sagging or
-  bogus voltage reading cannot multiply the throttle without bound (fpv_test.md
-  §4). The firmware already low-pass filters `vbat` (≈0.33 Hz), stricter than the
-  2–5 Hz the spec requires.
-- **Input sanitizing** — negative force requests map to the zero-force
-  throttle; non-finite `collective_thrust` / body rates are dropped by the node
-  instead of reaching the link encoder.
-
-**AirSim / SITL compatibility** — the simulator has no barometer, no battery
-sag and no bidirectional-DShot RPM, so the tool degrades automatically:
-
-- no `/fpv/static_pressure` (or `--kp 1.0`) ⇒ `kp = 1.0`, no density scaling;
-- `--no-voltage-comp` ⇒ no voltage normalization (AirSim pack voltage is flat);
-- missing/`NaN` `/fpv/motor_rpm` ⇒ `rpm_rms = NaN`, and the fit is a direct
-  (throttle, force) cubic — no RPM decoupling needed;
-- `--offboard` publishes `/fpv/offboard` so the host can take OFFBOARD without
-  a radio pilot.
-
-```bash
-# AirSim/SITL: launch the bridge, feed any /current_weight source, then:
-ros2 run apm_bridge thrust_test_node --offboard --no-voltage-comp \
-  --num-motors 4 --min-thrust 10 --max-thrust 40 --step 10 --yes --output-dir /tmp
-```
-
-The pure fit math is covered by `thrust_test_fit_test` (in `colcon test`).
-End-to-end coverage runs standalone against a sourced workspace:
-`python3 test/thrust_test_offline_test.py` (fake bridge, no hardware) and
-`python3 test/sitl_thrust_test.py --binary <betaflight>/obj/betaflight_SITL`
-(Betaflight SITL + synthetic scale).
+`colcon test` covers the model: `quadratic_thrust_model_test` (C++ runtime,
+including agreement with the fpv_test.md §5 reference C code and a closed-loop
+check on a physical plant), `thrust_model_test` (Python mirror),
+`thrust_test_fit_test` (SOP schedule, §3 pipeline, closed loop < 1 % thrust
+error) and `sitl_bridge_test`. End-to-end runs against a sourced workspace:
+`python3 test/thrust_test_offline_test.py` (fake bridge + physical plant, no
+hardware) and `python3 test/sitl_thrust_test.py --binary
+<betaflight>/obj/betaflight_SITL` (Betaflight SITL + synthetic scale).
 
 ## Current regression checks
 

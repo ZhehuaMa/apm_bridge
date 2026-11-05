@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SITL end-to-end test for thrust_test_node (--backend custom).
+"""SITL end-to-end test for thrust_test_node (fpv_test.md bench SOP, AirSim-style options).
 
 Brings up the Betaflight SITL firmware with the custom link on tcp:5763
 (same provisioning as sitl_custom_link_test.py: ARM on AUX1, OFFBOARD on
@@ -7,9 +7,12 @@ AUX2, BOXOFFBOARD switch held on), the custom_link_bridge_node, and a
 synthetic bench scale driven by the SITL motor outputs, then runs the
 real thrust_test_node as a subprocess and checks:
 
-  1. host arm + OFFBOARD takeover + motors spin up following the sweep
-  2. sweep steps appear in the CSV with increasing force
+  1. host arm + OFFBOARD takeover + motors spin up following the SOP steps
+  2. SOP steps appear in the CSV with increasing force and a monotonic fpv_test.md fit
   3. clean shutdown: FC disarmed, OFFBOARD dropped, exit code 0
+
+The synthetic scale is linear in the SITL motor outputs and SITL has no battery sag or
+RPM feedback, so the tool runs with --no-env-comp --no-voltage-comp (AirSim settings).
 
 Usage (workspace with apm_bridge built and sourced, system python):
   python3 test/sitl_thrust_test.py --binary <betaflight repo>/obj/betaflight_2026.6.1_SITL
@@ -44,11 +47,11 @@ BOX_OFFBOARD = 58  # permanent id
 TARE = 5.0        # kg
 K_FORCE = 6.0     # N per unit of summed motor output
 
-# 工具参数: 3 档扫油门, 快速流程 (不传 --kp, 走桥发布的 /fpv/static_pressure)
-TOOL_ARGS = ['--backend', 'custom', '--yes', '--no-plot', '--no-voltage-comp',
-             '--min-thrust', '15', '--max-thrust', '35', '--step', '10',
-             '--settle-time', '1.0', '--samples-per-point', '20',
-             '--num-motors', '4', '--lipo-cells', '6']
+# 工具参数: 5 阶 SOP (u = 0.2..0.6), 每阶 1.5 s (0.5 s 稳定 + 1.0 s 采样), 无降温段
+TOOL_ARGS = ['--yes', '--no-plot', '--no-env-comp', '--no-voltage-comp',
+             '--u-start', '0.2', '--u-step', '0.1', '--u-end', '0.6',
+             '--step-time', '1.5', '--settle-time', '0.5', '--cooldown-time', '0',
+             '--tare-time', '1.0', '--lipo-cells', '6']
 
 
 class StateObserver(Node):
@@ -97,9 +100,12 @@ class WeightSim:
 
 
 def provision_and_start_sitl(binary, workdir):
-    subprocess.run(["pkill", "-f", f"^{binary}"], check=False)
-    subprocess.run(["pkill", "-f", "custom_link_bridge_node"], check=False)
-    time.sleep(1.0)
+    # Never kill other users' processes on a shared host: refuse to run instead.
+    for pattern in (f"^{binary}", "custom_link_bridge_node"):
+        running = subprocess.run(["pgrep", "-af", pattern], capture_output=True, text=True)
+        if running.returncode == 0:
+            print(f"refusing to start: '{pattern}' already running:\n{running.stdout.strip()}")
+            return None, None
 
     os.makedirs(workdir, exist_ok=True)
     eeprom = os.path.join(workdir, "eeprom.bin")
@@ -117,7 +123,7 @@ def provision_and_start_sitl(binary, workdir):
                          capture_output=True, text=True, timeout=60)
     if res.returncode != 0 or not os.path.exists(eeprom):
         print("provisioning failed:", res.stdout[-500:], res.stderr[-500:])
-        return None
+        return None, None
 
     sitl_log = open(os.path.join(workdir, "sitl.log"), "w")
     return subprocess.Popen(["stdbuf", "-oL", "-eL", binary], cwd=workdir,
@@ -237,7 +243,7 @@ def main():
         results['motors_spun'] = motor_max > 0.25
         print(f'motor peak: {motor_max:.2f}')
 
-        # 桥发布的环境气压话题 (供 kp 采集)
+        # 桥发布的环境气压话题 (fpv_test.md §3.1 环境归一化输入)
         results['pressure_topic'] = observer.pressure_count > 10
         print(f'pressure messages: {observer.pressure_count}')
 
@@ -250,8 +256,8 @@ def main():
         if ok:
             with open(os.path.join(out_dir, csv_files[-1])) as f:
                 rows = list(csv.DictReader(f))
-            ok = len(rows) == 3
-            forces = [float(r['force_N']) for r in rows]
+            ok = len(rows) == 5
+            forces = [float(r['F_N']) for r in rows]
             ok = ok and all(forces[i] < forces[i + 1] for i in range(len(forces) - 1))
             ok = ok and forces[-1] > 1.0
         results['csv_points'] = ok
