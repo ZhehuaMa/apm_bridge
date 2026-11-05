@@ -60,8 +60,6 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<double>("motor_parameters.a3", 0.0);
     this->declare_parameter<double>("motor_parameters.a2", 0.0);
     this->declare_parameter<double>("motor_parameters.a1", 0.0);
-    this->declare_parameter<double>("motor_parameters.u_idle", 0.05);
-    this->declare_parameter<double>("motor_parameters.motor_idle", 0.055);
     this->declare_parameter<double>("motor_parameters.r_eq", 0.0);
     this->declare_parameter<double>("motor_parameters.k_i", 0.0);
     this->declare_parameter<double>("voltage_lpf_hz", 3.0);
@@ -103,23 +101,25 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("cli.bind_rx_on_connect", cli_bind_rx_on_connect);
 
     // 旧版 A..D/spin_k/vbat 模型已按 fpv_test.md 重建, 键名不兼容: 显式拒绝, 避免
-    // 旧参数文件被静默忽略后以未标定模型运行。
+    // 旧参数文件被静默忽略后以未标定模型运行。u_idle 不再是参数: 链路建立后由飞控
+    // CLI "get motor_idle" 读取 (与飞控实际怠速一致)。
     static const std::set<std::string> kModelKeys{
-        "motor_parameters.a3", "motor_parameters.a2", "motor_parameters.a1", "motor_parameters.u_idle",
-        "motor_parameters.motor_idle", "motor_parameters.r_eq", "motor_parameters.k_i"};
+        "motor_parameters.a3", "motor_parameters.a2", "motor_parameters.a1",
+        "motor_parameters.r_eq", "motor_parameters.k_i"};
     for (const auto &[name, value] : this->get_node_parameters_interface()->get_parameter_overrides())
     {
         (void)value;
+        if (name == "motor_parameters.u_idle" || name == "motor_parameters.motor_idle")
+            throw std::invalid_argument("Unsupported parameter '" + name +
+                                        "': u_idle is read from the FC (CLI get motor_idle); remove it");
         if (name.rfind("motor_parameters.", 0) == 0 && !kModelKeys.count(name))
             throw std::invalid_argument("Unsupported parameter '" + name +
-                                        "': motor_parameters now follow fpv_test.md (a3, a2, a1, u_idle, "
-                                        "motor_idle, r_eq, k_i); recalibrate with thrust_test_node");
+                                        "': motor_parameters now follow fpv_test.md (a3, a2, a1, r_eq, k_i); "
+                                        "recalibrate with thrust_test_node");
     }
     this->get_parameter("motor_parameters.a3", propulsion.a3);
     this->get_parameter("motor_parameters.a2", propulsion.a2);
     this->get_parameter("motor_parameters.a1", propulsion.a1);
-    this->get_parameter("motor_parameters.u_idle", propulsion.u_idle);
-    this->get_parameter("motor_parameters.motor_idle", motor_idle);
     this->get_parameter("motor_parameters.r_eq", propulsion.r_eq);
     this->get_parameter("motor_parameters.k_i", propulsion.k_i);
     this->get_parameter("voltage_lpf_hz", voltage_lpf_hz);
@@ -154,8 +154,6 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
         (!std::isfinite(mass) || mass <= 0 || !std::isfinite(gravity) || gravity <= 0 ||
          !std::isfinite(control_timeout) || control_timeout <= 0))
         throw std::invalid_argument("Invalid SITL mass, gravity or timeout");
-    if (!std::isfinite(motor_idle) || motor_idle < 0.0 || motor_idle >= 1.0)
-        throw std::invalid_argument("motor_parameters.motor_idle must be in [0, 1)");
     if (!std::isfinite(voltage_lpf_hz) || voltage_lpf_hz < 2.0 || voltage_lpf_hz > 5.0)
         throw std::invalid_argument("voltage_lpf_hz must be within 2..5 Hz (fpv_test.md section 4)");
     // a3..a1 全零 = 未标定: 只允许 raw 油门通道 (台架标定工具即走 raw); 已标定模型须通过
@@ -165,15 +163,13 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
         const std::string model_error = quadratic_thrust_model::validateModel(propulsion);
         if (!model_error.empty())
             throw std::invalid_argument("Invalid motor_parameters: " + model_error);
-        const double inverse_error = quadratic_thrust_model::initInverse(propulsion);
         RCLCPP_INFO(this->get_logger(),
                     "Propulsion model: F_std(u) = %.6g u^3 + %.6g u^2 + %.6g u N (F(1)=%.3f N), "
-                    "V_ref=%.2f V, u_idle=%.3f, motor_idle=%.3f, R_eq=%.4g ohm, k_i=%.4g A/N, "
-                    "V_min=%.1f V, LPF %.1f Hz; inverse-cubic initial guess max error %.2e",
+                    "V_ref=%.2f V, R_eq=%.4g ohm, k_i=%.4g A/N, V_min=%.1f V, LPF %.1f Hz; "
+                    "u_idle pending FC motor_idle (CLI)",
                     propulsion.a3, propulsion.a2, propulsion.a1,
                     quadratic_thrust_model::standardThrust(propulsion, 1.0), propulsion.v_ref,
-                    propulsion.u_idle, motor_idle, propulsion.r_eq, propulsion.k_i, propulsion.v_min,
-                    voltage_lpf_hz, inverse_error);
+                    propulsion.r_eq, propulsion.k_i, propulsion.v_min, voltage_lpf_hz);
     }
     else
         RCLCPP_WARN(this->get_logger(),
@@ -388,14 +384,14 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
             // cli.bind_rx_on_connect: 每次链路建立成功后让接收机进配对模式
             //（0x24 CL_CLI_CMD_BIND_RX，同 CLI bind_rx）。请求由 CLI 工作线程
             // 执行，这里只置标志并唤醒。持锁置位避免丢唤醒。
-            if (cli_bind_rx_on_connect)
+            // 同时 (重新) 读取飞控 motor_idle 作为 u_idle: 飞控可能已重启/改过配置。
             {
-                {
-                    std::lock_guard<std::mutex> lk(cli_job_mtx);
+                std::lock_guard<std::mutex> lk(cli_job_mtx);
+                if (cli_bind_rx_on_connect)
                     rx_bind_pending = true;
-                }
-                cli_job_cv.notify_one();
+                scheduleIdleQuery(std::chrono::steady_clock::now());
             }
+            cli_job_cv.notify_one();
         }
         else
             RCLCPP_WARN(this->get_logger(), "Custom link down");
@@ -1007,14 +1003,14 @@ void CustomLinkVehicleNode::pushControl()
                 if (cmd_force_mode)
                 {
                     // §4 在线反解 (每个控制周期用最新的环境系数与低通电压/电流):
-                    // F_req -> 占空比 u ∈ [u_idle, 1] -> Betaflight 集体油门。
+                    // F_req -> 占空比 u ∈ [u_idle, 1] -> Betaflight 集体油门 (u_idle 对应 c = 0)。
                     std::lock_guard<std::mutex> lk(mtx_kp);
                     const double nan = std::numeric_limits<double>::quiet_NaN();
                     const double duty = quadratic_thrust_model::calculateThrottle(
                         propulsion, cmd_force, env_factor,
                         voltage_compensation ? voltage_lpf.value : nan,
                         voltage_compensation ? current_lpf.value : nan);
-                    input.throttle = quadratic_thrust_model::dutyToCollective(duty, motor_idle);
+                    input.throttle = quadratic_thrust_model::dutyToCollective(duty, propulsion.u_idle);
                 }
                 else
                     input.throttle = cmd_thrust;
@@ -1121,6 +1117,13 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     {
         RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                               "Dropping control command: motor_parameters uncalibrated (run thrust_test_node)");
+        return;
+    }
+    // u_idle (飞控 motor_idle) 未读到前无法把占空比换算回集体油门。
+    if (!motor_idle_known.load())
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Dropping control command: FC motor_idle (u_idle) not yet read via CLI");
         return;
     }
 
@@ -1342,14 +1345,61 @@ void CustomLinkVehicleNode::maybeStartRxBind()
         RCLCPP_WARN(this->get_logger(), "RX bind on connect failed: %s", result.error.c_str());
 }
 
+void CustomLinkVehicleNode::scheduleIdleQuery(std::chrono::steady_clock::time_point due)
+{
+    idle_query_pending = true;
+    idle_query_due = due;
+}
+
+bool CustomLinkVehicleNode::queryMotorIdle()
+{
+    // fpv_test.md §4 步骤 4 的 u_idle 即飞控 motor_idle: 集体油门 0 对应的 DShot 占空比
+    // u = u_idle + (1 - u_idle)·c, 只有读到它才能把反解出的占空比换回集体油门。
+    if (!client)
+        return false;
+    const auto result = client->cliCommand(custom_link::protocol::CLI_CMD_GET, "motor_idle", cli_timeout);
+    const double idle = result.ok && result.status == custom_link::protocol::CLI_STATUS_OK
+                            ? quadratic_thrust_model::idleDutyFromCli(result.text)
+                            : std::numeric_limits<double>::quiet_NaN();
+    if (!std::isfinite(idle))
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                             "Reading FC motor_idle via CLI failed (%s); force commands stay rejected, retrying",
+                             result.ok ? result.text.c_str() : result.error.c_str());
+        return false;
+    }
+    double inverse_error = -1.0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_kp);
+        propulsion.u_idle = idle;
+        if (quadratic_thrust_model::configured(propulsion))
+            inverse_error = quadratic_thrust_model::initInverse(propulsion);
+        motor_idle_known = true;
+    }
+    if (inverse_error >= 0.0)
+        RCLCPP_INFO(this->get_logger(),
+                    "FC %s -> u_idle = %.4f (collective 0); inverse-cubic initial guess max error %.2e",
+                    result.text.c_str(), idle, inverse_error);
+    else
+        RCLCPP_INFO(this->get_logger(), "FC %s -> u_idle = %.4f (collective 0)", result.text.c_str(), idle);
+    return true;
+}
+
 void CustomLinkVehicleNode::cliWorkerLoop()
 {
     std::unique_lock<std::mutex> lk(cli_job_mtx);
+    const auto idle_due = [this] {
+        return idle_query_pending && std::chrono::steady_clock::now() >= idle_query_due;
+    };
+    const auto ready = [this, &idle_due] {
+        return !cli_jobs.empty() || rx_bind_pending || idle_due() || !cli_worker_running.load();
+    };
     while (cli_worker_running.load())
     {
-        cli_job_cv.wait(lk, [this] {
-            return !cli_jobs.empty() || rx_bind_pending || !cli_worker_running.load();
-        });
+        if (idle_query_pending)
+            cli_job_cv.wait_until(lk, idle_query_due, ready);
+        else
+            cli_job_cv.wait(lk, ready);
         // 连接触发的接收机配对（cli.bind_rx_on_connect）：优先于排队请求
         if (rx_bind_pending)
         {
@@ -1357,6 +1407,16 @@ void CustomLinkVehicleNode::cliWorkerLoop()
             lk.unlock();
             maybeStartRxBind();
             lk.lock();
+        }
+        // 连接触发的 motor_idle 读取; 失败 (链路未通/飞控无 CLI) 周期重试
+        if (idle_due())
+        {
+            idle_query_pending = false;
+            lk.unlock();
+            const bool ok = queryMotorIdle();
+            lk.lock();
+            if (!ok && !idle_query_pending)
+                scheduleIdleQuery(std::chrono::steady_clock::now() + kIdleQueryRetry);
         }
         // 内层循环也要感知停止：FC 无响应时每个积压请求都吃满超时，
         // 析构 join 不能拖 kMaxQueue x cli_timeout；剩下的交给下面的
@@ -1372,6 +1432,10 @@ void CustomLinkVehicleNode::cliWorkerLoop()
                 result = client->cliCommand(job.request->cmd, job.request->args, cli_timeout);
             else
                 result.error = "link not initialized";
+            // 经 /fpv/cli 改了 motor_idle: 立即重读, 保持 u_idle 与飞控一致
+            const bool idle_changed = job.request->cmd == quadrotor_msgs::srv::CliCommand::Request::CMD_SET &&
+                                      result.ok && result.status == custom_link::protocol::CLI_STATUS_OK &&
+                                      job.request->args.rfind("motor_idle", 0) == 0;
             auto response = std::make_shared<quadrotor_msgs::srv::CliCommand::Response>();
             response->ok = result.ok;
             response->status = result.status;
@@ -1380,6 +1444,8 @@ void CustomLinkVehicleNode::cliWorkerLoop()
             cliRespond(job.header, std::move(response));
 
             lk.lock();
+            if (idle_changed)
+                scheduleIdleQuery(std::chrono::steady_clock::now());
         }
     }
     // 关停排空：仍在队列里的请求明确回包，客户端不至于悬挂等超时

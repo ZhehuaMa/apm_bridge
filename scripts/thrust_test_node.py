@@ -18,8 +18,9 @@
 输出 CSV、带 motor_parameters 段的 *_result.yaml (直接粘贴进 custom_link_parameters.yaml)
 与 PNG。
 
-油门域: Betaflight 集体油门 c 与占空比 u 的关系为 u = motor_idle + (1 − motor_idle)·c
-(dshot_idle_value, 默认 5.5%); 低于 motor_idle 的阶梯实际以 motor_idle 运行并按实际值记录。
+油门域: Betaflight 集体油门 c 与占空比 u 的关系为 u = u_idle + (1 − u_idle)·c, u_idle 即
+飞控 motor_idle (默认 550 = 5.5%), 启动时经 /fpv/cli "get motor_idle" 读取, 不作参数;
+低于 u_idle 的阶梯实际以 u_idle (c = 0) 运行并按实际值记录, 降温段同样回到 u_idle。
 
 AirSim / SITL (无气压、无电压下降、无转速反馈): 传 --no-env-comp --no-voltage-comp
 跳过步骤 1、3、4 (与节点 baro_compensation/voltage_compensation=false 对应);
@@ -142,8 +143,6 @@ def render_param_yaml(result, args):
              f"      a3: {result['a3']:.9g}",
              f"      a2: {result['a2']:.9g}",
              f"      a1: {result['a1']:.9g}",
-             f'      u_idle: {args.u_idle:.6g}',
-             f'      motor_idle: {args.motor_idle:.6g}',
              f"      r_eq: {result['r_eq']:.9g}",
              f"      k_i: {result['k_i']:.9g}"]
     return '\n'.join(lines)
@@ -181,6 +180,7 @@ class ThrustTestNode(Node):
 
         self.points = []
         self.tare_kg = float('nan')
+        self.u_idle = float('nan')         # 飞控 motor_idle 占空比 (main 中经 /fpv/cli 读取)
 
         qos_be5 = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_be10 = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -302,7 +302,7 @@ class ThrustTestNode(Node):
         with self.lock:
             collective, weight, voltage = self.collective, self.last_weight, self.last_voltage
             mode, armed = self.mode, self.armed
-        duty = pm.collective_to_duty(collective, self.args.motor_idle)
+        duty = pm.collective_to_duty(collective, self.u_idle)
         print(f'\r[u={duty:5.3f} c={collective:5.3f}] [w={weight:.3f} kg] [V={voltage:.2f}] '
               f'[mode={mode or "--"}{" armed" if armed else ""}] [pts={len(self.points)}]   ',
               end='', flush=True)
@@ -311,7 +311,7 @@ class ThrustTestNode(Node):
 
     def set_duty(self, duty):
         with self.lock:
-            self.collective = pm.duty_to_collective(duty, self.args.motor_idle)
+            self.collective = pm.duty_to_collective(duty, self.u_idle)
             return self.collective
 
     def sleep_abortable(self, seconds):
@@ -346,7 +346,7 @@ class ThrustTestNode(Node):
             collective = self.set_duty(duty)
             if action == 'sample':
                 with self.lock:
-                    self.window = new_window(pm.collective_to_duty(collective, self.args.motor_idle),
+                    self.window = new_window(pm.collective_to_duty(collective, self.u_idle),
                                              collective)
                 ok = self.sleep_abortable(duration)
                 with self.lock:
@@ -468,6 +468,7 @@ def write_outputs(points, args, aborted):
         f.write(f'aborted: {str(aborted).lower()}\n')
         f.write(f'points: {len(points)}\n')
         f.write(f'v_ref: {v_ref:.2f}\n')
+        f.write(f'u_idle_fc_motor_idle: {args.u_idle:.4f}  # read from the FC at test time, not a parameter\n')
         f.write(f'environment_normalization: {str(not args.no_env_comp).lower()}\n')
         f.write(f'voltage_normalization: {str(not args.no_voltage_comp).lower()}\n')
         if result:
@@ -556,10 +557,6 @@ def parse_args(argv=None):
     parser.add_argument('--cooldown-threshold', type=float, default=0.70,
                         help='steps at or above this duty are followed by an idle cooldown')
     parser.add_argument('--cooldown-time', type=float, default=5.0, help='idle cooldown [s]')
-    parser.add_argument('--u-idle', type=float, default=pm.DEFAULT_U_IDLE,
-                        help='idle duty floor written to the result (§4 step 4)')
-    parser.add_argument('--motor-idle', type=float, default=pm.DEFAULT_MOTOR_IDLE,
-                        help='FC dshot_idle_value/10000: duty at Betaflight collective 0')
     parser.add_argument('--lipo-cells', type=int, default=6, help='V_ref = cells*3.7 V')
     parser.add_argument('--gravity', type=float, default=9.80665)
     parser.add_argument('--tare-time', type=float, default=2.0,
@@ -578,12 +575,11 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     try:
         args.levels = sop_levels(args.u_start, args.u_step, args.u_end)
-        args.timeline = sop_timeline(args.levels, args.step_time, args.settle_time,
-                                     args.cooldown_threshold, args.cooldown_time, args.u_idle)
+        # 校验时序参数; 实际时序在读到飞控 u_idle 后生成 (降温段回到 u_idle)
+        sop_timeline(args.levels, args.step_time, args.settle_time,
+                     args.cooldown_threshold, args.cooldown_time, 0.0)
     except ValueError as e:
         parser.error(str(e))
-    if not 0.0 <= args.motor_idle < 1.0 or not 0.0 <= args.u_idle < 1.0:
-        parser.error('--motor-idle and --u-idle must be in [0, 1)')
     return args
 
 
@@ -640,16 +636,24 @@ def main():
     spin_thread.start()
     install_signal_handlers(node.abort_event)
 
-    total = sum(d for _, _, d in args.timeline)
-    print(f'{bcolors.OKBLUE}SOP: {len(args.levels)} steps u={args.levels[0]:.2f}..{args.levels[-1]:.2f}, '
-          f'{args.step_time:.1f} s/step ({args.settle_time:.1f} s settle + '
-          f'{args.step_time - args.settle_time:.1f} s sample), cooldown {args.cooldown_time:.1f} s '
-          f'after u>={args.cooldown_threshold:.2f}; total {total:.0f} s{bcolors.ENDC}')
-
     exit_code, aborted, started = 0, False, False
     try:
         if not node.state_event.wait(timeout=15.0):
             raise FatalError('no /mavros/state within 15 s -- is custom_link_bridge_node running?')
+        # u_idle = 飞控 motor_idle: 集体油门 0 的占空比, 也是降温段的怠速 (§2.2/§4 步骤 4)
+        try:
+            node.u_idle = pm.fetch_u_idle(node, timeout=10.0)
+        except RuntimeError as e:
+            raise FatalError(f'cannot read FC motor_idle via /fpv/cli: {e}')
+        args.u_idle = node.u_idle
+        args.timeline = sop_timeline(args.levels, args.step_time, args.settle_time,
+                                     args.cooldown_threshold, args.cooldown_time, node.u_idle)
+        total = sum(d for _, _, d in args.timeline)
+        print(f'{bcolors.OKBLUE}FC motor_idle -> u_idle = {node.u_idle:.4f}; SOP: {len(args.levels)} steps '
+              f'u={args.levels[0]:.2f}..{args.levels[-1]:.2f}, {args.step_time:.1f} s/step '
+              f'({args.settle_time:.1f} s settle + {args.step_time - args.settle_time:.1f} s sample), '
+              f'cooldown {args.cooldown_time:.1f} s after u>={args.cooldown_threshold:.2f}; '
+              f'total {total:.0f} s{bcolors.ENDC}')
         if not node.weight_event.wait(timeout=5.0):
             raise FatalError('no /current_weight data -- is scale_reader_node running?')
         if not confirm_start(args, node.abort_event):

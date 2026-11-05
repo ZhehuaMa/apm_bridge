@@ -28,6 +28,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -134,12 +135,19 @@ namespace custom_link_bridge
         std::deque<CliJob> cli_jobs;
         std::atomic_bool cli_worker_running{false};
         bool rx_bind_pending = false;       // 持 cli_job_mtx；link up 时置位
+        // fpv_test.md u_idle = 飞控 motor_idle: link up (及经 /fpv/cli SET motor_idle 后)
+        // 由 CLI 工作线程 "get motor_idle" 读取, 失败按 kIdleQueryRetry 周期重试。持 cli_job_mtx。
+        bool idle_query_pending = false;
+        std::chrono::steady_clock::time_point idle_query_due{};
+        static constexpr std::chrono::seconds kIdleQueryRetry{5};
         bool cli_bind_rx_on_connect = false;
         double cli_timeout = 3.0;
         void cliServiceCallback(const std::shared_ptr<rmw_request_id_t> header,
                                 const std::shared_ptr<quadrotor_msgs::srv::CliCommand::Request> request);
         void cliWorkerLoop();
         void maybeStartRxBind();
+        bool queryMotorIdle();
+        void scheduleIdleQuery(std::chrono::steady_clock::time_point due); // 调用方持 cli_job_mtx
         void cliRespond(const std::shared_ptr<rmw_request_id_t> header,
                         std::shared_ptr<quadrotor_msgs::srv::CliCommand::Response> response);
         apm_bridge::GimbalModeSelector gimbal_mode_selector;
@@ -173,7 +181,7 @@ namespace custom_link_bridge
 
         // ---- 参数 ----
         quadratic_thrust_model::PropulsionModel propulsion; // fpv_test.md §4 在线反解模型
-        double motor_idle = 0.055;  // FC dshot_idle_value/10000: 集体油门 0 对应的占空比
+        std::atomic_bool motor_idle_known{false}; // propulsion.u_idle 已由飞控 CLI 读回 (持 mtx_kp 写 u_idle 后置位)
         double voltage_lpf_hz = 3.0; // §4 母线电压低通截止频率 (2~5 Hz)
         double gravity = 9.80665;
         double mass = 2.0;

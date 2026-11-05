@@ -235,6 +235,19 @@ namespace
         require(collectiveToDuty(0.0, 0.055) == 0.055 && collectiveToDuty(1.0, 0.055) == 1.0, "duty map");
         require(dutyToCollective(0.05, 0.055) == 0.0, "duty below idle -> collective 0");
         require(std::abs(dutyToCollective(collectiveToDuty(0.37, 0.055), 0.055) - 0.37) < 1e-12, "round trip");
+        // u_idle (§4 step 4 floor) is the FC motor_idle duty: it maps exactly to collective 0
+        const auto m = make(-15.0, 70.0, 6.0);
+        require(dutyToCollective(calculateThrottle(m, 0.0), m.u_idle) == 0.0, "u_idle must be collective 0");
+    }
+
+    void motor_idle_from_cli()
+    {
+        require(idleDutyFromCli("motor_idle = 550") == 0.055, "default BF motor_idle");
+        require(idleDutyFromCli("motor_idle = 0\r\n") == 0.0, "zero idle with line ending");
+        require(idleDutyFromCli("  motor_idle=2000 ") == 0.2, "upper bound");
+        for (const char *bad : {"motor_idle = 2001", "motor_idle = -5", "motor_idle = 5.5", "motor_idle =",
+                                "dshot_idle_value = 550", "NOT FOUND", "", "motor_idle = 99999999"})
+            require(std::isnan(idleDutyFromCli(bad)), "malformed motor_idle reply accepted");
     }
 
     // Synthetic plant (test/propulsion_plant.py): F = K·ρ·RPM², K_e·RPM = u·V − I·R_eq,
@@ -289,6 +302,7 @@ int main()
     step4_clip_and_guards();
     validation();
     low_pass_and_duty_mapping();
+    motor_idle_from_cli();
     closed_loop_on_plant();
     const auto m = make(-15.0, 70.0, 6.0);
     require(quadratic_thrust_model_second_tu(m, 20.0) == calculateThrottle(m, 20.0),

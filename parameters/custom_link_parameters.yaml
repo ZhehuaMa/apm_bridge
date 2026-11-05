@@ -19,12 +19,12 @@ custom_link_bridge:
     #   F_std(u) = a3*u^3 + a2*u^2 + a1*u
     # 需按 fpv_test.md §2 台架实验重新标定 (thrust_test_node), 结果 YAML 中的整段粘贴到此。
     # a3..a1 全零 = 未标定: 节点拒绝 /fpv/control_command 力指令, 只允许 raw 油门。
+    # §4 步骤 4 的怠速下限 u_idle 不是参数: 链路建立后由飞控 CLI "get motor_idle" 读取
+    # (550 = 5.5% 占空比, 即集体油门 0), 读到之前同样拒绝力指令。
     motor_parameters:
       a3: 0.0
       a2: 0.0
       a1: 0.0
-      u_idle: 0.05        # §4 步骤 4 怠速死区下限
-      motor_idle: 0.055   # 须与飞控 dshot_idle_value (550 = 5.5%) 一致: 集体油门 0 对应的占空比
       r_eq: 0.0           # 全系统等效内阻 (Ω), 标定得出; 0 = 一阶电压补偿
       k_i: 0.0            # I_std = k_i*F_std (A/N), 标定得出; 0 = 一阶电压补偿
 

@@ -5,8 +5,9 @@
 //
 // u 为整机归一化油门开度 (DShot 占空比, F(0)=0)。标准状态 (V_ref = cells·3.7 V,
 // T0 = 273.15 K, P0 = 101325 Pa) 下:  F_std(u) = a3·u³ + a2·u² + a1·u  (总推力, N)。
-// Betaflight 集体油门 c 与占空比的换算见 dutyToCollective (DShot 输出 idle 映射)。
-// 全部为 inline 定义, 可被多个翻译单元包含。
+// 怠速下限 u_idle 即飞控 motor_idle (CLI "get motor_idle", 0.01 % 单位): Betaflight
+// 集体油门 c 输出占空比 u = u_idle + (1 − u_idle)·c, 故 §4 步骤 4 的下限 u_idle 恰对应
+// c = 0 (换算见 dutyToCollective)。全部为 inline 定义, 可被多个翻译单元包含。
 
 #include <algorithm>
 #include <cmath>
@@ -29,7 +30,7 @@ namespace quadratic_thrust_model
         double a2 = 0.0;
         double a1 = 0.0;
         double v_ref = 22.2;  // 基准电压 V_ref (cells·3.7)
-        double u_idle = 0.05; // 怠速死区下限 (§4 步骤 4)
+        double u_idle = 0.05; // 怠速死区下限 (§4 步骤 4) = 飞控 motor_idle 占空比, 运行时由 CLI 读取
         double r_eq = 0.0;    // 全系统等效集中电阻 (Ω); 0 = 一阶电压补偿
         double k_i = 0.0;     // I_std = k_i·F_std (A/N, I ∝ RPM² ∝ F); 0 = 一阶电压补偿
         double v_min = 12.0;  // 欠压保护下限 (cells·2.0, §5)
@@ -253,15 +254,37 @@ namespace quadratic_thrust_model
         }
     };
 
-    /// Betaflight DShot 输出: 占空比 u = idle + (1 − idle)·c (dshot.c outputLow)。
-    inline double collectiveToDuty(double collective, double motor_idle)
+    /// Betaflight DShot 输出: 占空比 u = u_idle + (1 − u_idle)·c (dshot.c outputLow,
+    /// u_idle = motor_idle/10000)。
+    inline double collectiveToDuty(double collective, double u_idle)
     {
-        return motor_idle + (1.0 - motor_idle) * std::clamp(collective, 0.0, 1.0);
+        return u_idle + (1.0 - u_idle) * std::clamp(collective, 0.0, 1.0);
     }
 
-    inline double dutyToCollective(double duty, double motor_idle)
+    inline double dutyToCollective(double duty, double u_idle)
     {
-        return std::clamp((duty - motor_idle) / (1.0 - motor_idle), 0.0, 1.0);
+        return std::clamp((duty - u_idle) / (1.0 - u_idle), 0.0, 1.0);
+    }
+
+    /// 解析 custom link CLI "get motor_idle" 的回读 "motor_idle = 550" (单位 0.01 %,
+    /// Betaflight 取值 0..2000) 为占空比 0.055; 名称不符/非整数/越界返回 NaN。
+    inline double idleDutyFromCli(const std::string &text)
+    {
+        constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+        const auto eq = text.find('=');
+        if (eq == std::string::npos)
+            return kNan;
+        auto trim = [](std::string s) {
+            const auto first = s.find_first_not_of(" \t\r\n");
+            const auto last = s.find_last_not_of(" \t\r\n");
+            return first == std::string::npos ? std::string{} : s.substr(first, last - first + 1);
+        };
+        const std::string value = trim(text.substr(eq + 1));
+        if (trim(text.substr(0, eq)) != "motor_idle" || value.empty() ||
+            value.find_first_not_of("0123456789") != std::string::npos || value.size() > 5)
+            return kNan;
+        const int raw = std::stoi(value);
+        return raw <= 2000 ? raw / 10000.0 : kNan;
     }
 
 } // namespace quadratic_thrust_model

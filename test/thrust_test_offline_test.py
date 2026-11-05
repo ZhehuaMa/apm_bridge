@@ -1,8 +1,9 @@
 #!/usr/bin/python3
 """Offline end-to-end test of thrust_test_node against a fake bridge + physical plant.
 
-The FakeBridge emulates custom_link_bridge + FC + bench scale: every commanded
-Betaflight collective is mapped to the DShot duty u = 0.055 + 0.945·c and applied to
+The FakeBridge emulates custom_link_bridge + FC + bench scale. It answers /fpv/cli
+"get motor_idle" with a non-default 600 (u_idle = 0.06) so the tool must read it from
+the FC; every commanded Betaflight collective is mapped to u = u_idle + (1 − u_idle)·c and applied to
 the synthetic plant of propulsion_plant.py (F ∝ ρ·RPM², back-EMF, I ∝ RPM², pack sag).
 It publishes /current_weight, /mavros/battery (V, I), /fpv/motor_rpm,
 /fpv/static_pressure and /fpv/temperature_baro at a non-standard atmosphere.
@@ -34,6 +35,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from mavros_msgs.msg import State
 from quadrotor_msgs.msg import ControlCommand
+from quadrotor_msgs.srv import CliCommand
 from sensor_msgs.msg import BatteryState, FluidPressure, Imu, Temperature
 from std_msgs.msg import Bool, Float32MultiArray
 
@@ -48,7 +50,8 @@ TARE = 6.0            # kg on the scale with motors stopped
 GRAVITY = 9.80665
 PRESSURE = 85000.0    # ~1500 m
 TEMPERATURE = 30.0
-MOTOR_IDLE = 0.055
+FC_MOTOR_IDLE = 600             # Betaflight motor_idle (0.01 %), deliberately not the default
+U_IDLE = FC_MOTOR_IDLE / 10000.0
 
 # shortened SOP: 10 steps 0.1..1.0, 0.6 s/step (0.2 s settle), 0.3 s idle cooldown
 SOP_ARGS = ['--yes', '--no-plot', '--u-start', '0.1', '--u-step', '0.1', '--u-end', '1.0',
@@ -77,6 +80,8 @@ class FakeBridge(Node):
         self.temp_pub = self.create_publisher(Temperature, '/fpv/temperature_baro', qos)
         self.create_subscription(ControlCommand, '/fpv/control_command_raw', self.on_command, qos)
         self.create_subscription(Bool, '/fpv/arm', self.on_arm, qos)
+        self.cli_gets = []
+        self.create_service(CliCommand, '/fpv/cli', self.on_cli)
         self.create_timer(0.1, self.publish_state)
         self.create_timer(0.02, self.publish_telemetry)
 
@@ -85,6 +90,15 @@ class FakeBridge(Node):
             self.last_cmd_time = time.monotonic()
             self.collective = msg.collective_thrust if msg.armed else 0.0
             self.commands.append((time.monotonic(), msg.collective_thrust, bool(msg.armed)))
+
+    def on_cli(self, request, response):
+        response.ok = True
+        if request.cmd == CliCommand.Request.CMD_GET and request.args == 'motor_idle':
+            self.cli_gets.append(request.args)
+            response.status, response.text = 0, f'motor_idle = {FC_MOTOR_IDLE}'
+        else:
+            response.status, response.text = 1, 'NOT FOUND'
+        return response
 
     def on_arm(self, msg):
         with self.lock:
@@ -102,7 +116,7 @@ class FakeBridge(Node):
     def plant_state(self):
         with self.lock:
             armed, collective = self.armed, self.collective
-        duty = pm.collective_to_duty(collective, MOTOR_IDLE) if armed else 0.0
+        duty = pm.collective_to_duty(collective, U_IDLE) if armed else 0.0
         if self.airsim:
             return {'F': plant.AIRSIM_A1 * duty, 'V': 16.8, 'I': math.nan, 'rpm': math.nan}
         return plant.state(duty, plant.density_ratio(PRESSURE, TEMPERATURE))
@@ -139,11 +153,12 @@ def run_tool(airsim, out_dir, extra):
                               capture_output=True, text=True, timeout=120)
         with fake.lock:
             commands, arm_calls = list(fake.commands), list(fake.arm_calls)
+        cli_gets = list(fake.cli_gets)
     finally:
         executor.shutdown()
         rclpy.shutdown()
         spin.join(timeout=2.0)
-    return proc, commands, arm_calls
+    return proc, commands, arm_calls, cli_gets
 
 
 def read_outputs(out_dir):
@@ -164,11 +179,12 @@ def check(results, name, ok, detail=''):
 
 def hardware_mode(out_dir, results):
     print('== hardware mode (baro + sag + RPM + current) ==')
-    proc, commands, arm_calls = run_tool(False, out_dir, ['--lipo-cells', '6'])
+    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'])
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, 'hw_exit', proc.returncode == 0, f'rc={proc.returncode}')
     check(results, 'hw_arm_disarm', True in arm_calls and False in arm_calls)
+    check(results, 'hw_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
 
     # step order with an idle cooldown (collective 0) after each u >= 0.70 step
     sequence = []
@@ -178,13 +194,16 @@ def hardware_mode(out_dir, results):
             sequence.append(c)
     expected = []
     for u in [round(0.1 * i, 1) for i in range(1, 11)]:
-        expected.append(round(pm.duty_to_collective(u, MOTOR_IDLE), 6))
+        expected.append(round(pm.duty_to_collective(u, U_IDLE), 6))
         if u >= 0.7:
             expected.append(0.0)
     expected = [0.0] + expected
     check(results, 'hw_sop_sequence', sequence == expected, f'\n      got {sequence}\n      exp {expected}')
 
     rows, result = read_outputs(out_dir)
+    check(results, 'hw_u_idle_recorded', result['u_idle_fc_motor_idle'] == U_IDLE and
+          abs(float(rows[0]['u']) - (U_IDLE + (1 - U_IDLE) * float(rows[0]['collective']))) < 1e-6,
+          f"u_idle={result['u_idle_fc_motor_idle']}")
     check(results, 'hw_csv_points', len(rows) == 10 and
           {'u', 'V', 'I', 'rpm1', 'rpm4', 'rpm_rms', 'F_N', 'P_Pa', 't_C', 'F0_N', 'F_std_N'} <= set(rows[0]),
           f'{len(rows)} rows')
@@ -197,7 +216,8 @@ def hardware_mode(out_dir, results):
     coef_ok = all(abs(mp[k] - ideal[k]) <= 1e-3 * max(1.0, abs(ideal[k])) for k in ('a3', 'a2', 'a1'))
     check(results, 'hw_fit_matches_pipeline', coef_ok and result['monotonic'],
           f"a3..a1=({mp['a3']:.5g}, {mp['a2']:.5g}, {mp['a1']:.5g})")
-    model = pm.PropulsionModel.from_parameters(mp, 6)
+    check(results, 'hw_no_idle_parameter', set(mp) == {'a3', 'a2', 'a1', 'r_eq', 'k_i'}, f'{sorted(mp)}')
+    model = pm.PropulsionModel.from_parameters(mp, 6, U_IDLE)
     worst = 0.0
     for p, t, v_oc in ((101325.0, 0.0, 22.2), (PRESSURE, TEMPERATURE, 24.0), (95000.0, -10.0, 21.0)):
         for f_req in (10.0, 25.0, 45.0):
@@ -208,7 +228,7 @@ def hardware_mode(out_dir, results):
 
 def airsim_mode(out_dir, results):
     print('== AirSim mode (no baro, no sag, no RPM, no current) ==')
-    proc, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp', '--offboard'])
+    proc, _, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp', '--offboard'])
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, 'airsim_exit', proc.returncode == 0, f'rc={proc.returncode}')

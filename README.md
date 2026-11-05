@@ -608,8 +608,11 @@ are converted to throttle exactly as fpv_test.md §4 specifies, in
   `F_std(u) = a3·u³ + a2·u² + a1·u` (zero intercept), standard state
   `V_ref = lipo_cells·3.7 V` (6S: 22.20 V), `T0 = 273.15 K`, `P0 = 101325 Pa`.
   `u` is the DShot duty; Betaflight's collective `c` maps to it as
-  `u = motor_idle + (1 − motor_idle)·c` (`dshot_idle_value`, default 5.5 %),
-  so the bridge sends `c = (u − motor_idle)/(1 − motor_idle)`.
+  `u = u_idle + (1 − u_idle)·c`, where `u_idle` is the FC `motor_idle`
+  (default 550 = 5.5 %). `u_idle` is therefore not a parameter: on every link-up
+  (and after a `/fpv/cli` `SET motor_idle`) the bridge reads it with the CLI
+  `get motor_idle`, and it rejects force commands until it has it. The bridge
+  sends `c = (u − u_idle)/(1 − u_idle)`.
 - **Step 1** — `F_std_target = F_req·(P0/P)·(T/T0)` from the 0x11 baro
   (`baro_compensation`; factor 1 until the first sample).
 - **Step 2** — Newton-Raphson on `a3u³ + a2u² + a1u − F_std_target = 0`
@@ -622,26 +625,26 @@ are converted to throttle exactly as fpv_test.md §4 specifies, in
   at `lipo_cells·2.0 V` (6S: 12 V). With `r_eq` and `k_i` calibrated:
   `u_cmd = (u_std·V_ref + (I − I_std)·R_eq)/V`, `I_std = k_i·F_std_target`;
   otherwise `u_cmd = u_std·V_ref/V`.
-- **Step 4** — `u = clip(u_cmd, u_idle, 1.0)`; `F_req ≤ 0.001 N` → `u_idle`.
+- **Step 4** — `u = clip(u_cmd, u_idle, 1.0)`; `F_req ≤ 0.001 N` → `u_idle`
+  (= collective 0, the FC idle).
 
 ```yaml
 motor_parameters:      # paste the block produced by thrust_test_node
   a3: …                # N
   a2: …                # N
   a1: …                # N, must be > 0; dF/du > 0 on [0,1] is enforced
-  u_idle: 0.05         # §4 step 4 idle floor (duty)
-  motor_idle: 0.055    # FC dshot_idle_value / 10000
   r_eq: …              # Ω, identified on the bench (0 = first-order step 3)
   k_i: …               # A/N, I_std = k_i·F_std (0 = first-order step 3)
 voltage_lpf_hz: 3.0
 ```
 
 The node rejects an invalid calibrated model (non-finite, `a1 ≤ 0`,
-`dF/du ≤ 0` somewhere on [0, 1], out-of-range idle/`r_eq`/`k_i`) and any legacy
-`motor_parameters` key (`A..D`, `n`, `thrust_limit`, `spin_k`, `vbat_*`) at
-startup. With all-zero `a3..a1` (uncalibrated) it starts but drops force
-commands; `~/control_command_raw` still works, which is what the calibration
-tools use. Non-finite `collective_thrust` or body rates are dropped as well.
+`dF/du ≤ 0` somewhere on [0, 1], negative `r_eq`/`k_i`) and any other
+`motor_parameters` key (legacy `A..D`, `n`, `thrust_limit`, `spin_k`, `vbat_*`,
+or `u_idle`/`motor_idle`, which come from the FC) at startup. With all-zero
+`a3..a1` (uncalibrated) it starts but drops force commands;
+`~/control_command_raw` still works, which is what the calibration tools use.
+Non-finite `collective_thrust` or body rates are dropped as well.
 
 ## Bench thrust test (fpv_test.md §2–§3)
 
@@ -651,7 +654,9 @@ run this test before flying with force commands.**
 
 Inputs: `/current_weight` (`[weight_kg, stable_weight_kg]`, ≥ 10 Hz, e.g.
 `scale_reader_node` for a DT30X), `/mavros/battery` (V, I), `/fpv/motor_rpm`
-(bidirectional DShot), `/fpv/static_pressure`, `/fpv/temperature_baro`.
+(bidirectional DShot), `/fpv/static_pressure`, `/fpv/temperature_baro`, and the
+FC `motor_idle` via `/fpv/cli` (u_idle: duty of collective 0 and of the idle
+cooldown; recorded in the result, not written as a parameter).
 
 Procedure (§2.2, all adjustable): tare before arming, then duty steps
 `u = 0.05, 0.10 … 1.00` (20 steps); each step lasts 2.5 s — the first 0.5 s is
@@ -696,7 +701,9 @@ The shipped [sitl_parameters.yaml](parameters/sitl_parameters.yaml) model comes
 from 42 steady-state FC samples measured in the AirSim/UE simulation on
 2026-10-10 (seven collective levels 0.08–0.50, two repeats;
 [sitl_motor_calibration.csv](parameters/sitl_motor_calibration.csv)), fitted
-with the fpv_test.md model over the duty `u = 0.055 + 0.945·collective`:
+with the fpv_test.md model over the duty `u = 0.055 + 0.945·collective`
+(SITL `motor_idle` 550; new `--collect` runs read it via `/fpv/cli` and record it
+in the CSV `u_idle` column, which `--fit` uses):
 
 ```text
 F_std(u) = -1.39108 u^3 - 0.55109 u^2 + 89.8761 u   [N]

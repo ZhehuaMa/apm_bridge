@@ -101,15 +101,30 @@ def test_validation_and_low_pass():
 @pytest.mark.parametrize('voltage_comp', [False, True])
 @pytest.mark.parametrize('baro_comp', [False, True])
 def test_hardware_mirror_matches_node_branching(voltage_comp, baro_comp):
-    mp = dict(COEF, u_idle=0.05, motor_idle=0.055, r_eq=0.03, k_i=1.5)
+    mp = dict(COEF, r_eq=0.03, k_i=1.5)
     mirror = ThrustModel(mp, 6, voltage_comp, baro_comp)
-    m = pm.PropulsionModel.from_parameters(mp, 6)
+    mirror.model.set_u_idle(0.06)  # as read back from the FC motor_idle
+    m = pm.PropulsionModel.from_parameters(mp, 6, 0.06)
     env, vbat, amps = 1.1, 21.0, 40.0
     expected = m.collective(25.0, env if baro_comp else 1.0,
                             vbat if voltage_comp else math.nan, amps if voltage_comp else math.nan)
     assert mirror.force_to_throttle(25.0, env, vbat, amps) == pytest.approx(expected, abs=1e-12)
     force = mirror.force_for_throttle(expected, env, vbat, amps)
     assert force == pytest.approx(25.0, rel=1e-6)
+
+
+def test_u_idle_is_fc_motor_idle_and_collective_zero():
+    assert pm.idle_duty_from_cli('motor_idle = 550') == pytest.approx(0.055)
+    assert pm.idle_duty_from_cli('motor_idle = 0\n') == 0.0
+    for bad in ('motor_idle = 2001', 'motor_idle = 5.5', 'dshot_idle_value = 550', 'NOT FOUND', '', None):
+        assert math.isnan(pm.idle_duty_from_cli(bad))
+    m = model(u_idle=0.055)
+    assert m.collective(0.0) == 0.0 and m.collective(1e6) == 1.0
+    before = m.throttle(20.0)
+    m.set_u_idle(0.08)                     # FC motor_idle changed: floor and mapping follow
+    assert m.u_idle == 0.08 and m.inverse is not None
+    assert m.throttle(0.0) == 0.08 and m.collective(0.0) == 0.0
+    assert m.throttle(20.0) == pytest.approx(before, abs=1e-12)  # solved duty itself is idle-independent
 
 
 @pytest.mark.parametrize('env', [0, -1, math.inf, math.nan])

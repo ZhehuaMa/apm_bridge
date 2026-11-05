@@ -192,7 +192,8 @@ class FlightObserver(Node):
                              3 * math.atan2(math.sin(yaw_goal - yaw), math.cos(yaw_goal - yaw))], -.5, .5)
             rotor_hover = self.model.throttle(2.0 * 9.80665)  # hover DShot duty (fpv_test.md model)
             tilt = max(.7, math.cos(roll) * math.cos(pitch))
-            throttle = (rotor_hover / tilt - .055) / .945 + rotor_hover / .587 * (
+            idle = self.model.u_idle
+            throttle = (rotor_hover / tilt - idle) / (1 - idle) + rotor_hover / .587 * (
                 .05 * (self.height_goal - height) - .10 * velocity)
             message = ControlCommand(armed=True, control_mode=ControlCommand.BODY_RATES,
                                      collective_thrust=float(np.clip(throttle, 0, .5)))
@@ -562,7 +563,7 @@ def main():
         stack.callback(stop_process, bridge)
         sitl_params = yaml.safe_load((Path(__file__).resolve().parents[1] / "parameters/sitl_parameters.yaml")
                                      .read_text())["custom_link_bridge"]["ros__parameters"]
-        model = pm.PropulsionModel.from_parameters(sitl_params["motor_parameters"], 6)
+        model = pm.PropulsionModel.from_parameters(sitl_params["motor_parameters"], 6, pm.DEFAULT_U_IDLE)
         rclpy.init()
         node = FlightObserver(model, args.pitch_hold)
         executor = SingleThreadedExecutor()
@@ -570,6 +571,8 @@ def main():
         thread = threading.Thread(target=executor.spin, daemon=True)
         thread.start()
         try:
+            # u_idle = SITL firmware motor_idle (collective 0), read like the bridge does
+            model.set_u_idle(pm.fetch_u_idle(node, timeout=20.0))
             run_flight(client, node, args.output, args)
         finally:
             executor.shutdown()

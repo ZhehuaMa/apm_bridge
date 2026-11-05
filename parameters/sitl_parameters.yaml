@@ -29,13 +29,12 @@ custom_link_bridge:
     # cubic F_std(u) = a3*u^3 + a2*u^2 + a1*u over the DShot duty u = 0.055 + 0.945*collective
     # (sitl_motor_calibration --fit): R^2=0.99998, max throttle error 0.0016, hover collective 0.1732.
     # AirSim has no baro/voltage sag/RPM feedback: both compensations stay disabled, r_eq = k_i = 0.
+    # u_idle is read from the SITL firmware at link-up (CLI "get motor_idle", default 550 = 0.055).
     # Recalibrate after changing the vehicle, PWM endpoints or simulation environment.
     motor_parameters:
       a3: -1.3910762188770394
       a2: -0.5510910291316834
       a1: 89.87610919170108
-      u_idle: 0.05
-      motor_idle: 0.055
       r_eq: 0.0
       k_i: 0.0
 
