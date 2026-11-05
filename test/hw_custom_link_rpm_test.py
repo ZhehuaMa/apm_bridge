@@ -37,7 +37,7 @@ import serial
 SYNC1, SYNC2 = 0xEB, 0x90
 MSG_FAST, MSG_MED, MSG_SLOW, MSG_ESC = 0x10, 0x11, 0x12, 0x16
 MSG_HOST_CONTROL, MSG_FC_CLI, MSG_HOST_CLI = 0x20, 0x15, 0x24
-CMD_GET, CMD_SET = 0, 1
+CMD_GET, CMD_SET, CMD_SAVE = 0, 1, 4
 STATUS_OK = 0
 FLAG_MORE = 0x01
 
@@ -326,7 +326,7 @@ def main():
                 print("  dshot_bidir is OFF: set ON + save (FC will reboot)")
                 r, err = hw.cli(0x2F00, CMD_SET, "dshot_bidir = ON")
                 check("set_dshot_bidir", r and r[0] == STATUS_OK and not err, str(err))
-                r, err = hw.cli(0x2F01, CMD_SET, "save")   # 重启落盘
+                r, err = hw.cli(0x2F01, CMD_SAVE, "")   # 重启落盘（回 "saving..." 后 FC 重启）
                 print(f"    save: {r[1].decode(errors='replace') if r and not err else err}")
                 print("  waiting for FC reboot (telemetry resync)...")
                 time.sleep(4.0)
