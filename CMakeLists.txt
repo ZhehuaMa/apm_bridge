@@ -114,6 +114,16 @@ install(PROGRAMS scripts/bench_pid_tuner.py
   DESTINATION lib/${PROJECT_NAME} RENAME bench_pid_tuner)
 install(FILES scripts/bench_pid_core.py DESTINATION lib/${PROJECT_NAME})
 
+# 整机油门-拉力台架标定工具 (custom_link_bridge; AirSim/SITL 兼容, 见 fpv_test.md):
+# thrust_test_node 自动扫油门拟合 motor_parameters, scale_reader_node 读台秤,
+# motor_check_node 链路/电机冒烟。
+install(PROGRAMS scripts/thrust_test_node.py
+  DESTINATION lib/${PROJECT_NAME} RENAME thrust_test_node)
+install(PROGRAMS scripts/scale_reader_node.py
+  DESTINATION lib/${PROJECT_NAME} RENAME scale_reader_node)
+install(PROGRAMS scripts/motor_check_node.py
+  DESTINATION lib/${PROJECT_NAME} RENAME motor_check_node)
+
 if(BUILD_TESTING)
   add_executable(quadratic_thrust_model_test test/quadratic_thrust_model_test.cpp)
   add_test(NAME quadratic_thrust_model_test COMMAND quadratic_thrust_model_test)
@@ -122,6 +132,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(sitl_bridge_test test/sitl_bridge_test.py)
   ament_add_pytest_test(thrust_model_test test/thrust_model_test.py)
+  ament_add_pytest_test(thrust_test_fit_test test/thrust_test_fit_test.py TIMEOUT 60)
   ament_add_pytest_test(bench_pid_test test/bench_pid_test.py TIMEOUT 240)
   ament_add_pytest_test(bench_angle_link_test test/bench_angle_link_test.py TIMEOUT 30)
   ament_add_pytest_test(gimbal_node_test test/gimbal_node_test.py TIMEOUT 30)

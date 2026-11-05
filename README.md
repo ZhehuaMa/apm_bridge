@@ -726,9 +726,66 @@ The generated thrust limit never exceeds the highest sampled throttle. Before
 arming, the script verifies `airsim.enabled=true`, checks mass/gravity against
 the running node and rejects other control publishers.
 
+## Bench throttle-thrust calibration (physical test stand)
+
+`sitl_motor_calibration` fits the model by *flying* the simulator. For a real
+aircraft bolted to a load cell, `thrust_test_node` fits the same
+`motor_parameters` (the throttle↔force "conversion" of
+[`quadratic_thrust_model.h`](include/quadratic_thrust_model.h) and
+[fpv_test.md](../../../Documents/fpv_test.md)) from a bench sweep, driving the
+`custom_link_bridge` raw channel. Three tools:
+
+- `scale_reader_node` — reads a DT30X-style serial scale and publishes
+  `/current_weight` = `[weight_kg, stable_weight_kg(NaN=unsettled)]`. Any
+  publisher honouring that contract works (e.g. a SITL weight simulator).
+- `thrust_test_node` — arms via `/fpv/arm`, steps the throttle, averages the
+  steady weight at each step, and fits
+  `thrust = kp·((1-k)·thr + k·thr²)`, `thr = A·f³ + B·f² + C·f + D`,
+  `f = F_total/n`. Writes a CSV, a `*_result.yaml` with a ready-to-paste
+  `motor_parameters:` block, and a PNG.
+- `motor_check_node` — a props-off link/arm/throttle smoke test (no scale
+  needed).
+
+```bash
+# real stand, 6S quad, pilot holds the BOXOFFBOARD switch:
+ros2 run apm_bridge scale_reader_node --ros-args -p port:=/dev/ttyUSB0 &
+ros2 run apm_bridge thrust_test_node --lipo-cells 6 --num-motors 4 \
+  --min-thrust 5 --max-thrust 100 --step 5 --output-dir /tmp
+```
+
+Environment (`kp`), battery-sag (`vbat`/`volt_max`) and RPM-RMS compensation
+mirror fpv_test.md and the node's runtime inversion. The fitted coefficients are
+reported at the **standard reference state (P₀ = 101325 Pa, T₀ = 0 °C,
+V_ref = cells·3.7 V)**; the node de-normalizes them with live baro/voltage at
+run time. Each CSV row also records `current_A` and `rpm_rms` (RMS of the valid
+`/fpv/motor_rpm` entries) for offline advanced normalization; neither is
+required for the fit.
+
+**AirSim / SITL compatibility** — the simulator has no barometer, no battery
+sag and no bidirectional-DShot RPM, so the tool degrades automatically:
+
+- no `/fpv/static_pressure` (or `--kp 1.0`) ⇒ `kp = 1.0`, no density scaling;
+- `--no-voltage-comp` ⇒ no voltage normalization (AirSim pack voltage is flat);
+- missing/`NaN` `/fpv/motor_rpm` ⇒ `rpm_rms = NaN`, and the fit is a direct
+  (throttle, force) cubic — no RPM decoupling needed;
+- `--offboard` publishes `/fpv/offboard` so the host can take OFFBOARD without
+  a radio pilot.
+
+```bash
+# AirSim/SITL: launch the bridge, feed any /current_weight source, then:
+ros2 run apm_bridge thrust_test_node --offboard --no-voltage-comp \
+  --num-motors 4 --min-thrust 10 --max-thrust 40 --step 10 --yes --output-dir /tmp
+```
+
+The pure fit math is covered by `thrust_test_fit_test` (in `colcon test`).
+End-to-end coverage runs standalone against a sourced workspace:
+`python3 test/thrust_test_offline_test.py` (fake bridge, no hardware) and
+`python3 test/sitl_thrust_test.py --binary <betaflight>/obj/betaflight_SITL`
+(Betaflight SITL + synthetic scale).
+
 ## Current regression checks
 
-With `BUILD_TESTING=ON`, the default configuration registers eight test groups.
+With `BUILD_TESTING=ON`, the default configuration registers eleven test groups.
 Enabling both `APM_BRIDGE_AIRSIM` and `APM_BRIDGE_AIRSIM_LIVE_TEST` adds a live
 AirSim test. Run all registered groups for the selected configuration using
 the native build/test recipe in [build and test instructions](doc/build-and-test.md).
