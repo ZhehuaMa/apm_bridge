@@ -74,6 +74,9 @@ def test_duty_collective_mapping():
     for c in (0.0, 0.3, 1.0):
         assert pm.duty_to_collective(pm.collective_to_duty(c, 0.055), 0.055) == pytest.approx(c)
     assert pm.duty_to_collective(0.05, 0.055) == 0.0  # below FC idle -> collective 0
+    for removed in ('--u-idle', '--motor-idle'):
+        with pytest.raises(SystemExit):
+            tool.parse_args([removed, '0.05'])
 
 
 # ---------------------------------------------------------------- §3.1 normalization
@@ -173,7 +176,7 @@ def test_render_param_yaml_is_pasteable():
     args = tool.parse_args(['--yes', '--no-env-comp'])
     text = tool.render_param_yaml({'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5}, args)
     p = yaml.safe_load(text)['custom_link_bridge']['ros__parameters']
-    assert p['motor_parameters'] == {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'u_idle': 0.05,
-                                     'motor_idle': 0.055, 'r_eq': 0.03, 'k_i': 1.5}
+    # u_idle is not a parameter: the node reads the FC motor_idle at link-up
+    assert p['motor_parameters'] == {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5}
     assert p['baro_compensation'] is False and p['voltage_compensation'] is True
     assert len(args.levels) == 20

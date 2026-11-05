@@ -72,7 +72,8 @@ class ThrustModel:
     与节点 YAML 一致 (load_model_params 读出; 电机阶段前 fail-fast 校验)。"""
 
     def __init__(self, mp, lipo_cells, voltage_comp=False, baro_comp=True):
-        self.model = pm.PropulsionModel.from_parameters(mp, lipo_cells)
+        # u_idle = 飞控 motor_idle, 链路建立后经 /fpv/cli 读回 (set_u_idle); 之前用 Betaflight 默认值
+        self.model = pm.PropulsionModel.from_parameters(mp, lipo_cells, pm.DEFAULT_U_IDLE)
         self.voltage_comp = voltage_comp
         self.baro_comp = baro_comp
 
@@ -332,8 +333,8 @@ def main():
     if m.validate():
         print(f"RESULT: FAIL (motor_parameters 未标定/非法: {m.validate()}; 先按 fpv_test.md 跑 thrust_test_node)")
         return 1
-    print(f"  model: F_std(u)={m.a3:.4g}u^3+{m.a2:.4g}u^2+{m.a1:.4g}u, u_idle={m.u_idle} "
-          f"motor_idle={m.motor_idle} mass={mass} kg")
+    print(f"  model: F_std(u)={m.a3:.4g}u^3+{m.a2:.4g}u^2+{m.a1:.4g}u, mass={mass} kg "
+          f"(u_idle read from FC motor_idle after link up)")
 
     # ---- 启动节点（custom_link.launch.py，bind_rx:=false 防 RX 配对锁死）----
     launch_cmd = ["ros2", "launch", "apm_bridge", "custom_link.launch.py",
@@ -442,6 +443,12 @@ def main():
             print(f"RESULT: FAIL (voltage_compensation={model.voltage_comp}, "
                   f"baro_compensation={model.baro_comp} — --thrust-max 硬上限依赖补偿模型)")
             return 1
+        try:
+            model.model.set_u_idle(pm.fetch_u_idle(monitor, timeout=5.0))
+        except RuntimeError as e:
+            print(f"RESULT: FAIL (读取飞控 motor_idle 失败: {e})")
+            return 1
+        check("fc_motor_idle", True, f"u_idle={model.model.u_idle:.4f}")
         env, vbat, amps = monitor.env_factor(), monitor.voltage(), monitor.current_a()
         collective = {}
         for name, throttle in (("low", args.thrust_low), ("high", args.thrust_high)):

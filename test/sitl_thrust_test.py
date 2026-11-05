@@ -101,7 +101,9 @@ class WeightSim:
 
 def provision_and_start_sitl(binary, workdir):
     # Never kill other users' processes on a shared host: refuse to run instead.
-    for pattern in (f"^{binary}", "custom_link_bridge_node"):
+    # Patterns are anchored to the executable at the start of the command line so
+    # shells/editors that merely mention the name do not match.
+    for pattern in (f"^{binary}", r"^[^ ]*custom_link_bridge_node( |$)"):
         running = subprocess.run(["pgrep", "-af", pattern], capture_output=True, text=True)
         if running.returncode == 0:
             print(f"refusing to start: '{pattern}' already running:\n{running.stdout.strip()}")

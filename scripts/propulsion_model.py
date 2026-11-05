@@ -4,9 +4,10 @@
 (thrust_test_node)、SITL 标定、硬件测试镜像与单元测试共用。
 
 油门域: 文档的 u 是整机归一化油门开度 (PWM/DShot 占空比), F(0)=0。Betaflight 的
-集体油门 c (custom link 0x20) 先映射到 DShot 输出 u = motor_idle + (1-motor_idle)·c
-(dshot.c outputLow, 默认 dshot_idle_value=550 -> 5.5%), 因此模型全部在占空比 u 上
-建立, 下发前再换算回 c。
+集体油门 c (custom link 0x20) 映射到 DShot 输出 u = u_idle + (1-u_idle)·c
+(dshot.c outputLow), 其中 u_idle 就是飞控 motor_idle (默认 550 -> 5.5%), 也即 §4
+步骤 4 的怠速下限 (对应 c = 0)。u_idle 不作参数配置, 运行时经 /fpv/cli
+"get motor_idle" 从飞控读取 (fetch_u_idle)。模型全部在占空比 u 上建立。
 
 基准状态 (§1.1): V_ref = cells·3.7 V (6S = 22.20 V), T0 = 273.15 K, P0 = 101325 Pa。
 """
@@ -20,8 +21,8 @@ P0 = 101325.0                 # Pa
 T0 = 273.15                   # K
 V_REF_PER_CELL = 3.7          # 22.20 V for 6S
 V_MIN_PER_CELL = 2.0          # 12.0 V for 6S: §5 硬件欠压保护下限
-DEFAULT_U_IDLE = 0.05         # §5 怠速死区下限
-DEFAULT_MOTOR_IDLE = 0.055    # Betaflight dshot_idle_value 550
+DEFAULT_U_IDLE = 0.055        # Betaflight motor_idle 默认 550; 仅用于无法询问飞控的离线场景
+MOTOR_IDLE_SETTING = 'motor_idle'  # Betaflight CLI 设置名 (0.01 % 单位, 0..2000)
 F_REQ_EPS = 0.001             # §5 零推力保护阈值 (N)
 NEWTON_MAX_ITER = 4           # §4 步骤 2: 3~4 次
 NEWTON_TOL = 1e-5             # §4 步骤 2: 1e-5 精度
@@ -37,12 +38,58 @@ def _clamp(x, lo, hi):
 # 油门域换算 (Betaflight DShot 输出映射)
 # ======================================================================
 
-def collective_to_duty(collective, motor_idle=DEFAULT_MOTOR_IDLE):
-    return motor_idle + (1.0 - motor_idle) * _clamp(collective, 0.0, 1.0)
+def collective_to_duty(collective, u_idle):
+    return u_idle + (1.0 - u_idle) * _clamp(collective, 0.0, 1.0)
 
 
-def duty_to_collective(duty, motor_idle=DEFAULT_MOTOR_IDLE):
-    return _clamp((duty - motor_idle) / (1.0 - motor_idle), 0.0, 1.0)
+def duty_to_collective(duty, u_idle):
+    return _clamp((duty - u_idle) / (1.0 - u_idle), 0.0, 1.0)
+
+
+def idle_duty_from_cli(text):
+    """'motor_idle = 550' (CLI GET 回读, 0.01 % 单位) -> 0.055; 不合法返回 NaN。"""
+    name, sep, value = (text or '').partition('=')
+    value = value.strip()
+    if not sep or name.strip() != MOTOR_IDLE_SETTING or not value.isdigit() or len(value) > 5:
+        return float('nan')
+    raw = int(value)
+    return raw / 10000.0 if raw <= 2000 else float('nan')
+
+
+def fetch_u_idle(node, timeout=5.0, spin=False):
+    """经 custom_link_bridge 的 /fpv/cli 读取飞控 motor_idle, 返回 u_idle 占空比。
+
+    spin=True: 调用方未在后台 spin 该节点 (rclpy.spin_once 驱动); 否则仅等待 future。
+    失败抛 RuntimeError。
+    """
+    import time
+    import rclpy
+    from quadrotor_msgs.srv import CliCommand
+
+    client = node.create_client(CliCommand, '/fpv/cli')
+    try:
+        if not client.wait_for_service(timeout_sec=timeout):
+            raise RuntimeError('/fpv/cli service unavailable (is custom_link_bridge_node running?)')
+        request = CliCommand.Request(cmd=CliCommand.Request.CMD_GET, args=MOTOR_IDLE_SETTING)
+        future = client.call_async(request)
+        deadline = time.monotonic() + timeout
+        while not future.done() and time.monotonic() < deadline:
+            if spin:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            else:
+                time.sleep(0.02)
+        if not future.done():
+            future.cancel()
+            raise RuntimeError('/fpv/cli get motor_idle timed out')
+        response = future.result()
+        if not response.ok or response.status != 0:
+            raise RuntimeError(f'FC rejected get motor_idle: {response.error or response.text}')
+        u_idle = idle_duty_from_cli(response.text)
+        if not math.isfinite(u_idle):
+            raise RuntimeError(f'unexpected motor_idle reply: {response.text!r}')
+        return u_idle
+    finally:
+        node.destroy_client(client)
 
 
 # ======================================================================
@@ -252,21 +299,26 @@ class PropulsionModel:
     r_eq: float = 0.0
     k_i: float = 0.0
     v_min: float = 6 * V_MIN_PER_CELL
-    motor_idle: float = DEFAULT_MOTOR_IDLE
     inverse: tuple = field(default=None, init=False, repr=False)
     inverse_max_error: float = field(default=float('nan'), init=False, repr=False)
 
     @classmethod
-    def from_parameters(cls, motor_parameters, lipo_cells):
+    def from_parameters(cls, motor_parameters, lipo_cells, u_idle):
+        """motor_parameters (YAML) + 飞控读回的 u_idle (fetch_u_idle) -> 模型。"""
         mp = motor_parameters
         return cls(a3=float(mp.get('a3', 0.0)), a2=float(mp.get('a2', 0.0)), a1=float(mp.get('a1', 0.0)),
-                   v_ref=lipo_cells * V_REF_PER_CELL,
-                   u_idle=float(mp.get('u_idle', DEFAULT_U_IDLE)),
+                   v_ref=lipo_cells * V_REF_PER_CELL, u_idle=float(u_idle),
                    r_eq=float(mp.get('r_eq', 0.0)), k_i=float(mp.get('k_i', 0.0)),
-                   v_min=lipo_cells * V_MIN_PER_CELL,
-                   motor_idle=float(mp.get('motor_idle', DEFAULT_MOTOR_IDLE)))
+                   v_min=lipo_cells * V_MIN_PER_CELL)
 
     def __post_init__(self):
+        if not self.validate():
+            self._init_inverse()
+
+    def set_u_idle(self, u_idle):
+        """飞控 motor_idle 变化后更新 u_idle 并重拟合反函数初值 (同节点 queryMotorIdle)。"""
+        self.u_idle = float(u_idle)
+        self.inverse = None
         if not self.validate():
             self._init_inverse()
 
@@ -284,13 +336,13 @@ class PropulsionModel:
     def validate(self):
         """空串 = 合法; 否则为原因 (同 C++ validateModel)。"""
         if not all(math.isfinite(v) for v in (self.a3, self.a2, self.a1, self.v_ref, self.u_idle,
-                                               self.r_eq, self.k_i, self.v_min, self.motor_idle)):
+                                               self.r_eq, self.k_i, self.v_min)):
             return 'parameters must be finite'
         ok, slope = monotonic_check(self.a3, self.a2, self.a1)
         if not ok:
             return f'thrust curve must satisfy a1 > 0 and dF/du > 0 on [0,1] (min slope {slope:.4g})'
-        if not 0.0 <= self.u_idle < 1.0 or not 0.0 <= self.motor_idle < 1.0:
-            return 'u_idle and motor_idle must be in [0, 1)'
+        if not 0.0 <= self.u_idle < 1.0:
+            return 'u_idle must be in [0, 1)'
         if self.v_ref <= 0.0 or not 0.0 <= self.v_min < self.v_ref:
             return 'require v_ref > 0 and 0 <= v_min < v_ref'
         if self.r_eq < 0.0 or self.k_i < 0.0:
@@ -353,5 +405,5 @@ class PropulsionModel:
         return _clamp(u_cmd, self.u_idle, 1.0)
 
     def collective(self, f_req, env_factor=1.0, voltage=float('nan'), current=float('nan')):
-        """throttle() 换算到 Betaflight 集体油门 (custom link 0x20)。"""
-        return duty_to_collective(self.throttle(f_req, env_factor, voltage, current), self.motor_idle)
+        """throttle() 换算到 Betaflight 集体油门 (custom link 0x20); u_idle 对应 c = 0。"""
+        return duty_to_collective(self.throttle(f_req, env_factor, voltage, current), self.u_idle)

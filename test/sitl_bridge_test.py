@@ -139,8 +139,8 @@ def test_default_parameters_and_model():
     assert not params["voltage_compensation"] and not params["baro_compensation"]
     assert params["gimbal_port"] == "" and params["airsim"]["enabled"]
     motor = params["motor_parameters"]
-    assert set(motor) == {"a3", "a2", "a1", "u_idle", "motor_idle", "r_eq", "k_i"}
-    model = pm.PropulsionModel.from_parameters(motor, 6)
+    assert set(motor) == {"a3", "a2", "a1", "r_eq", "k_i"}  # u_idle comes from the FC motor_idle
+    model = pm.PropulsionModel.from_parameters(motor, 6, pm.DEFAULT_U_IDLE)
     assert model.validate() == ""
     assert model.collective(2 * 9.80665) == pytest.approx(0.1732, abs=.002)
     assert model.throttle(0) == model.u_idle and model.collective(0) == 0
@@ -148,41 +148,52 @@ def test_default_parameters_and_model():
     assert model.throttle(float("nan")) == model.u_idle
 
 
-def duty_samples(force_of_duty, collective):
-    return [(force_of_duty(pm.collective_to_duty(c)), c) for c in collective]
+def duty_samples(force_of_duty, collective, u_idle=pm.DEFAULT_U_IDLE):
+    return [(force_of_duty(pm.collective_to_duty(c, u_idle)), c) for c in collective]
 
 
 def test_fit_and_output_shape(tmp_path):
     collective = np.linspace(.08, .5, 30)
     samples = duty_samples(lambda u: 90.0 * u, collective)
-    model, report = fit_samples(samples, 2.0, 9.80665, .01)
+    model, report = fit_samples(samples, 2.0, 9.80665, .01, pm.DEFAULT_U_IDLE)
     assert (model.a3, model.a2, model.a1) == pytest.approx((0, 0, 90.0), abs=1e-6)
     assert report["throttle_max_error"] < 1e-9
     output = tmp_path / "fitted.yaml"
     write_parameters(ROOT / "parameters/sitl_parameters.yaml", output, model, 2.0, 9.80665)
     p = yaml.safe_load(output.read_text())["custom_link_bridge"]["ros__parameters"]
-    assert p["motor_parameters"] == {"a3": model.a3, "a2": model.a2, "a1": model.a1, "u_idle": .05,
-                                     "motor_idle": .055, "r_eq": 0.0, "k_i": 0.0}
+    assert p["motor_parameters"] == {"a3": model.a3, "a2": model.a2, "a1": model.a1, "r_eq": 0.0, "k_i": 0.0}
     assert p["airsim"]["enabled"] and p["mass"] == 2.0
     assert not p["voltage_compensation"] and not p["baro_compensation"]
     for bad in ([(float("nan"), .1)] * 5, [(20, .1)] * 5, [(20, -.1)] * 5):
         with pytest.raises(ValueError):
-            fit_samples(bad, 2.0, 9.80665, .01)
+            fit_samples(bad, 2.0, 9.80665, .01, pm.DEFAULT_U_IDLE)
 
 
 def test_cubic_fit_and_residual_rejection():
     collective = np.linspace(.08, .5, 40)
     truth = (-15.0, 70.0, 30.0)
     samples = duty_samples(lambda u: (truth[0] * u + truth[1]) * u * u + truth[2] * u, collective)
-    model, report = fit_samples(samples, 2, 9.80665, .01)
+    model, report = fit_samples(samples, 2, 9.80665, .01, pm.DEFAULT_U_IDLE)
     assert (model.a3, model.a2, model.a1) == pytest.approx(truth, rel=1e-9)
     assert report["throttle_max_error"] < 1e-9
     samples[10] = (samples[10][0] * 1.4, samples[10][1])
     with pytest.raises(ValueError, match="residual"):
-        fit_samples(samples, 2, 9.80665, .01)
+        fit_samples(samples, 2, 9.80665, .01, pm.DEFAULT_U_IDLE)
     falling = duty_samples(lambda u: 60 * u - 40 * u * u * u, np.linspace(.08, 1.0, 30))
     with pytest.raises(ValueError, match="dF/du"):
-        fit_samples(falling, 2, 9.80665, .01)
+        fit_samples(falling, 2, 9.80665, .01, pm.DEFAULT_U_IDLE)
+
+
+def test_read_samples_uses_recorded_u_idle(tmp_path):
+    header = "time_s,throttle,force_N,height_m,ax_flu,ay_flu,az_flu,qx,qy,qz,qw,fc_stamp_s,u_idle\n"
+    path = tmp_path / "pulses.csv"
+    path.write_text(header + "".join(f"0,{c},{80 * pm.collective_to_duty(c, .07)},4,0,0,0,0,0,0,1,0,.07\n"
+                                     for c in (.1, .2, .3, .4)))
+    samples, u_idle = read_samples(path)
+    assert u_idle == pytest.approx(.07) and len(samples) == 4
+    path.write_text(header + "0,.1,10,4,0,0,0,0,0,0,1,0,.07\n0,.2,20,4,0,0,0,0,0,0,1,0,.06\n")
+    with pytest.raises(ValueError, match="inconsistent"):
+        read_samples(path)
 
 
 def test_vertical_estimator_filters_stationary_baro_noise():
@@ -215,8 +226,9 @@ def test_vertical_estimator_tracks_accelerating_flight():
 
 
 def test_measured_motor_calibration_matches_parameters():
-    samples = read_samples(ROOT / "parameters/sitl_motor_calibration.csv")
-    model, report = fit_samples(samples, 2.0, 9.80665, .01)
+    samples, u_idle = read_samples(ROOT / "parameters/sitl_motor_calibration.csv")
+    assert u_idle == pm.DEFAULT_U_IDLE  # measured before u_idle was recorded: BF default 550
+    model, report = fit_samples(samples, 2.0, 9.80665, .01, u_idle)
     params = yaml.safe_load((ROOT / "parameters/sitl_parameters.yaml").read_text())
     configured = params["custom_link_bridge"]["ros__parameters"]["motor_parameters"]
     assert len(samples) == 42
