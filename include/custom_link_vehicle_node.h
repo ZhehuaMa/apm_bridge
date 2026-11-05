@@ -66,6 +66,7 @@ namespace custom_link_bridge
         static constexpr double kBatteryLowVoltagePerCell = 3.6;
         static constexpr double kBatteryCriticalVoltagePerCell = 3.3;
         static constexpr double kBatteryInvalidVoltagePerCell = 3.0;
+        static constexpr double kBatteryUndervoltagePerCell = 2.0; // fpv_test.md §5: 6S 12.0 V 欠压保护下限
 
         std::vector<std::string> mode_strings = {
             "ANGLE",
@@ -171,7 +172,9 @@ namespace custom_link_bridge
         void publishState(uint32_t mode_flags, bool armed);
 
         // ---- 参数 ----
-        quadratic_thrust_model::MotorParams motor_params;
+        quadratic_thrust_model::PropulsionModel propulsion; // fpv_test.md §4 在线反解模型
+        double motor_idle = 0.055;  // FC dshot_idle_value/10000: 集体油门 0 对应的占空比
+        double voltage_lpf_hz = 3.0; // §4 母线电压低通截止频率 (2~5 Hz)
         double gravity = 9.80665;
         double mass = 2.0;
         int n_lipo_cells = 6;
@@ -195,16 +198,20 @@ namespace custom_link_bridge
         bool mission_gimbal_on_ground = false;
 
         // ---- 共享状态 ----
+        // §4 在线反解输入: 环境折算系数 (P0/P)·(T/T0)、低通后的母线电压与总电流
         std::mutex mtx_kp;
-        double kp = 1.0;
-        double baro_temperature_c = 20.0;
-        double battery_voltage = 0.0;
+        double env_factor = 1.0;
+        double baro_temperature_c = 0.0;
+        quadratic_thrust_model::LowPassFilter voltage_lpf;
+        quadratic_thrust_model::LowPassFilter current_lpf;
+        int64_t last_battery_us = 0;
 
         std::mutex mtx_cmd;
         // 控制设定点（FLU 系）：角速度模式 = 三轴 rad/s；角度模式 = roll/pitch rad + yaw rad/s
         std::array<double, 3> cmd_setpoints{{0.0, 0.0, 0.0}};
-        double cmd_thrust = 0.0; // 0..1.0 
-        double cmd_force = 0.0;  // Force (N)
+        double cmd_thrust = 0.0; // raw 通道: Betaflight 集体油门 0..1.0
+        double cmd_force = 0.0;  // 力通道: 期望总推力 F_req (N)
+        bool cmd_force_mode = false; // true: 每个控制周期按 §4 由 cmd_force 反解油门
         rclcpp::Time cmd_stamp{0, 0, RCL_ROS_TIME};
         bool cmd_valid = false;
         bool cmd_angle = false;

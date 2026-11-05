@@ -109,14 +109,14 @@ install(DIRECTORY
 
 install(PROGRAMS scripts/sitl_motor_calibration.py
   DESTINATION lib/${PROJECT_NAME} RENAME sitl_motor_calibration)
-install(FILES scripts/sitl_support.py DESTINATION lib/${PROJECT_NAME})
+install(FILES scripts/sitl_support.py scripts/propulsion_model.py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/bench_pid_tuner.py
   DESTINATION lib/${PROJECT_NAME} RENAME bench_pid_tuner)
 install(FILES scripts/bench_pid_core.py DESTINATION lib/${PROJECT_NAME})
 
-# 整机油门-拉力台架标定工具 (custom_link_bridge; AirSim/SITL 兼容, 见 fpv_test.md):
-# thrust_test_node 自动扫油门拟合 motor_parameters, scale_reader_node 读台秤,
-# motor_check_node 链路/电机冒烟。
+# fpv_test.md 整机拉力测试 (§2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge; AirSim/SITL 兼容):
+# thrust_test_node 按 SOP 采集并拟合 motor_parameters (依赖 propulsion_model.py),
+# scale_reader_node 读台秤, motor_check_node 链路/电机冒烟。
 install(PROGRAMS scripts/thrust_test_node.py
   DESTINATION lib/${PROJECT_NAME} RENAME thrust_test_node)
 install(PROGRAMS scripts/scale_reader_node.py

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <tf2/LinearMath/Matrix3x3.hpp>
 #include "custom_link/sitl_transport.h"
@@ -15,8 +16,6 @@ namespace
 {
     constexpr double kDegToRad = M_PI / 180.0;
     constexpr double kRadToDeg = 180.0 / M_PI;
-    constexpr double kSeaLevelPressurePa = 101325.0;
-    constexpr double kReferenceTemperatureKelvin = 273.15;
     constexpr int kAbsoluteZeroCdeg = -27315;
 
     static double normalizeAngle(double a)
@@ -57,15 +56,15 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<int>("channel_trigger", 6);
     this->declare_parameter<bool>("voltage_compensation", false);
     this->declare_parameter<bool>("baro_compensation", true);
-    this->declare_parameter<double>("motor_parameters.A", 0.0);
-    this->declare_parameter<double>("motor_parameters.B", 0.0);
-    this->declare_parameter<double>("motor_parameters.C", 0.0);
-    this->declare_parameter<double>("motor_parameters.D", 0.0);
-    this->declare_parameter<int>("motor_parameters.n", 1);
-    this->declare_parameter<double>("motor_parameters.thrust_limit", 1.0);
-    this->declare_parameter<double>("motor_parameters.spin_k", 0.0);
-    this->declare_parameter<double>("motor_parameters.vbat_a", 0.0);
-    this->declare_parameter<double>("motor_parameters.vbat_b", 1.0);
+    // fpv_test.md 模型 F_std(u) = a3·u³ + a2·u² + a1·u (u = DShot 占空比), thrust_test_node 标定
+    this->declare_parameter<double>("motor_parameters.a3", 0.0);
+    this->declare_parameter<double>("motor_parameters.a2", 0.0);
+    this->declare_parameter<double>("motor_parameters.a1", 0.0);
+    this->declare_parameter<double>("motor_parameters.u_idle", 0.05);
+    this->declare_parameter<double>("motor_parameters.motor_idle", 0.055);
+    this->declare_parameter<double>("motor_parameters.r_eq", 0.0);
+    this->declare_parameter<double>("motor_parameters.k_i", 0.0);
+    this->declare_parameter<double>("voltage_lpf_hz", 3.0);
     airsim_enabled = this->declare_parameter<bool>("airsim.enabled", false);
 
     this->declare_parameter<std::string>("link.transport", "serial"); // serial | tcp
@@ -102,21 +101,34 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("cli.timeout_s", cli_timeout);
     this->get_parameter("cli.timeout_s", cli_timeout);
     this->get_parameter("cli.bind_rx_on_connect", cli_bind_rx_on_connect);
-    if (baro_compensation)
-        kp = kReferenceTemperatureKelvin / (kReferenceTemperatureKelvin + baro_temperature_c);
-    this->get_parameter("motor_parameters.A", motor_params.A);
-    this->get_parameter("motor_parameters.B", motor_params.B);
-    this->get_parameter("motor_parameters.C", motor_params.C);
-    this->get_parameter("motor_parameters.D", motor_params.D);
-    this->get_parameter("motor_parameters.n", motor_params.n_motors);
-    this->get_parameter("motor_parameters.thrust_limit", motor_params.thrust_limit);
-    this->get_parameter("motor_parameters.spin_k", motor_params.spin_k);
-    this->get_parameter("motor_parameters.vbat_a", motor_params.vbat_a);
-    this->get_parameter("motor_parameters.vbat_b", motor_params.vbat_b);
-    motor_params.volt_max = n_lipo_cells * kBatteryFullVoltagePerCell;
-    motor_params.volt_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;
-    // 欠压钳位 (fpv_test.md §4): 低于"无效"阈值的电压读数不再继续放大油门
-    motor_params.volt_min = n_lipo_cells * kBatteryInvalidVoltagePerCell;
+
+    // 旧版 A..D/spin_k/vbat 模型已按 fpv_test.md 重建, 键名不兼容: 显式拒绝, 避免
+    // 旧参数文件被静默忽略后以未标定模型运行。
+    static const std::set<std::string> kModelKeys{
+        "motor_parameters.a3", "motor_parameters.a2", "motor_parameters.a1", "motor_parameters.u_idle",
+        "motor_parameters.motor_idle", "motor_parameters.r_eq", "motor_parameters.k_i"};
+    for (const auto &[name, value] : this->get_node_parameters_interface()->get_parameter_overrides())
+    {
+        (void)value;
+        if (name.rfind("motor_parameters.", 0) == 0 && !kModelKeys.count(name))
+            throw std::invalid_argument("Unsupported parameter '" + name +
+                                        "': motor_parameters now follow fpv_test.md (a3, a2, a1, u_idle, "
+                                        "motor_idle, r_eq, k_i); recalibrate with thrust_test_node");
+    }
+    this->get_parameter("motor_parameters.a3", propulsion.a3);
+    this->get_parameter("motor_parameters.a2", propulsion.a2);
+    this->get_parameter("motor_parameters.a1", propulsion.a1);
+    this->get_parameter("motor_parameters.u_idle", propulsion.u_idle);
+    this->get_parameter("motor_parameters.motor_idle", motor_idle);
+    this->get_parameter("motor_parameters.r_eq", propulsion.r_eq);
+    this->get_parameter("motor_parameters.k_i", propulsion.k_i);
+    this->get_parameter("voltage_lpf_hz", voltage_lpf_hz);
+    propulsion.v_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;     // 6S: 22.20 V
+    propulsion.v_min = n_lipo_cells * kBatteryUndervoltagePerCell;       // 6S: 12.0 V
+    // §5: 滤波器初值取基准电压; 电流在首个遥测样本处初始化
+    voltage_lpf.cutoff_hz = voltage_lpf_hz;
+    voltage_lpf.value = propulsion.v_ref;
+    current_lpf.cutoff_hz = voltage_lpf_hz;
 
     double ori_stddev = 0.0, gyro_stddev = 0.0, acc_stddev = 0.0;
     this->get_parameter("imu.orientation_stddev", ori_stddev);
@@ -140,42 +152,33 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
         throw std::invalid_argument("AirSim SITL requires voltage_compensation=false and baro_compensation=false");
     if (airsim_enabled &&
         (!std::isfinite(mass) || mass <= 0 || !std::isfinite(gravity) || gravity <= 0 ||
-         !std::isfinite(control_timeout) || control_timeout <= 0 || motor_params.n_motors <= 0 ||
-         !std::isfinite(motor_params.thrust_limit) || motor_params.thrust_limit <= 0 ||
-         motor_params.thrust_limit > 1 ||
-         !std::isfinite(motor_params.A) || !std::isfinite(motor_params.B) ||
-         !std::isfinite(motor_params.C) || !std::isfinite(motor_params.D)))
-        throw std::invalid_argument("Invalid SITL mass, gravity, timeout or motor model");
-    // 全零 A..D = 未标定 (仅 raw 油门通道可用, 测试/台架工具常用); 已标定模型须通过
-    // 单调性/合法性校验, 否则拒绝启动, 不以错误曲线飞行。
-    if (motor_params.A != 0.0 || motor_params.B != 0.0 || motor_params.C != 0.0 || motor_params.D != 0.0)
+         !std::isfinite(control_timeout) || control_timeout <= 0))
+        throw std::invalid_argument("Invalid SITL mass, gravity or timeout");
+    if (!std::isfinite(motor_idle) || motor_idle < 0.0 || motor_idle >= 1.0)
+        throw std::invalid_argument("motor_parameters.motor_idle must be in [0, 1)");
+    if (!std::isfinite(voltage_lpf_hz) || voltage_lpf_hz < 2.0 || voltage_lpf_hz > 5.0)
+        throw std::invalid_argument("voltage_lpf_hz must be within 2..5 Hz (fpv_test.md section 4)");
+    // a3..a1 全零 = 未标定: 只允许 raw 油门通道 (台架标定工具即走 raw); 已标定模型须通过
+    // §3.2 单调性/合法性校验, 否则拒绝启动。
+    if (quadratic_thrust_model::configured(propulsion))
     {
-        const std::string model_error =
-            quadratic_thrust_model::validateMotorParams(motor_params, voltage_compensation);
+        const std::string model_error = quadratic_thrust_model::validateModel(propulsion);
         if (!model_error.empty())
             throw std::invalid_argument("Invalid motor_parameters: " + model_error);
+        const double inverse_error = quadratic_thrust_model::initInverse(propulsion);
+        RCLCPP_INFO(this->get_logger(),
+                    "Propulsion model: F_std(u) = %.6g u^3 + %.6g u^2 + %.6g u N (F(1)=%.3f N), "
+                    "V_ref=%.2f V, u_idle=%.3f, motor_idle=%.3f, R_eq=%.4g ohm, k_i=%.4g A/N, "
+                    "V_min=%.1f V, LPF %.1f Hz; inverse-cubic initial guess max error %.2e",
+                    propulsion.a3, propulsion.a2, propulsion.a1,
+                    quadratic_thrust_model::standardThrust(propulsion, 1.0), propulsion.v_ref,
+                    propulsion.u_idle, motor_idle, propulsion.r_eq, propulsion.k_i, propulsion.v_min,
+                    voltage_lpf_hz, inverse_error);
     }
     else
         RCLCPP_WARN(this->get_logger(),
-                    "motor_parameters A..D are all zero: collective force commands map to zero throttle "
-                    "(only ~/control_command_raw is usable until the model is calibrated)");
-
-    RCLCPP_INFO(this->get_logger(),
-                "Motor parameters: A=%.6f, B=%.6f, C=%.6f, D=%.6f, n=%d, voltage_max=%.6f, spin_k=%.6f, vbat_a=%.6f, vbat_b=%.6f, volt_ref=%.6f, volt_min=%.3f, x_peak=%.4g",
-                motor_params.A, motor_params.B, motor_params.C, motor_params.D,
-                motor_params.n_motors, motor_params.volt_max, motor_params.spin_k,
-                motor_params.vbat_a, motor_params.vbat_b, motor_params.volt_ref,
-                motor_params.volt_min, motor_params.x_peak);
-
-    // 反演曲线预拟合: thrustToForce 运行时以多项式求值替代牛顿迭代
-    const double fit_residual = quadratic_thrust_model::initInverseFit(motor_params);
-    if (fit_residual >= 0.0)
-        RCLCPP_INFO(this->get_logger(),
-                    "Thrust inverse fit: domain=[0, %.3f], %d cubic segments, max residual %.6f N (per-call Newton -> segment polyval)",
-                    motor_params.inv_t_max, motor_params.inv_segments, fit_residual);
-    else
-        RCLCPP_WARN(this->get_logger(),
-                    "Thrust inverse fit failed (degenerate samples?), thrustToForce falls back to Newton iteration");
+                    "motor_parameters a3..a1 are all zero (uncalibrated): ~/control_command force commands are "
+                    "rejected; only ~/control_command_raw works until thrust_test_node calibration");
 
     // ---------------- ROS 接口 ----------------
     imu_pub = this->create_publisher<sensor_msgs::msg::Imu>(
@@ -187,7 +190,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     state_pub = this->create_publisher<mavros_msgs::msg::State>("/mavros/state", 10);
     ext_state_pub = this->create_publisher<mavros_msgs::msg::ExtendedState>("/mavros/extended_state", 10);
     battery_pub = this->create_publisher<sensor_msgs::msg::BatteryState>("/mavros/battery", 10);
-    // 环境气压/温度 (0x11 携带)：对外统一 /fpv 话题，供推力标定等工具采集 kp
+    // 环境气压/温度 (0x11 携带)：对外统一 /fpv 话题，供台架标定工具做 fpv_test.md §3.1 环境归一化
     pressure_pub = this->create_publisher<sensor_msgs::msg::FluidPressure>(
         "/fpv/static_pressure", rclcpp::QoS(rclcpp::KeepLast(10)).best_effort());
     temperature_pub = this->create_publisher<sensor_msgs::msg::Temperature>(
@@ -629,6 +632,8 @@ void CustomLinkVehicleNode::handleMedium(const custom_link::protocol::PayloadMed
     altitude_pub->publish(altitude);
     if (baro_compensation)
     {
+        // §4 步骤 1: F_std_target = F_req·(P0/P)·(T/T0); 气压/温度缺失时保持上一次系数
+        // (启动时为 1, 即标准状态)。
         std::lock_guard<std::mutex> lk(mtx_kp);
         if (p.temp_cdeg > kAbsoluteZeroCdeg)
         {
@@ -640,15 +645,16 @@ void CustomLinkVehicleNode::handleMedium(const custom_link::protocol::PayloadMed
                                 "Ignoring invalid barometric temperature %.2f C; retaining the previous temperature",
                                 p.temp_cdeg * 0.01);
         }
-        if (p.baro_pa > 0)
+        const double factor = quadratic_thrust_model::environmentFactor(static_cast<double>(p.baro_pa),
+                                                                        baro_temperature_c);
+        if (std::isfinite(factor))
         {
-            kp = (static_cast<double>(p.baro_pa) / kSeaLevelPressurePa) *
-                 (kReferenceTemperatureKelvin / (kReferenceTemperatureKelvin + baro_temperature_c));
+            env_factor = factor;
         }
         else
         {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                                "Ignoring zero barometric pressure; retaining the previous pressure compensation factor");
+                                "Ignoring zero barometric pressure; retaining the previous environment factor");
         }
     }
 
@@ -672,8 +678,16 @@ void CustomLinkVehicleNode::handleSlow(const custom_link::protocol::PayloadSlow 
     const double amperage = p.current_ma * 0.001;
 
     {
+        // §4: 母线电压 (及总电流) 经 2~5 Hz 一阶低通后再参与补偿, 防止大油门突加时
+        // 电压瞬降形成正反馈。按遥测时间戳计算 α, 截止频率与遥测速率无关。
         std::lock_guard<std::mutex> lk(mtx_kp);
-        battery_voltage = voltage;
+        // 首个样本按 0x12 名义周期 (10 Hz) 推进, 滤波器从 V_ref 初值收敛 (§5)
+        const double dt = last_battery_us > 0 ? (hostUs - last_battery_us) * 1e-6 : 0.1;
+        last_battery_us = hostUs;
+        if (voltage > 0.0)
+            voltage_lpf.update(voltage, dt);
+        if (amperage >= 0.0)
+            current_lpf.update(amperage, dt);
     }
 
     const bool now_armed = (p.status & custom_link::protocol::STATUS_ARMED) != 0;
@@ -990,16 +1004,20 @@ void CustomLinkVehicleNode::pushControl()
                 input.rate_dps_or_angle_deg[0] = cmd_setpoints[0] * kRadToDeg;
                 input.rate_dps_or_angle_deg[1] = cmd_setpoints[1] * kRadToDeg;
                 input.rate_dps_or_angle_deg[2] = cmd_setpoints[2] * kRadToDeg;
-                if (cmd_thrust < 0.0)
+                if (cmd_force_mode)
                 {
+                    // §4 在线反解 (每个控制周期用最新的环境系数与低通电压/电流):
+                    // F_req -> 占空比 u ∈ [u_idle, 1] -> Betaflight 集体油门。
                     std::lock_guard<std::mutex> lk(mtx_kp);
-                    if (voltage_compensation)
-                        cmd_thrust = quadratic_thrust_model::forceToThrust(motor_params, cmd_force, kp, battery_voltage);
-                    else
-                        cmd_thrust = quadratic_thrust_model::forceToThrust(motor_params, cmd_force, kp);
-                    cmd_thrust = std::clamp(cmd_thrust, 0.0, 1.0);
+                    const double nan = std::numeric_limits<double>::quiet_NaN();
+                    const double duty = quadratic_thrust_model::calculateThrottle(
+                        propulsion, cmd_force, env_factor,
+                        voltage_compensation ? voltage_lpf.value : nan,
+                        voltage_compensation ? current_lpf.value : nan);
+                    input.throttle = quadratic_thrust_model::dutyToCollective(duty, motor_idle);
                 }
-                input.throttle = cmd_thrust;
+                else
+                    input.throttle = cmd_thrust;
                 input.angle = cmd_angle;
                 fresh = true;
             }
@@ -1090,12 +1108,19 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     if (command->armed == 0 || !armed.load())
         return;
 
-    // 非有限推力会经 forceToThrust 落成 NaN 油门, 客户端 uint16 编码时为未定义行为
+    // 非有限推力会经推力模型落成 NaN 油门, 客户端 uint16 编码时为未定义行为
     // (x86 上通常落到最低油门); 与 raw 回调一致, 整帧丢弃。
     if (!std::isfinite(command->collective_thrust))
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "Dropping control command: non-finite collective_thrust");
+        return;
+    }
+    // 未标定 (a3..a1 全零) 时不存在 F_req -> 油门的映射, 拒绝力指令而不是输出怠速。
+    if (!quadratic_thrust_model::configured(propulsion))
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                              "Dropping control command: motor_parameters uncalibrated (run thrust_test_node)");
         return;
     }
 
@@ -1130,7 +1155,7 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     cmd_angle = angle;
     cmd_setpoints = setpoints;
     cmd_force = force;
-    cmd_thrust = -1.0;
+    cmd_force_mode = true;
     cmd_stamp = this->now();
     cmd_valid = true;
 }
@@ -1160,6 +1185,7 @@ void CustomLinkVehicleNode::ctrlCommandRawCallback(const quadrotor_msgs::msg::Co
     cmd_angle = angle;
     cmd_setpoints = setpoints;
     cmd_thrust = std::clamp(command->collective_thrust, 0.0, 1.0);
+    cmd_force_mode = false;
     cmd_stamp = this->now();
     cmd_valid = true;
 }

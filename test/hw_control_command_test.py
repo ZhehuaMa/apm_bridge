@@ -5,7 +5,7 @@
 与 hw_custom_link_rpm_test.py（直连串口、绕过 ROS、raw 油门）互补：本脚本走
 完整 ROS 数据面——launch 启动与话题重映射、/fpv/arm 与 /fpv/offboard 电平
 语义、ControlCommand 集合推力换算（collective_thrust m/s² → 油门，镜像节点
-vbat/baro 补偿）、节点控制量新鲜度超时（0.5 s 无指令 → 油门归零）。
+fpv_test.md §4 在线反解）、节点控制量新鲜度超时（0.5 s 无指令 → 油门归零）。
 
 QuadX 混控符号约定（同 hw_custom_link_rpm_test.py，台架闭环实证）：
   M0 右后 / M1 右前 / M2 左后 / M3 左前（俯视 M0/M3 桨顺时针）
@@ -41,6 +41,9 @@ import threading
 import time
 from collections import deque
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+import propulsion_model as pm  # noqa: E402
+
 try:
     import yaml
 except ImportError:  # pragma: no cover
@@ -61,60 +64,38 @@ except ImportError:  # pragma: no cover
 
 # QuadX 电机分组（下标 = /fpv/motor_rpm.data 下标 = 固件 motor[i]）
 RIGHT, LEFT, FRONT, REAR, CW, CCW = (0, 1), (2, 3), (1, 3), (0, 2), (0, 3), (1, 2)
-SEA_LEVEL_PA = 101325.0
-T0_KELVIN = 273.15
 
 
 class ThrustModel:
-    """quadratic_thrust_model.h forceToThrust 的 Python 镜像（含 vbat/baro 补偿），
-    用于把目标油门换算成 ControlCommand.collective_thrust (m/s²)。补偿开关必须
-    与节点 YAML 一致（load_model_params 读出；电机阶段前 fail-fast 校验）。"""
+    """custom_link 节点 fpv_test.md §4 在线反解的 Python 镜像 (scripts/propulsion_model.py),
+    用于把目标集体油门换算成 ControlCommand.collective_thrust (m/s²)。补偿开关必须
+    与节点 YAML 一致 (load_model_params 读出; 电机阶段前 fail-fast 校验)。"""
 
     def __init__(self, mp, lipo_cells, voltage_comp=False, baro_comp=True):
-        self.A, self.B, self.C, self.D = (float(mp[k]) for k in "ABCD")
-        self.n = int(mp.get("n", 1))
-        self.thrust_limit = float(mp.get("thrust_limit", 1.0))
-        self.spin_k = float(mp.get("spin_k", 0.0))
-        self.vbat_a = float(mp.get("vbat_a", 0.0))
-        self.vbat_b = float(mp.get("vbat_b", 1.0))
-        self.volt_max = lipo_cells * 4.2
-        self.volt_ref = lipo_cells * 3.7
-        self.volt_min = lipo_cells * 3.0   # 节点 volt_min = cells*kBatteryInvalidVoltagePerCell
+        self.model = pm.PropulsionModel.from_parameters(mp, lipo_cells)
         self.voltage_comp = voltage_comp
         self.baro_comp = baro_comp
 
-    def _vbat_scale(self, vbat):
-        return (self.vbat_a * vbat + self.vbat_b) / (self.vbat_a * self.volt_ref + self.vbat_b)
-
-    def force_to_throttle(self, force_n, kp, vbat):
-        x = force_n / self.n
+    def force_to_throttle(self, force_n, env_factor, vbat, current=float("nan")):
+        """节点 pushControl 语义: F_req -> 占空比 (§4 步骤 1~4) -> Betaflight 集体油门。"""
         if self.baro_comp:
-            if not math.isfinite(kp) or kp <= 0.0:
-                raise ValueError("Air density ratio must be finite and positive")
-            x /= kp
-        if not x > 0.0:   # 负/非有限请求按零推力 (同 C++)
-            x = 0.0
-        # 欠压钳位 (同 C++ compensationVoltage): <=0/非有限 = 无遥测
-        vbat = max(vbat, self.volt_min) if math.isfinite(vbat) and vbat > 0.0 else 0.0
-        # 节点 ctrlCommandCallback 分支语义：voltage_compensation=false 时
-        # 走 forceToThrust(无 vbat)（即 legacy 线性油门补偿），true 时走 vbat 模型
-        vbat_on = self.voltage_comp and self.vbat_a != 0.0 and vbat > 0.0
-        if vbat_on:
-            x *= self._vbat_scale(vbat)
-        t = ((self.A * x + self.B) * x + self.C) * x + self.D
-        if self.voltage_comp and vbat > 0.0 and not vbat_on:
-            t *= self.volt_max / vbat
-        t = (1.0 - self.spin_k) * t + self.spin_k * t * t
-        return max(0.0, min(t, self.thrust_limit))
+            if not (math.isfinite(env_factor) and env_factor > 0.0):
+                raise ValueError("environment factor must be finite and positive")
+        else:
+            env_factor = 1.0
+        if not self.voltage_comp:
+            vbat = current = float("nan")
+        return self.model.collective(force_n, env_factor, vbat, current)
 
-    def force_for_throttle(self, target, kp, vbat, hi_n=200.0):
-        """force_to_throttle 单调升，二分反解目标油门对应的总推力 (N)。"""
-        if self.force_to_throttle(hi_n, kp, vbat) < target:
+    def force_for_throttle(self, target, env_factor, vbat, current=float("nan"), hi_n=None):
+        """force_to_throttle 单调升，二分反解目标集体油门对应的总推力 (N)。"""
+        hi_n = hi_n if hi_n is not None else 2.0 * self.model.thrust(1.0)
+        if self.force_to_throttle(hi_n, env_factor, vbat, current) < target:
             return None
         lo = 0.0
         for _ in range(80):
             mid = 0.5 * (lo + hi_n)
-            if self.force_to_throttle(mid, kp, vbat) < target:
+            if self.force_to_throttle(mid, env_factor, vbat, current) < target:
                 lo = mid
             else:
                 hi_n = mid
@@ -189,10 +170,11 @@ class Monitor(Node):
     def current_a(self):
         return abs(self.battery.current) if self.battery is not None else None
 
-    def kp(self):
+    def env_factor(self):
+        """fpv_test.md §4 步骤 1 的 (P0/P)·(T/T0)。"""
         if self.pressure_pa is None or self.temp_c is None:
             return None
-        return (self.pressure_pa / SEA_LEVEL_PA) * (T0_KELVIN / (T0_KELVIN + self.temp_c))
+        return pm.environment_factor(self.pressure_pa, self.temp_c)
 
     def rpm_window(self, t0, t1):
         """[t0,t1] 窗内每电机平均转速（跳过 NaN 样本）；无样本返回 None 元组。"""
@@ -346,7 +328,12 @@ def main():
         return 1
 
     model, mass = load_model_params(args.parameters)
-    print(f"  model: n={model.n} limit={model.thrust_limit} mass={mass} kg")
+    m = model.model
+    if m.validate():
+        print(f"RESULT: FAIL (motor_parameters 未标定/非法: {m.validate()}; 先按 fpv_test.md 跑 thrust_test_node)")
+        return 1
+    print(f"  model: F_std(u)={m.a3:.4g}u^3+{m.a2:.4g}u^2+{m.a1:.4g}u, u_idle={m.u_idle} "
+          f"motor_idle={m.motor_idle} mass={mass} kg")
 
     # ---- 启动节点（custom_link.launch.py，bind_rx:=false 防 RX 配对锁死）----
     launch_cmd = ["ros2", "launch", "apm_bridge", "custom_link.launch.py",
@@ -417,10 +404,10 @@ def main():
         if not wait_for("battery", lambda: monitor.battery is not None, 10.0):
             print("RESULT: FAIL (未见 /mavros/battery)")
             return 1
-        if not wait_for("baro", lambda: monitor.kp() is not None, 10.0):
+        if not wait_for("baro", lambda: monitor.env_factor() is not None, 10.0):
             print("RESULT: FAIL (未见 /fpv/static_pressure 或 temperature_baro)")
             return 1
-        print(f"    vbat={monitor.voltage():.2f} V, kp={monitor.kp():.4f}, "
+        print(f"    vbat={monitor.voltage():.2f} V, env_factor={monitor.env_factor():.4f}, "
               f"rssi={monitor.rssi if monitor.rssi is not None else 'n/a'}%")
 
         # ---- 2. /fpv/motor_rpm 基线（未解锁）----
@@ -448,22 +435,22 @@ def main():
             return 1
 
         # ---- 推力换算预检（armed 前验证模型镜像）----
-        # 油门硬上限依赖镜像与节点补偿分支一致；baro_compensation=false 时节点
-        # kp 初值不可镜像，voltage_compensation=false 时节点实际油门可比目标高
-        # ~30%（满电 6S），两者任一关闭都拒绝电机阶段（fail-closed）。
+        # 油门硬上限依赖镜像与节点补偿分支一致；baro_compensation=false 时环境系数
+        # 固定为 1, voltage_compensation=false 时节点不做 §4 步骤 3 电压补偿, 实际油门
+        # 可与目标相差 V_ref/V; 两者任一关闭都拒绝电机阶段（fail-closed）。
         if not model.voltage_comp or not model.baro_comp:
             print(f"RESULT: FAIL (voltage_compensation={model.voltage_comp}, "
                   f"baro_compensation={model.baro_comp} — --thrust-max 硬上限依赖补偿模型)")
             return 1
-        kp, vbat = monitor.kp(), monitor.voltage()
+        env, vbat, amps = monitor.env_factor(), monitor.voltage(), monitor.current_a()
         collective = {}
         for name, throttle in (("low", args.thrust_low), ("high", args.thrust_high)):
-            force = model.force_for_throttle(throttle, kp, vbat)
+            force = model.force_for_throttle(throttle, env, vbat, amps)
             if force is None:
                 print(f"RESULT: FAIL (目标油门 {throttle} 超出模型域)")
                 return 1
             collective[name] = force / mass
-            rt = model.force_to_throttle(force, kp, vbat)
+            rt = model.force_to_throttle(force, env, vbat, amps)
             check(f"thrust_map_{name}", abs(rt - throttle) < 0.002,
                   f"throttle {throttle:.3f} -> {collective[name]:.3f} m/s² (round-trip {rt:.4f})")
         if not ok:
