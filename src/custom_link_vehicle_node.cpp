@@ -19,13 +19,29 @@ namespace
     constexpr double kReferenceTemperatureKelvin = 273.15;
     constexpr int kAbsoluteZeroCdeg = -27315;
 
-    double normalizeAngle(double a)
+    static double normalizeAngle(double a)
     {
         while (a > M_PI)
             a -= 2.0 * M_PI;
         while (a <= -M_PI)
             a += 2.0 * M_PI;
         return a;
+    }
+
+    // ATTITUDE 指令 → 角度模式设定点（FLU）：roll/pitch 取姿态四元数的欧拉角（rad），
+    // yaw 沿用 bodyrates.z 角速度（rad/s，mode_req=3 的 yaw 通道仍是 deg/s）。
+    // 四元数未归一化或含非有限值时返回 false，整条指令丢弃（不回落角速度通道）。
+    static bool attitudeSetpoints(const quadrotor_msgs::msg::ControlCommand &command, std::array<double, 3> &setpoints)
+    {
+        const auto &q = command.orientation;
+        const double norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+        if (!std::isfinite(norm) || std::abs(norm - 1.0) > 0.01)
+            return false;
+        double roll, pitch, yaw;
+        tf2::Matrix3x3(tf2::Quaternion(q.x, q.y, q.z, q.w)).getRPY(roll, pitch, yaw);
+        (void)yaw; // 偏航走 bodyrates.z 角速度，yaw 欧拉角不参与设定点
+        setpoints = {roll, pitch, command.bodyrates.z};
+        return std::all_of(setpoints.begin(), setpoints.end(), [](double v) { return std::isfinite(v); });
     }
 
 } // namespace
@@ -61,6 +77,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<double>("link.sync_rate", 1.0);
     this->declare_parameter<double>("link.diag_rate", 0.2);
     this->declare_parameter<double>("link.rate_limit_dps", 0.0);
+    this->declare_parameter<double>("link.angle_limit_deg", 0.0);
     this->declare_parameter<double>("cli.timeout_s", 3.0); // /fpv/cli 响应超时
     this->declare_parameter<bool>("cli.bind_rx_on_connect", false);
 
@@ -316,6 +333,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("link.sync_rate", sync_rate);
     this->get_parameter("link.diag_rate", diag_rate);
     this->get_parameter("link.rate_limit_dps", rate_limit_dps);
+    this->get_parameter("link.angle_limit_deg", angle_limit_deg);
     const auto control_period = custom_link::periodFromRate(control_rate);
 
     std::unique_ptr<custom_link::Transport> transport;
@@ -950,11 +968,12 @@ void CustomLinkVehicleNode::pushControl()
         {
             if ((this->now() - cmd_stamp).seconds() < control_timeout)
             {
-                // ROS FLU rad/s -> Betaflight 体轴 deg/s：同轴同号，直通换算
-                //（BF 陀螺仪域即 FLU 角速度，见 handleFast 注释）。
-                input.rate_dps[0] = cmd_bodyrates[0] * kRadToDeg;
-                input.rate_dps[1] = cmd_bodyrates[1] * kRadToDeg;
-                input.rate_dps[2] = cmd_bodyrates[2] * kRadToDeg;
+                // ROS FLU rad(/s) -> Betaflight deg 域，同轴同号直通换算：
+                // 角速度模式为三轴 rad/s（BF 陀螺仪域即 FLU 角速度，见 handleFast
+                // 注释）；角度模式 roll/pitch 为 rad、yaw 为 rad/s（mode_req=3）。
+                input.rate_dps_or_angle_deg[0] = cmd_setpoints[0] * kRadToDeg;
+                input.rate_dps_or_angle_deg[1] = cmd_setpoints[1] * kRadToDeg;
+                input.rate_dps_or_angle_deg[2] = cmd_setpoints[2] * kRadToDeg;
                 input.throttle = cmd_thrust;
                 input.angle = cmd_angle;
                 fresh = true;
@@ -965,21 +984,28 @@ void CustomLinkVehicleNode::pushControl()
             }
         }
     }
-    // 发送前角速度限幅（deg/s，0 = 不限制）。独立于固件侧
-    // custom_link_rate_limit_dps，作为客户端防御层；生效值取两者中更小。
+    // 发送前限幅（0 = 不限制），客户端防御层，独立于固件侧限制：
+    //   角速度通道 -> link.rate_limit_dps vs 固件 custom_link_rate_limit_dps，取更小；
+    //   角度模式 roll/pitch -> link.angle_limit_deg vs 固件 pid profile 的
+    //   angle_limit（CLI 可调，默认 60°），同样取更小。
     if (airsim_enabled && fresh &&
-        (!std::isfinite(input.throttle) || !std::all_of(std::begin(input.rate_dps), std::end(input.rate_dps),
+        (!std::isfinite(input.throttle) || !std::all_of(std::begin(input.rate_dps_or_angle_deg), std::end(input.rate_dps_or_angle_deg),
                                                       [](double rate) { return std::isfinite(rate); })))
     {
         fresh = false;
         RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Rejected non-finite SITL control");
     }
-    if (fresh && rate_limit_dps > 0.0)
-    {
-        for (int i = 0; i < 3; i++)
-        {
-            if (!input.angle || i == 2)
-                input.rate_dps[i] = std::clamp(input.rate_dps[i], -rate_limit_dps, rate_limit_dps);
+    if (input.angle) {
+        if (fresh && angle_limit_deg > 0.01) {
+            input.rate_dps_or_angle_deg[0] = std::clamp(input.rate_dps_or_angle_deg[0], -angle_limit_deg, angle_limit_deg);
+            input.rate_dps_or_angle_deg[1] = std::clamp(input.rate_dps_or_angle_deg[1], -angle_limit_deg, angle_limit_deg);
+        }
+        
+    } 
+    else {
+        if (fresh && rate_limit_dps > 0.01) {
+            input.rate_dps_or_angle_deg[0] = std::clamp(input.rate_dps_or_angle_deg[0], -rate_limit_dps, rate_limit_dps);
+            input.rate_dps_or_angle_deg[1] = std::clamp(input.rate_dps_or_angle_deg[1], -rate_limit_dps, rate_limit_dps);
         }
     }
     client->setControl(input, fresh);
@@ -1044,17 +1070,18 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
 
     in_hover.store(command->is_hover_state != 0);
 
-    if (command->control_mode == quadrotor_msgs::msg::ControlCommand::ATTITUDE)
+    // ATTITUDE = 固件原生角度模式（0x20 mode_req=3）：roll/pitch 取姿态四元数，
+    // yaw 仍是角速度；BODY_RATES = 角速度模式（mode_req=2）。
+    const bool angle = command->control_mode == quadrotor_msgs::msg::ControlCommand::ATTITUDE;
+    std::array<double, 3> setpoints{command->bodyrates.x, command->bodyrates.y, command->bodyrates.z};
+    if (angle && !attitudeSetpoints(*command, setpoints))
     {
-        // 自定义链路当前只承载角速度通道；姿态环留在上游。
-        RCLCPP_WARN_ONCE(this->get_logger(),
-                         "ATTITUDE control mode is not carried by the custom link, using bodyrates only");
-        use_rate.store(false);
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Dropping ATTITUDE command: orientation quaternion not unit "
+                             "(|norm-1| > 1%%) or non-finite setpoint");
+        return;
     }
-    else
-    {
-        use_rate.store(true);
-    }
+    use_rate.store(!angle);
 
     double thrust = 0.0;
     {
@@ -1067,8 +1094,8 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     }
 
     std::lock_guard<std::mutex> lk(mtx_cmd);
-    cmd_angle = false;
-    cmd_bodyrates = {command->bodyrates.x, command->bodyrates.y, command->bodyrates.z};
+    cmd_angle = angle;
+    cmd_setpoints = setpoints;
     cmd_thrust = std::clamp(thrust, 0.0, 1.0);
     cmd_stamp = this->now();
     cmd_valid = true;
@@ -1079,18 +1106,16 @@ void CustomLinkVehicleNode::ctrlCommandRawCallback(const quadrotor_msgs::msg::Co
     if (command->armed == 0 || !armed.load())
         return;
 
+    // 与 ctrlCommandCallback 同一套 ATTITUDE -> 角度模式映射；区别仅在油门：
+    // 本回调的 collective_thrust 已是归一化推力 0..1，直接透传。
     const bool angle = command->control_mode == quadrotor_msgs::msg::ControlCommand::ATTITUDE;
     std::array<double, 3> setpoints{command->bodyrates.x, command->bodyrates.y, command->bodyrates.z};
-    if (angle)
+    if (angle && !attitudeSetpoints(*command, setpoints))
     {
-        const auto &q = command->orientation;
-        const double norm = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
-        if (!std::isfinite(norm) || std::abs(norm - 1.0) > 0.01)
-            return;
-        double roll, pitch, yaw;
-        tf2::Matrix3x3(tf2::Quaternion(q.x, q.y, q.z, q.w)).getRPY(roll, pitch, yaw);
-        setpoints = {std::clamp(roll, -10.0*kDegToRad, 10.0*kDegToRad),
-                     std::clamp(pitch, -10.0*kDegToRad, 10.0*kDegToRad), command->bodyrates.z};
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Dropping ATTITUDE command: orientation quaternion not unit "
+                             "(|norm-1| > 1%%) or non-finite setpoint");
+        return;
     }
     if (!std::isfinite(command->collective_thrust) || !std::all_of(setpoints.begin(), setpoints.end(),
         [](double value) { return std::isfinite(value); }))
@@ -1099,7 +1124,7 @@ void CustomLinkVehicleNode::ctrlCommandRawCallback(const quadrotor_msgs::msg::Co
 
     std::lock_guard<std::mutex> lk(mtx_cmd);
     cmd_angle = angle;
-    cmd_bodyrates = setpoints;
+    cmd_setpoints = setpoints;
     cmd_thrust = std::clamp(command->collective_thrust, 0.0, 1.0);
     cmd_stamp = this->now();
     cmd_valid = true;

@@ -148,7 +148,7 @@ namespace
         client.start();
         custom_link::ControlInput command;
         command.throttle = 0.3;
-        command.rate_dps[0] = 12.5;
+        command.rate_dps_or_angle_deg[0] = 12.5;
         client.setControl(command, true);
         capture.waitFor(0, [](const auto &frame) { return frame.mode_req == 2 && frame.throttle == 1300; });
 
@@ -171,7 +171,7 @@ namespace
 
         start = capture.count();
         command.angle = true;
-        command.rate_dps[0] = 2.0;
+        command.rate_dps_or_angle_deg[0] = 2.0;
         client.setControl(command, true);
         auto angle = capture.waitFor(start, [](const auto &frame) { return frame.mode_req == 3; });
         require(angle.rate_x10[0] == 20 && angle.arm == 0, "ANGLE target/arm transport");
@@ -179,7 +179,7 @@ namespace
         client.setOffboardRequest(false);
         capture.waitFor(start, [](const auto &frame) { return frame.mode_req == 0; });
         command.angle = false;
-        command.rate_dps[0] = 12.5;
+        command.rate_dps_or_angle_deg[0] = 12.5;
         client.setControl(command, true);
         client.setOffboardRequest(true);
         capture.waitFor(start, [](const auto &frame) { return frame.mode_req == 2; });

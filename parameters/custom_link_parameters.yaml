@@ -36,6 +36,7 @@ custom_link_bridge:
       tcp_port: 5763
       control_rate: 100.0   # 缓存推送和 0x20 上行频率 (Hz)，周期须小于 FC 看门狗 (默认 50ms)
       rate_limit_dps: 0.0   # 客户端角速度限幅 (deg/s, 0=不限)；固件侧另有 custom_link_rate_limit_dps
+      angle_limit_deg: 0.0  # 客户端角度模式 roll/pitch 限幅 (deg, 0=不限)；固件侧兜底为 pid profile angle_limit (默认 60)
       sync_rate: 1.0        # 四时间戳对时频率
       diag_rate: 0.2        # 链路诊断日志频率
 

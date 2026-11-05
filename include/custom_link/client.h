@@ -38,7 +38,7 @@ namespace custom_link
     struct ControlInput
     {
         double throttle = 0.0;       // 0..1
-        double rate_dps[3] = {0, 0, 0}; // BF 体轴 deg/s
+        double rate_dps_or_angle_deg[3] = {0, 0, 0}; // BF body rates deg/s or roll/pitch angle degrees
         uint8_t mode_req = 2;        // offboard
         bool angle = false;          // mode 3: roll/pitch angle degrees, yaw rate deg/s
     };
