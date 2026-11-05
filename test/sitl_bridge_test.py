@@ -16,51 +16,12 @@ import propulsion_model as pm
 
 ROOT = Path(__file__).resolve().parents[1]
 
-@pytest.mark.parametrize("value,expected", [("", None), ("-20.0", -20.0), ("0.0", 0.0), ("15.0", 15.0)])
-def test_shared_pitch_launch_preserves_yaml_unless_overridden(monkeypatch, tmp_path, value, expected):
-    from launch import LaunchContext
-    from launch.actions import DeclareLaunchArgument
-    from launch_ros.utilities import evaluate_parameters, normalize_parameters
 
-    spec = importlib.util.spec_from_file_location("camera_launch", ROOT / "launch/custom_link.launch.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def load_launch(monkeypatch, tmp_path, launch_file, yaml_text):
+    """Load a launch file with Node captured and the package share redirected to tmp_path."""
+    from launch_ros.utilities import normalize_parameters
 
-    class CaptureNode:
-        def __init__(self, **kwargs):
-            self.parameters = normalize_parameters(kwargs["parameters"])
-
-    (tmp_path / "parameters").mkdir()
-    parameter_file = tmp_path / "parameters/custom_link_parameters.yaml"
-    parameter_file.write_text("custom_link_bridge:\n  ros__parameters:\n    gimbal:\n      pitch_hold: -12.0\n")
-    monkeypatch.setattr(module, "Node", CaptureNode)
-    monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(tmp_path))
-    context = LaunchContext()
-    context.launch_configurations.update(
-        transport="tcp", serial_port="/not-used", baudrate="921600",
-        tcp_host="127.0.0.1", tcp_port="5763", gimbal_port="", gimbal_model="C20S", pitch_hold=value)
-    node = module._launch_node(context)[0]
-    parameters = evaluate_parameters(context, node.parameters)
-    assert parameters[0] == parameter_file
-    assert yaml.safe_load(parameter_file.read_text())["custom_link_bridge"]["ros__parameters"]["gimbal"]["pitch_hold"] == -12.0
-    overrides = [entry["gimbal.pitch_hold"] for entry in parameters
-                 if isinstance(entry, dict) and "gimbal.pitch_hold" in entry]
-    assert overrides == ([] if expected is None else [expected])
-    if expected is not None:
-        assert isinstance(overrides[0], float)
-    names = {entity.name for entity in module.generate_launch_description().entities
-             if isinstance(entity, DeclareLaunchArgument)}
-    assert "pitch_hold" in names and "fixed_pitch" not in names
-
-
-@pytest.mark.parametrize("launch_file", ["custom_link.launch.py", "sitl.launch.py"])
-@pytest.mark.parametrize("value,expected", [("", None), ("0.0", 0.0), ("-55.0", -55.0), ("10.0", 10.0)])
-def test_aim_launch_preserves_yaml_unless_overridden(monkeypatch, tmp_path, launch_file, value, expected):
-    from launch import LaunchContext
-    from launch.actions import DeclareLaunchArgument
-    from launch_ros.utilities import evaluate_parameters, normalize_parameters
-
-    spec = importlib.util.spec_from_file_location("aim_launch", ROOT / "launch" / launch_file)
+    spec = importlib.util.spec_from_file_location(launch_file.replace(".", "_"), ROOT / "launch" / launch_file)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -71,23 +32,89 @@ def test_aim_launch_preserves_yaml_unless_overridden(monkeypatch, tmp_path, laun
     (tmp_path / "parameters").mkdir()
     parameter_file = tmp_path / "parameters" / (
         "sitl_parameters.yaml" if launch_file == "sitl.launch.py" else "custom_link_parameters.yaml")
-    parameter_file.write_text("custom_link_bridge:\n  ros__parameters:\n    gimbal:\n      pitch_aim: -20.0\n")
+    parameter_file.write_text(yaml_text)
     monkeypatch.setattr(module, "Node", CaptureNode)
     monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(tmp_path))
+    return module, parameter_file
+
+
+def launch_context(module, **values):
+    """LaunchContext seeded with every declared argument's default, then the given values.
+
+    Seeding from the launch file itself keeps these tests valid when new launch
+    arguments are added (unset arguments behave exactly as on the command line).
+    """
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument
+    from launch.utilities import perform_substitutions
+
     context = LaunchContext()
-    context.launch_configurations.update(
-        transport="tcp", serial_port="/not-used", baudrate="921600", tcp_host="127.0.0.1",
-        tcp_port="5763", gimbal_port="", gimbal_model="C20S", pitch_hold="", pitch_aim=value,
-        parameters=str(parameter_file), airsim_host="127.0.0.1", airsim_port="41451",
-        vehicle_name="Copter", airsim_link_port="5764", camera_name="0", gimbal_enabled="true")
-    parameters = evaluate_parameters(context, module._launch_node(context)[0].parameters)
-    overrides = [entry["gimbal.pitch_aim"] for entry in parameters
-                 if isinstance(entry, dict) and "gimbal.pitch_aim" in entry]
-    assert overrides == ([] if expected is None else [expected])
+    for entity in module.generate_launch_description().entities:
+        if isinstance(entity, DeclareLaunchArgument):
+            default = entity.default_value
+            context.launch_configurations[entity.name] = \
+                "" if default is None else perform_substitutions(context, default)
+    context.launch_configurations.update(values)
+    return context
+
+
+def launch_parameters(module, context):
+    from launch_ros.utilities import evaluate_parameters
+    return evaluate_parameters(context, module._launch_node(context)[0].parameters)
+
+
+def declared_arguments(module):
+    from launch.actions import DeclareLaunchArgument
+    return {entity.name for entity in module.generate_launch_description().entities
+            if isinstance(entity, DeclareLaunchArgument)}
+
+
+def overrides(parameters, name):
+    return [entry[name] for entry in parameters if isinstance(entry, dict) and name in entry]
+
+
+@pytest.mark.parametrize("value,expected", [("", None), ("-20.0", -20.0), ("0.0", 0.0), ("15.0", 15.0)])
+def test_shared_pitch_launch_preserves_yaml_unless_overridden(monkeypatch, tmp_path, value, expected):
+    module, parameter_file = load_launch(
+        monkeypatch, tmp_path, "custom_link.launch.py",
+        "custom_link_bridge:\n  ros__parameters:\n    gimbal:\n      pitch_hold: -12.0\n")
+    parameters = launch_parameters(module, launch_context(module, transport="tcp", pitch_hold=value))
+    assert parameters[0] == parameter_file
+    assert yaml.safe_load(parameter_file.read_text())["custom_link_bridge"]["ros__parameters"]["gimbal"]["pitch_hold"] == -12.0
+    pitch = overrides(parameters, "gimbal.pitch_hold")
+    assert pitch == ([] if expected is None else [expected])
+    if expected is not None:
+        assert isinstance(pitch[0], float)
+    assert overrides(parameters, "link.transport") == ["tcp"]
+    names = declared_arguments(module)
+    assert "pitch_hold" in names and "fixed_pitch" not in names
+
+
+@pytest.mark.parametrize("launch_file", ["custom_link.launch.py", "sitl.launch.py"])
+@pytest.mark.parametrize("value,expected", [("", None), ("0.0", 0.0), ("-55.0", -55.0), ("10.0", 10.0)])
+def test_aim_launch_preserves_yaml_unless_overridden(monkeypatch, tmp_path, launch_file, value, expected):
+    module, parameter_file = load_launch(
+        monkeypatch, tmp_path, launch_file,
+        "custom_link_bridge:\n  ros__parameters:\n    gimbal:\n      pitch_aim: -20.0\n")
+    parameters = launch_parameters(module, launch_context(module, pitch_aim=value,
+                                                          parameters=str(parameter_file)))
+    assert overrides(parameters, "gimbal.pitch_aim") == ([] if expected is None else [expected])
     assert yaml.safe_load(parameter_file.read_text())["custom_link_bridge"]["ros__parameters"]["gimbal"]["pitch_aim"] == -20.0
-    names = {entity.name for entity in module.generate_launch_description().entities
-             if isinstance(entity, DeclareLaunchArgument)}
-    assert "pitch_aim" in names
+    assert "pitch_aim" in declared_arguments(module)
+
+
+@pytest.mark.parametrize("value,expected", [("", None), ("true", True), ("false", False)])
+def test_bind_rx_launch_override(monkeypatch, tmp_path, value, expected):
+    module, _ = load_launch(
+        monkeypatch, tmp_path, "custom_link.launch.py",
+        "custom_link_bridge:\n  ros__parameters:\n    cli:\n      bind_rx_on_connect: true\n")
+    parameters = launch_parameters(module, launch_context(module, bind_rx=value))
+    bind = overrides(parameters, "cli.bind_rx_on_connect")
+    assert bind == ([] if expected is None else [expected])
+    if expected is not None:
+        assert isinstance(bind[0], bool)
+    # no other argument leaks an override when left at its default
+    assert all(set(entry) == {"cli.bind_rx_on_connect"} for entry in parameters if isinstance(entry, dict))
 
 
 def q(x=0.0, y=0.0, z=0.0, w=1.0):
