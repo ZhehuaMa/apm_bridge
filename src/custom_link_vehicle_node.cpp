@@ -115,6 +115,8 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("motor_parameters.vbat_b", motor_params.vbat_b);
     motor_params.volt_max = n_lipo_cells * kBatteryFullVoltagePerCell;
     motor_params.volt_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;
+    // 欠压钳位 (fpv_test.md §4): 低于"无效"阈值的电压读数不再继续放大油门
+    motor_params.volt_min = n_lipo_cells * kBatteryInvalidVoltagePerCell;
 
     double ori_stddev = 0.0, gyro_stddev = 0.0, acc_stddev = 0.0;
     this->get_parameter("imu.orientation_stddev", ori_stddev);
@@ -144,12 +146,26 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
          !std::isfinite(motor_params.A) || !std::isfinite(motor_params.B) ||
          !std::isfinite(motor_params.C) || !std::isfinite(motor_params.D)))
         throw std::invalid_argument("Invalid SITL mass, gravity, timeout or motor model");
+    // 全零 A..D = 未标定 (仅 raw 油门通道可用, 测试/台架工具常用); 已标定模型须通过
+    // 单调性/合法性校验, 否则拒绝启动, 不以错误曲线飞行。
+    if (motor_params.A != 0.0 || motor_params.B != 0.0 || motor_params.C != 0.0 || motor_params.D != 0.0)
+    {
+        const std::string model_error =
+            quadratic_thrust_model::validateMotorParams(motor_params, voltage_compensation);
+        if (!model_error.empty())
+            throw std::invalid_argument("Invalid motor_parameters: " + model_error);
+    }
+    else
+        RCLCPP_WARN(this->get_logger(),
+                    "motor_parameters A..D are all zero: collective force commands map to zero throttle "
+                    "(only ~/control_command_raw is usable until the model is calibrated)");
 
     RCLCPP_INFO(this->get_logger(),
-                "Motor parameters: A=%.6f, B=%.6f, C=%.6f, D=%.6f, n=%d, voltage_max=%.6f, spin_k=%.6f, vbat_a=%.6f, vbat_b=%.6f, volt_ref=%.6f",
+                "Motor parameters: A=%.6f, B=%.6f, C=%.6f, D=%.6f, n=%d, voltage_max=%.6f, spin_k=%.6f, vbat_a=%.6f, vbat_b=%.6f, volt_ref=%.6f, volt_min=%.3f, x_peak=%.4g",
                 motor_params.A, motor_params.B, motor_params.C, motor_params.D,
                 motor_params.n_motors, motor_params.volt_max, motor_params.spin_k,
-                motor_params.vbat_a, motor_params.vbat_b, motor_params.volt_ref);
+                motor_params.vbat_a, motor_params.vbat_b, motor_params.volt_ref,
+                motor_params.volt_min, motor_params.x_peak);
 
     // 反演曲线预拟合: thrustToForce 运行时以多项式求值替代牛顿迭代
     const double fit_residual = quadratic_thrust_model::initInverseFit(motor_params);
@@ -1074,6 +1090,15 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
     if (command->armed == 0 || !armed.load())
         return;
 
+    // 非有限推力会经 forceToThrust 落成 NaN 油门, 客户端 uint16 编码时为未定义行为
+    // (x86 上通常落到最低油门); 与 raw 回调一致, 整帧丢弃。
+    if (!std::isfinite(command->collective_thrust))
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Dropping control command: non-finite collective_thrust");
+        return;
+    }
+
     if (command->collective_thrust < 1e-6) // 准备落地上锁
         set_unarm = true;
 
@@ -1088,6 +1113,12 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                              "Dropping ATTITUDE command: orientation quaternion not unit "
                              "(|norm-1| > 1%%) or non-finite setpoint");
+        return;
+    }
+    if (!std::all_of(setpoints.begin(), setpoints.end(), [](double value) { return std::isfinite(value); }))
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Dropping control command: non-finite body rate");
         return;
     }
     use_rate.store(!angle);
