@@ -79,6 +79,7 @@ class ThrustModel:
         self.vbat_b = float(mp.get("vbat_b", 1.0))
         self.volt_max = lipo_cells * 4.2
         self.volt_ref = lipo_cells * 3.7
+        self.volt_min = lipo_cells * 3.0   # 节点 volt_min = cells*kBatteryInvalidVoltagePerCell
         self.voltage_comp = voltage_comp
         self.baro_comp = baro_comp
 
@@ -91,6 +92,10 @@ class ThrustModel:
             if not math.isfinite(kp) or kp <= 0.0:
                 raise ValueError("Air density ratio must be finite and positive")
             x /= kp
+        if not x > 0.0:   # 负/非有限请求按零推力 (同 C++)
+            x = 0.0
+        # 欠压钳位 (同 C++ compensationVoltage): <=0/非有限 = 无遥测
+        vbat = max(vbat, self.volt_min) if math.isfinite(vbat) and vbat > 0.0 else 0.0
         # 节点 ctrlCommandCallback 分支语义：voltage_compensation=false 时
         # 走 forceToThrust(无 vbat)（即 legacy 线性油门补偿），true 时走 vbat 模型
         vbat_on = self.voltage_comp and self.vbat_a != 0.0 and vbat > 0.0
@@ -100,7 +105,7 @@ class ThrustModel:
         if self.voltage_comp and vbat > 0.0 and not vbat_on:
             t *= self.volt_max / vbat
         t = (1.0 - self.spin_k) * t + self.spin_k * t * t
-        return min(t, self.thrust_limit)
+        return max(0.0, min(t, self.thrust_limit))
 
     def force_for_throttle(self, target, kp, vbat, hi_n=200.0):
         """force_to_throttle 单调升，二分反解目标油门对应的总推力 (N)。"""

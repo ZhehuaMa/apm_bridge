@@ -34,3 +34,13 @@ def test_hardware_mirror_rejects_invalid_density(kp):
     model = ThrustModel(PARAMS, 6)
     with pytest.raises(ValueError, match="Air density"):
         model.force_to_throttle(10.0, kp, 22.2)
+
+
+@pytest.mark.parametrize("vbat_a", [0.0, -0.0776732])
+def test_hardware_mirror_voltage_floor_and_force_clamp(vbat_a):
+    # Mirrors quadratic_thrust_model.h: volt_min = cells*3.0 floor, no negative force.
+    model = ThrustModel(dict(PARAMS, vbat_a=vbat_a, vbat_b=2.7346374), 6, True, False)
+    assert model.force_to_throttle(10.0, 1.0, 2.0) == model.force_to_throttle(10.0, 1.0, 18.0)
+    assert model.force_to_throttle(10.0, 1.0, math.nan) == model.force_to_throttle(10.0, 1.0, 0.0)
+    assert model.force_to_throttle(-5.0, 1.0, 22.2) == model.force_to_throttle(0.0, 1.0, 22.2)
+    assert model.force_to_throttle(math.nan, 1.0, 22.2) == model.force_to_throttle(0.0, 1.0, 22.2)

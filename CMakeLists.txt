@@ -125,7 +125,8 @@ install(PROGRAMS scripts/motor_check_node.py
   DESTINATION lib/${PROJECT_NAME} RENAME motor_check_node)
 
 if(BUILD_TESTING)
-  add_executable(quadratic_thrust_model_test test/quadratic_thrust_model_test.cpp)
+  add_executable(quadratic_thrust_model_test
+    test/quadratic_thrust_model_test.cpp test/quadratic_thrust_model_odr.cpp)
   add_test(NAME quadratic_thrust_model_test COMMAND quadratic_thrust_model_test)
   add_executable(gimbal_tracking_test test/gimbal_tracking_test.cpp)
   add_test(NAME gimbal_tracking_test COMMAND gimbal_tracking_test)

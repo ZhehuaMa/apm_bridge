@@ -702,6 +702,24 @@ run time. Each CSV row also records `current_A` and `rpm_rms` (RMS of the valid
 `/fpv/motor_rpm` entries) for offline advanced normalization; neither is
 required for the fit.
 
+Runtime safeguards in `quadratic_thrust_model.h` (applied by the bridge):
+
+- **Startup validation** — a calibrated model (any of A..D non-zero) must have
+  finite coefficients, `C > 0`, `thrust_limit ∈ (0, 1]`, `spin_k ∈ [0, 1]`, a
+  positive vbat curve over `[volt_min, volt_max]`, and must rise monotonically
+  until it reaches the throttle limit (fpv_test.md §3.2); otherwise the node
+  refuses to start. An all-zero model only warns (raw control still works).
+- **Monotone saturation** — if the cubic turns over (e.g. `A < 0`), force
+  requests beyond its maximum saturate at that maximum instead of collapsing
+  toward zero throttle.
+- **Voltage floor** — compensation uses `max(V, cells·3.0 V)`, so a sagging or
+  bogus voltage reading cannot multiply the throttle without bound (fpv_test.md
+  §4). The firmware already low-pass filters `vbat` (≈0.33 Hz), stricter than the
+  2–5 Hz the spec requires.
+- **Input sanitizing** — negative force requests map to the zero-force
+  throttle; non-finite `collective_thrust` / body rates are dropped by the node
+  instead of reaching the link encoder.
+
 **AirSim / SITL compatibility** — the simulator has no barometer, no battery
 sag and no bidirectional-DShot RPM, so the tool degrades automatically:
 
