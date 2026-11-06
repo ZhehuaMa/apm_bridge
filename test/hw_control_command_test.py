@@ -58,9 +58,12 @@ try:
     from quadrotor_msgs.msg import ControlCommand
     from sensor_msgs.msg import BatteryState, FluidPressure, Temperature
     from std_msgs.msg import Bool, Float32MultiArray
-except ImportError:  # pragma: no cover
-    sys.exit("ROS 2 (rclpy/mavros_msgs/quadrotor_msgs) not importable — "
-             "source the workspace setup.bash first and run with /usr/bin/python3")
+except ImportError:  # pragma: no cover - imported by unit tests without ROS; direct runs need it
+    Node = object  # placeholder base so class Monitor(Node) still defines without ROS
+    rclpy = QoSProfile = ReliabilityPolicy = Vector3 = None
+    RCIn = State = ControlCommand = None
+    BatteryState = FluidPressure = Temperature = None
+    Bool = Float32MultiArray = None
 
 # QuadX 电机分组（下标 = /fpv/motor_rpm.data 下标 = 固件 motor[i]）
 RIGHT, LEFT, FRONT, REAR, CW, CCW = (0, 1), (2, 3), (1, 3), (0, 2), (0, 3), (1, 2)

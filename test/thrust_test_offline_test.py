@@ -89,7 +89,7 @@ class FakeBridge(Node):
         with self.lock:
             self.last_cmd_time = time.monotonic()
             self.collective = msg.collective_thrust if msg.armed else 0.0
-            self.commands.append((time.monotonic(), msg.collective_thrust, bool(msg.armed)))
+            self.commands.append((time.monotonic(), msg.collective_thrust, bool(msg.armed), msg))
 
     def on_cli(self, request, response):
         response.ok = True
@@ -185,10 +185,17 @@ def hardware_mode(out_dir, results):
     check(results, 'hw_exit', proc.returncode == 0, f'rc={proc.returncode}')
     check(results, 'hw_arm_disarm', True in arm_calls and False in arm_calls)
     check(results, 'hw_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
+    test_cmds = [msg for _, _, armed, msg in ((t, c, a, m) for t, c, a, m in commands) if armed]
+    mode_ok = test_cmds and all(m.control_mode == ControlCommand.BODY_RATES for m in test_cmds) and \
+        all(abs(m.bodyrates.x) < 1e-12 and abs(m.bodyrates.y) < 1e-12 and abs(m.bodyrates.z) < 1e-12
+            for m in test_cmds)
+    check(results, 'hw_body_rates_stream', mode_ok)
+
+    # step order with an idle cooldown (collective 0) after each u >= 0.70 step
 
     # step order with an idle cooldown (collective 0) after each u >= 0.70 step
     sequence = []
-    for _, c, armed in commands:
+    for _, c, armed, _ in commands:
         c = round(c, 6)
         if armed and (not sequence or sequence[-1] != c):
             sequence.append(c)
@@ -198,7 +205,9 @@ def hardware_mode(out_dir, results):
         if u >= 0.7:
             expected.append(0.0)
     expected = [0.0] + expected
-    check(results, 'hw_sop_sequence', sequence == expected, f'\n      got {sequence}\n      exp {expected}')
+    # 后续追加的是标定验证段的油门 (§4 在线反解), 不属于阶梯: 只比对前缀
+    check(results, 'hw_sop_sequence', sequence[:len(expected)] == expected,
+          f'\n      got {sequence}\n      exp prefix {expected}')
 
     rows, result = read_outputs(out_dir)
     check(results, 'hw_u_idle_recorded', result['u_idle_fc_motor_idle'] == U_IDLE and
@@ -218,6 +227,10 @@ def hardware_mode(out_dir, results):
           f"a3..a1=({mp['a3']:.5g}, {mp['a2']:.5g}, {mp['a1']:.5g})")
     check(results, 'hw_no_idle_parameter', set(mp) == {'a3', 'a2', 'a1', 'r_eq', 'k_i'}, f'{sorted(mp)}')
     model = pm.PropulsionModel.from_parameters(mp, 6, U_IDLE)
+    verification = result.get('verification') or []
+    ver_ok = verification and all(abs(v['error_pct']) < 2.0 for v in verification)
+    check(results, 'hw_verification', bool(ver_ok),
+          ', '.join(f"{v['f_req_N']:.2f}N:{v['error_pct']:+.1f}%" for v in verification))
     worst = 0.0
     for p, t, v_oc in ((101325.0, 0.0, 22.2), (PRESSURE, TEMPERATURE, 24.0), (95000.0, -10.0, 21.0)):
         for f_req in (10.0, 25.0, 45.0):

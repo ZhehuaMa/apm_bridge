@@ -716,12 +716,14 @@ Inputs: `/current_weight` (`[weight_kg, stable_weight_kg]`, ≥ 10 Hz, e.g.
 FC `motor_idle` via `/fpv/cli` (u_idle: duty of collective 0 and of the idle
 cooldown; recorded in the result, not written as a parameter).
 
-Procedure (§2.2, all adjustable): tare before arming, then duty steps
-`u = 0.05, 0.10 … 1.00` (20 steps); each step lasts 2.5 s — the first 0.5 s is
-discarded, every stream is averaged over the remaining 2.0 s into one point
-`(u, V, I, RPM1..4, F, P, t)`; after each step with `u ≥ 0.70` the motors return
-to idle for 5.0 s. A scale reading below `--critical-weight` (lift-off) or an
-unexpected disarm aborts safely; collected points are still written.
+The control stream is **BODY_RATES by default** (zero rates + raw collective);
+`--attitude` switches to ATTITUDE with orientation echo (keeps thrust constant
+while tilted). Procedure (§2.2, all adjustable): tare before arming, then duty
+steps `u = 0.05, 0.10 … 1.00` (20 steps); each step lasts 2.5 s — the first
+0.5 s is discarded, every stream is averaged over the remaining 2.0 s into one
+point `(u, V, I, RPM1..4, F, P, t)`; after each step with `u ≥ 0.70` the motors
+return to idle for 5.0 s. A scale reading below `--critical-weight` (lift-off)
+or an unexpected disarm aborts safely; collected points are still written.
 
 Fit (§3): environment normalization `F0 = F·(P0/P)·(T/T0)`; RMS RPM; least
 squares `u·V = (1/K_v*)·RPM_rms + R_eq·I`; standard-voltage thrust
@@ -731,7 +733,11 @@ missing); zero-intercept cubic via the normal equations; monotonicity check
 (`a1 > 0`, `dF/du > 0` on [0, 1]); `k_i` by least squares of `I_std` on
 `F_std`. Output: CSV with raw and normalized values, `*_result.yaml` with a
 ready-to-paste `motor_parameters` block (written only if the check passes),
-and a PNG.
+and a PNG. **After the fit, the tool verifies the calibration on the scale
+itself** (§4 online inversion): it requests a few expected thrusts, computes the
+throttle from the live temperature/pressure/voltage (and current), measures the
+actual pull and compares the error (≤ 2 % is a pass; results land in the
+result's `verification` block, `--no-verify` disables).
 
 ```bash
 # real stand, 6S, pilot holds the BOXOFFBOARD switch:
