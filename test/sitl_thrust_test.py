@@ -7,7 +7,8 @@ AUX2, BOXOFFBOARD switch held on), the custom_link_bridge_node, and a
 synthetic bench scale driven by the SITL motor outputs, then runs the
 real thrust_test_node as a subprocess and checks:
 
-  1. host arm + OFFBOARD takeover + motors spin up following the SOP steps
+  1. host arm + OFFBOARD takeover **through the link** (no pilot BOXOFFBOARD switch:
+     the tool's /fpv/offboard -> mode_req drives the takeover) + motors follow the SOP
   2. SOP steps appear in the CSV with increasing force and a monotonic fpv_test.md fit
   3. clean shutdown: FC disarmed, OFFBOARD dropped, exit code 0
 
@@ -173,7 +174,9 @@ def main():
         time.sleep(0.5)
 
         feed = Feed()
-        feed.set_rc(5, 2000)  # AUX2 high: BOXOFFBOARD on (pilot intent)
+        # 不置 BOXOFFBOARD 开关 (AUX2 低): OFFBOARD 由工具经定制链路 mode_req 直接接管,
+        # 验证新版"通讯协议直接进入 OFFBOARD"路径 (固件接受 mode_req 新边沿即接管)。
+        feed.set_rc(5, 1000)  # AUX2 low: no pilot OFFBOARD switch
 
         rclpy.init()
         executor = rclpy.executors.SingleThreadedExecutor()
