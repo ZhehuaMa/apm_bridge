@@ -66,6 +66,7 @@ class FakeBridge(Node):
         self.airsim = airsim
         self.lock = threading.Lock()
         self.armed = False
+        self.offboard = False   # /fpv/offboard 电平 (主机经链路直接接管, 无需飞手开关)
         self.collective = 0.0
         self.last_cmd_time = 0.0
         self.commands = []        # (time, collective, armed_field)
@@ -80,6 +81,7 @@ class FakeBridge(Node):
         self.temp_pub = self.create_publisher(Temperature, '/fpv/temperature_baro', qos)
         self.create_subscription(ControlCommand, '/fpv/control_command_raw', self.on_command, qos)
         self.create_subscription(Bool, '/fpv/arm', self.on_arm, qos)
+        self.create_subscription(Bool, '/fpv/offboard', self.on_offboard, qos)
         self.cli_gets = []
         self.create_service(CliCommand, '/fpv/cli', self.on_cli)
         self.create_timer(0.1, self.publish_state)
@@ -105,12 +107,19 @@ class FakeBridge(Node):
             self.armed = msg.data
             self.arm_calls.append(msg.data)
 
+    def on_offboard(self, msg):
+        with self.lock:
+            self.offboard = msg.data
+
     def publish_state(self):
         msg = State()
         msg.connected = True
         with self.lock:
-            msg.armed = self.armed
-            msg.mode = 'OFFBOARD' if self.armed and time.monotonic() - self.last_cmd_time < 0.5 else 'ACRO'
+            # 真实固件要求控制流新鲜 + OFFBOARD 请求才解锁/接管; 这里同样的语义,
+            # 防止测试把"只是发了 arm 电平"误认为已接管。
+            msg.armed = self.armed and self.offboard
+            msg.mode = ('OFFBOARD' if msg.armed and
+                        time.monotonic() - self.last_cmd_time < 0.5 else 'ACRO')
         self.state_pub.publish(msg)
 
     def plant_state(self):
@@ -241,7 +250,7 @@ def hardware_mode(out_dir, results):
 
 def airsim_mode(out_dir, results):
     print('== AirSim mode (no baro, no sag, no RPM, no current) ==')
-    proc, _, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp', '--offboard'])
+    proc, _, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp'])
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, 'airsim_exit', proc.returncode == 0, f'rc={proc.returncode}')

@@ -30,8 +30,9 @@ AirSim / SITL (无气压、无电压下降、无转速反馈): 传 --no-env-comp
 Ctrl+C 安全关停 (油门回最低、上锁), 已采数据照常输出。
 
 用法 (需系统 python，conda 环境请先 deactivate):
-  ros2 run apm_bridge thrust_test_node --lipo-cells 6                    # 真机, 飞手持 BOXOFFBOARD
-  ros2 run apm_bridge thrust_test_node --offboard --no-env-comp --no-voltage-comp --yes   # AirSim
+  ros2 run apm_bridge thrust_test_node --lipo-cells 6                      # 真机/台架 (默认主机接管 OFFBOARD)
+  ros2 run apm_bridge thrust_test_node --lipo-cells 6 --no-offboard        # 由飞手持 BOXOFFBOARD
+  ros2 run apm_bridge thrust_test_node --no-env-comp --no-voltage-comp --yes   # AirSim (无气压/压降)
 """
 
 from __future__ import annotations
@@ -210,8 +211,10 @@ class ThrustTestNode(Node):
         qos_be10 = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.cmd_pub = self.create_publisher(ControlCommand, '/fpv/control_command_raw', qos_be5)
         self.arm_pub = self.create_publisher(Bool, '/fpv/arm', qos_be10)
+        # OFFBOARD 经通讯协议直接接管: 默认发布 /fpv/offboard; --no-offboard
+        # 退回飞手侧 BOXOFFBOARD 开关授权。
         self.offboard_pub = (self.create_publisher(Bool, '/fpv/offboard', qos_be10)
-                             if args.offboard else None)
+                             if not args.no_offboard else None)
 
         self.create_subscription(State, '/mavros/state', self.on_state, 10)
         self.create_subscription(BatteryState, '/mavros/battery', self.on_battery, qos_be10)
@@ -480,7 +483,9 @@ class ThrustTestNode(Node):
                 self.offboard_pub.publish(Bool(data=True))
             self.arm_pub.publish(Bool(data=True))
             if not self._wait_armed(True, 15.0):
-                raise FatalError('FC did not ARM (is BOXOFFBOARD held, or pass --offboard?)')
+                hint = ('pass --no-offboard and hold BOXOFFBOARD' if args.no_offboard
+                        else 'check the link (host OFFBOARD request not accepted)')
+                raise FatalError(f'FC did not ARM ({hint})')
         except Exception:
             with self.lock:
                 self.testing = False
@@ -651,9 +656,9 @@ def plot_results(result, png_path):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='fpv_test.md bench thrust test + propulsion model fit (custom_link_bridge)')
-    parser.add_argument('--offboard', action='store_true',
-                        help='publish /fpv/offboard to request OFFBOARD from the host (AirSim / '
-                             'pilotless bench); omit when the pilot holds BOXOFFBOARD')
+    parser.add_argument('--no-offboard', action='store_true',
+                        help='do not publish /fpv/offboard; OFFBOARD stays with the pilot '
+                             "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")
     parser.add_argument('--u-start', type=float, default=0.05, help='first throttle duty (§2.2)')
     parser.add_argument('--u-step', type=float, default=0.05, help='throttle duty step (§2.2)')
     parser.add_argument('--u-end', type=float, default=1.00, help='last throttle duty (§2.2, adjustable)')

@@ -8,17 +8,17 @@ thrust_test_node 的轻量版冒烟测试，不需要台秤/气压温度，用�
   油门走 /fpv/control_command_raw，collective_thrust 原样透传 FC，
   不经 motor_parameters 模型换算 (即本工具检查的是链路与电机，
   不是推力模型; 要验模型请跑台架标定);
-  解锁走 /fpv/arm (2 Hz level 重发)，OFFBOARD 由飞手侧 BOXOFFBOARD 开关把关;
-  AirSim / 无遥控台架可传 --offboard, 工具以 2 Hz 发布 /fpv/offboard 请求 OFFBOARD;
-  上锁请求后控制流继续保持 DISARM_STREAM_TIME 秒，让 arm=0 边沿随
-  0x20 帧送达 FC。
+  解锁走 /fpv/arm, OFFBOARD 经通讯协议直接接管: 工具默认以 2 Hz 发布
+  /fpv/offboard, 无需飞手持 BOXOFFBOARD 开关 (固件接受 mode_req 新边沿即接管);
+  --no-offboard 退回飞手侧 BOXOFFBOARD 授权。上锁请求后控制流继续保持
+  DISARM_STREAM_TIME 秒，让 arm=0 边沿随 0x20 帧送达 FC。
 
 安全: 保持期间 FC 意外掉锁立即中止; Ctrl+C 随时安全关停 (油门归零 +
 上锁)。真机检查请先卸桨或将机体可靠固定!
 
 用法 (需系统 python，conda 环境请先 deactivate):
-  ros2 run apm_bridge motor_check_node --thrust 10 --duration 3            # 真机 (飞手持 BOXOFFBOARD)
-  ros2 run apm_bridge motor_check_node --offboard --thrust 10 --duration 3  # AirSim/SITL
+  ros2 run apm_bridge motor_check_node --thrust 10 --duration 3             # 真机/台架 (默认主机接管)
+  ros2 run apm_bridge motor_check_node --thrust 10 --duration 3 --no-offboard  # 由飞手持 BOXOFFBOARD
 """
 
 import argparse
@@ -83,10 +83,10 @@ class MotorCheckNode(Node):
         self.cmd_pub = self.create_publisher(ControlCommand,
                                              '/fpv/control_command_raw', qos_be5)
         self.arm_pub = self.create_publisher(Bool, '/fpv/arm', qos_be10)
-        # --offboard: 主机请求 OFFBOARD (AirSim / 无遥控台架)。真机默认不发,
-        # 由飞手持 BOXOFFBOARD 开关授权。
+        # OFFBOARD 经通讯协议直接接管: 默认发布 /fpv/offboard; --no-offboard
+        # 退回飞手侧 BOXOFFBOARD 开关授权。
         self.offboard_pub = (self.create_publisher(Bool, '/fpv/offboard', qos_be10)
-                             if args.offboard else None)
+                             if not args.no_offboard else None)
 
         # ---- 订阅 ----
         self.create_subscription(State, '/mavros/state', self.on_state, 10)
@@ -185,8 +185,9 @@ class MotorCheckNode(Node):
                 self.offboard_pub.publish(Bool(data=True))
             self.arm_pub.publish(Bool(data=True))
             if not self._wait_armed(True, timeout=15.0):
-                raise FatalError('FC did not ARM (is BOXOFFBOARD held, or pass '
-                                 '--offboard for host OFFBOARD request?)')
+                hint = ('pass --no-offboard and hold BOXOFFBOARD' if args.no_offboard
+                        else 'check the link (host OFFBOARD request not accepted)')
+                raise FatalError(f'FC did not ARM ({hint})')
         except Exception:
             with self.lock:
                 self.testing = False
@@ -287,10 +288,9 @@ def parse_args():
                         help='hold duration [s]')
     parser.add_argument('--rate', type=float, default=50.0,
                         help='control command stream rate [Hz]')
-    parser.add_argument('--offboard', action='store_true',
-                        help='also publish /fpv/offboard at 2 Hz to request OFFBOARD '
-                             'from the host (AirSim / benches without a pilot). '
-                             'Omit on real aircraft where the pilot holds BOXOFFBOARD')
+    parser.add_argument('--no-offboard', action='store_true',
+                        help='do not publish /fpv/offboard; OFFBOARD stays with the pilot '
+                             "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")
     parser.add_argument('--yes', action='store_true',
                         help='skip the Enter confirmation before starting')
     return parser.parse_args()
@@ -357,7 +357,7 @@ def main():
         if not node.state_event.wait(timeout=15.0):
             raise FatalError('no /mavros/state within 15 s -- '
                              'is custom_link_bridge running?')
-        print(f'{bcolors.OKBLUE}custom-link: {"host OFFBOARD via /fpv/offboard" if args.offboard else "pilot must hold the BOXOFFBOARD switch"} '
+        print(f'{bcolors.OKBLUE}custom-link: {"pilot must hold the BOXOFFBOARD switch" if args.no_offboard else "host takes OFFBOARD via the link (/fpv/offboard)"} '
               f'for host arming{bcolors.ENDC}')
         if not confirm_start(args, node.abort_event):
             node.abort_event.set()

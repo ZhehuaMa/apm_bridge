@@ -740,20 +740,21 @@ actual pull and compares the error (≤ 2 % is a pass; results land in the
 result's `verification` block, `--no-verify` disables).
 
 ```bash
-# real stand, 6S, pilot holds the BOXOFFBOARD switch:
+# real stand, 6S, host takes OFFBOARD via the link (the default; use --no-offboard
+# to leave OFFBOARD with a pilot holding the BOXOFFBOARD switch):
 ros2 run apm_bridge scale_reader_node --ros-args -p port:=/dev/ttyUSB0 &
 ros2 run apm_bridge thrust_test_node --lipo-cells 6 --output-dir /tmp
 ```
 
 **AirSim / SITL** — no barometer, voltage sag, RPM or current sensor. Use
 `--no-env-comp --no-voltage-comp` (pairs with `baro_compensation` /
-`voltage_compensation: false` in the node) and `--offboard` to request OFFBOARD
-from the host; missing RPM is recorded as NaN and `R_eq` identification is
+`voltage_compensation: false` in the node); the host takes OFFBOARD through the
+link by default. Missing RPM is recorded as NaN and `R_eq` identification is
 skipped. AirSim thrust is linear in the duty, which the model represents
 exactly (`a1` only).
 
 ```bash
-ros2 run apm_bridge thrust_test_node --offboard --no-env-comp --no-voltage-comp \
+ros2 run apm_bridge thrust_test_node --no-env-comp --no-voltage-comp \
   --yes --output-dir /tmp
 ```
 
