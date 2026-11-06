@@ -128,6 +128,26 @@ def average_window(window, tare_kg, gravity):
             'weight_kg': weight, 'n_weight': len(window['weight'])}
 
 
+def verification_weights(w_kg, gravity, f_max, count=3):
+    """§4 在线反解 + 台秤闭环验证的期望总推力 (N)。
+
+    各取静重推力的 25%/50%/100%, 都相对整机/缆线的静重可分辨 (台秤误差
+    ~10 g·g ≈ 0.1 N), 且不超出标定域 [0, F_std(1)]。静重可分辨性不满足
+    时返回空列表 (验证段安全跳过)。
+    """
+    w = w_kg * gravity
+    levels = [0.25 * i * w for i in range(1, count + 1)]
+    min_resolvable = 0.010 * gravity  # 台秤分辨率 ~10 g
+    # 小于分辨率的档舍去; 超过标定域 F_std(1) 的档舍去 (f_max 不够覆盖 100% 静重时
+    # 至少保留一档, 除非连最低档都越界)。
+    return [f for f in levels if f >= min_resolvable and f <= f_max]
+
+
+def verification_verify_pass(verification, max_rel_error=0.02):
+    """标定验证判定: 每档 |相对误差| <= max_rel_error (2 %, 与 §3 拟合残差同量级)。"""
+    return bool(verification) and all(abs(v['rel']) <= max_rel_error for v in verification)
+
+
 def new_window(u, collective, n_motors=0):
     return {'u': u, 'collective': collective, 'weight': [], 'V': [], 'I': [],
             'rpm': [[] for _ in range(n_motors)], 'P': [], 't': []}
@@ -172,6 +192,9 @@ class ThrustTestNode(Node):
         self.last_weight = float('nan')
         self.last_stable = float('nan')
         self.last_voltage = float('nan')
+        self.last_current = float('nan')
+        self.last_pressure = float('nan')
+        self.last_temperature = float('nan')
         self.tare_samples = None          # 去皮期间收集的稳定重量
         self.window = None                # 当前稳态采样段 (None = 不采集)
         self.quiet = False
@@ -181,6 +204,7 @@ class ThrustTestNode(Node):
         self.points = []
         self.tare_kg = float('nan')
         self.u_idle = float('nan')         # 飞控 motor_idle 占空比 (main 中经 /fpv/cli 读取)
+        self.verification = None           # 标定验证结果列表 (见 verify_with_model)
 
         qos_be5 = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_be10 = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -228,6 +252,7 @@ class ThrustTestNode(Node):
         current = abs(float(msg.current)) if math.isfinite(msg.current) else float('nan')
         with self.lock:
             self.last_voltage = voltage
+            self.last_current = current
             if self.window is not None:
                 self.window['V'].append(voltage)
                 self.window['I'].append(current)
@@ -256,9 +281,13 @@ class ThrustTestNode(Node):
 
     def on_pressure(self, msg):
         if msg.fluid_pressure > 0.0:
+            with self.lock:
+                self.last_pressure = float(msg.fluid_pressure)
             self._append('P', float(msg.fluid_pressure))
 
     def on_temperature(self, msg):
+        with self.lock:
+            self.last_temperature = float(msg.temperature)
         self._append('t', float(msg.temperature))
 
     def on_motor_rpm(self, msg):
@@ -274,10 +303,12 @@ class ThrustTestNode(Node):
     # ---------------------------------------------------------- 定时器
 
     def control_timer_cb(self):
-        """ATTITUDE 模式 + 姿态回显 + 零角速度 + 直通集体油门。"""
+        """默认 BODY_RATES: 零角速度 + 直通集体油门 (raw 通道纯油门直通)。
+
+        --attitude 时改用 ATTITUDE + 姿态回显 (验证段的恒推力不随倾斜掉秤)。"""
         cmd = ControlCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.control_mode = ControlCommand.ATTITUDE
+        cmd.control_mode = ControlCommand.ATTITUDE if self.args.attitude else ControlCommand.BODY_RATES
         with self.lock:
             cmd.armed = self.testing
             cmd.collective_thrust = min(max(self.collective, 0.0), 1.0)
@@ -360,6 +391,69 @@ class ThrustTestNode(Node):
                 if not self.sleep_abortable(duration):
                     return
 
+    def live_inputs(self):
+        """验证段用的最新温度/气压/电压/电流 (NaN = 无/已用 --no-* 关闭)。"""
+        with self.lock:
+            env = 1.0
+            if not self.args.no_env_comp and math.isfinite(self.last_pressure) and \
+                    math.isfinite(self.last_temperature):
+                env = pm.environment_factor(self.last_pressure, self.last_temperature)
+            voltage = self.last_voltage if not self.args.no_voltage_comp else float('nan')
+            current = self.last_current if not self.args.no_voltage_comp else float('nan')
+        return env, voltage, current
+
+    def verify_with_model(self, model, duration):
+        """§4 在线反解 + 台秤闭环验证: 当前温度/气压/电压(和电流)下请求几档期望推力,
+        量实际拉力并与期望对比。返回结果列表, 中途被中止返回 None。
+
+        为使"实测拉力 F_meas = 台秤减静重"恰与期望总推力同口径, 机体须保持静平衡
+        (飞控只受零角速度, 不机动): 使用与标定段一致的控制通道。电缆拉力台秤误差
+        的量级即静重推力分辨率的约束 (见 verification_weights)。"""
+        # §4 反解在标定域 [0, F_std(1)] 内; 静重台秤下的期望推力须满足
+        # |F_meas| >= 10 g·g (分辨) 且 <= F_std(1) (不越界)。
+        f_max = model.thrust(1.0)
+        weights = verification_weights(self.tare_kg, self.args.gravity, f_max)
+        if not weights:
+            print(f'{bcolors.WARNING}verification skipped: static weight {self.tare_kg:.3f} kg '
+                  f'does not resolve 10 g scale steps{bcolors.ENDC}')
+            return []
+        results = []
+        for f_req in weights:
+            # 与标定段同一 SOP 时序: 前 --settle-time 丢弃 (气流/压降瞬态)。在此等待段
+            # 内重采样低通后的电压/电流并迭代油门 (§4 步骤 3 的反馈), 让电机动态
+            # 与母线压降在进入采样段前收敛, 而不是用采前瞬间的读数。
+            env, voltage, current = self.live_inputs()
+            u = model.throttle(f_req, env, voltage, current)
+            collective = self.set_duty(u)
+            settle_end = time.monotonic() + self.args.settle_time
+            while not self.abort_event.is_set() and time.monotonic() < settle_end:
+                env, voltage, current = self.live_inputs()
+                u = model.throttle(f_req, env, voltage, current)
+                collective = self.set_duty(u)
+                time.sleep(0.02)
+            if self.abort_event.is_set():
+                return None  # aborted
+            with self.lock:
+                self.window = new_window(u, collective)
+            ok = self.sleep_abortable(duration)
+            with self.lock:
+                window, self.window = self.window, None
+            if not ok:
+                return None  # aborted mid-step
+            f_meas = average_window(window, self.tare_kg, self.args.gravity)['F']
+            if not math.isfinite(f_meas):
+                print(f'{bcolors.WARNING}F_req={f_req:.3f} N: no scale data, skipped{bcolors.ENDC}')
+                continue
+            err = f_meas - f_req
+            rel = err / f_req
+            results.append({'f_req': f_req, 'f_meas': f_meas, 'u': u, 'env': env,
+                            'voltage': voltage, 'current': current, 'error': err, 'rel': rel})
+            print(f'F_req={f_req:.3f} N -> u={u:.4f} (c={collective:.4f}): '
+                  f'F={f_meas:.3f} N, error {err:+.3f} N ({rel:+.1%})')
+        with self.lock:
+            self.collective = 0.0
+        return results
+
     def record(self, window, duration):
         point = average_window(window, self.tare_kg, self.args.gravity)
         rate = point['n_weight'] / duration
@@ -431,7 +525,9 @@ class ThrustTestNode(Node):
 # 结果输出
 # ======================================================================
 
-def write_outputs(points, args, aborted):
+def write_outputs(node, args, aborted):
+    """CSV + _result.yaml + PNG。node 提供 points/tare/verification。"""
+    points = node.points
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(args.output_dir, exist_ok=True)
     base = os.path.join(args.output_dir, f'thrust_curve_{stamp}')
@@ -484,11 +580,21 @@ def write_outputs(points, args, aborted):
             f.write(f"k_i_A_per_N: {result['k_i']:.6g}\n")
             for w in result['warnings']:
                 f.write(f'# warning: {w}\n')
-            if result['monotonic']:
-                f.write('\n# ---- paste into parameters/custom_link_parameters.yaml ----\n')
-                f.write(render_param_yaml(result, args) + '\n')
-            else:
-                f.write('# NOT MONOTONIC on [0,1]: model rejected (fpv_test.md 3.2), repeat the test\n')
+        verification = node.verification
+        if verification:
+            f.write('verification:  # fpv_test.md §4 runtime check on the bench scale\n')
+            for v in verification:
+                f.write(f"  - {{f_req_N: {v['f_req']:.4f}, f_meas_N: {v['f_meas']:.4f}, "
+                        f"error_N: {v['error']:+.4f}, error_pct: {100 * v['rel']:+.2f}, "
+                        f"u: {v['u']:.6f}, env: {v['env']:.5f}, voltage_V: {v['voltage']:.3f}, "
+                        f"current_A: {v['current']:.3f}}}\n")
+            worst = max(abs(v['rel']) for v in verification)
+            f.write(f'verification_worst_rel_error: {worst:.4f}\n')
+        if result and result['monotonic']:
+            f.write('\n# ---- paste into parameters/custom_link_parameters.yaml ----\n')
+            f.write(render_param_yaml(result, args) + '\n')
+        elif result:
+            f.write('# NOT MONOTONIC on [0,1]: model rejected (fpv_test.md 3.2), repeat the test\n')
         else:
             f.write(f'# fit failed: {error}\n')
     print(f'result YAML written to {yaml_path}')
@@ -568,6 +674,13 @@ def parse_args(argv=None):
     parser.add_argument('--no-voltage-comp', action='store_true',
                         help='skip §3.1 steps 3-4 (no voltage sag, e.g. AirSim; pairs with '
                              'voltage_compensation=false)')
+    parser.add_argument('--attitude', action='store_true',
+                        help='use ATTITUDE + orientation echo instead of the default BODY_RATES '
+                             '(zero rates); verification holds thrust constant while tilted')
+    parser.add_argument('--no-verify', action='store_true',
+                        help='skip the post-fit §4 verification on the scale')
+    parser.add_argument('--verify-sample-time', type=float, default=3.0,
+                        help='settle+average per verification thrust level [s]')
     parser.add_argument('--control-rate', type=float, default=50.0, help='command stream rate [Hz]')
     parser.add_argument('--yes', action='store_true', help='skip the Enter confirmation')
     parser.add_argument('--output-dir', type=str, default='.')
@@ -663,6 +776,20 @@ def main():
             started = True
             node.start_testing()
             node.run_sop(args.timeline)
+            if node.points and not args.no_verify and not node.abort_event.is_set():
+                result = pm.calibrate(node.points, args.lipo_cells * pm.V_REF_PER_CELL,
+                                      voltage_normalization=not args.no_voltage_comp,
+                                      environment_normalization=not args.no_env_comp)
+                if result['monotonic']:
+                    model = pm.PropulsionModel(result['a3'], result['a2'], result['a1'],
+                                               u_idle=args.u_idle, r_eq=result['r_eq'],
+                                               k_i=result['k_i'])
+                    print(f'{bcolors.OKBLUE}verifying the calibration on the scale...{bcolors.ENDC}')
+                    node.verification = node.verify_with_model(model, args.verify_sample_time)
+                    if node.verification is None:
+                        aborted = True
+                else:
+                    print(f'{bcolors.WARNING}verification skipped: fit is not monotonic{bcolors.ENDC}')
     except FatalError as e:
         print(f'{bcolors.ERROR}FATAL: {e}{bcolors.ENDC}')
         exit_code = 1
@@ -676,7 +803,7 @@ def main():
         spin_thread.join(timeout=2.0)
 
     if node.points:
-        _, _, result = write_outputs(node.points, args, aborted)
+        _, _, result = write_outputs(node, args, aborted)
         if result is None or not result['monotonic']:
             exit_code = exit_code or 2
     else:

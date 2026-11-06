@@ -171,6 +171,26 @@ def test_calibrate_warns_below_twenty_points():
     assert any('N >= 20' in w for w in res['warnings'])
 
 
+def test_verification_weights_resolvable_and_bounded():
+    # tare 6 kg (58.84 N) -> 25/50/75% 静重推力, 都在标定域内
+    w = tool.verification_weights(6.0, 9.80665, 200.0)
+    assert w == pytest.approx([14.7101, 29.4202, 44.1299], rel=1e-4)
+    # 标定域上界截断 (F_std(1) = 20 N 只覆盖 25% 档)
+    assert tool.verification_weights(6.0, 9.80665, 20.0) == pytest.approx([14.7101], rel=1e-4)
+    # 太轻的静重连最高档都小于台秤 10 g 分辨率 -> 安全跳过 (0.01 kg: 100% < 0.098 N)
+    assert tool.verification_weights(0.01, 9.80665, 200.0) == []
+    assert tool.verification_verify_pass([{'rel': 0.01}, {'rel': -0.02}])
+    assert not tool.verification_verify_pass([{'rel': 0.03}])
+    assert not tool.verification_verify_pass([])
+
+
+def test_tool_streams_body_rates_by_default():
+    args = tool.parse_args(['--yes'])
+    assert args.attitude is False and args.no_verify is False and args.verify_sample_time > 0.0
+    assert tool.parse_args(['--attitude', '--yes']).attitude is True
+    assert tool.parse_args(['--no-verify', '--yes']).no_verify is True
+
+
 def test_render_param_yaml_is_pasteable():
     import yaml
     args = tool.parse_args(['--yes', '--no-env-comp'])
