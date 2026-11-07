@@ -214,7 +214,7 @@ def wait_until(predicate, observer, timeout, label, allow_flight_error=False):
 
 def run_flight(client, node, output, args):
     report = {"passed": False, "model": args.model, "pitch_hold_deg": args.pitch_hold,
-              "pitch_aim_deg": args.pitch_aim, "requested_aim_pitch_deg": 90 + args.pitch_aim,
+              "pitch_aim_deg": args.pitch_aim, "requested_aim_pitch_deg": -90 + args.pitch_aim,
               "ros_domain_id": args.ros_domain_id,
               "control": "ROS/custom-link only", "physics": "live UE/Cosys-AirSim",
               "los_source": "TargetDrone actor-origin geometric reference, using TargetLosEstimator; not a visual bbox centroid",
@@ -401,7 +401,8 @@ def run_flight(client, node, output, args):
         if not math.isclose(values[7].double_value, args.pitch_aim, abs_tol=1e-5):
             raise RuntimeError("Running pitch_aim differs from the test")
         pitch_min, pitch_max = values[8].double_value, values[9].double_value  # 机械行程(编码器域)
-        effective_aim = 90 + args.pitch_aim if pitch_min == pitch_max else float(np.clip(90 + args.pitch_aim, pitch_min, pitch_max))
+        # ROS 域期望 = -90 + pitch_aim (向上 = -90°); 关节抬头域目标 = 90 - pitch_aim, 钳制到机械行程。
+        effective_aim = 90 - args.pitch_aim if pitch_min == pitch_max else float(np.clip(90 - args.pitch_aim, pitch_min, pitch_max))
         report["effective_aim_pitch_deg"] = effective_aim
         aim_rotation = Rotation.from_rotvec([0, -math.radians(effective_aim), 0])
         if not math.isclose(values[5].double_value, 2) or not math.isclose(values[6].double_value, 9.80665):
@@ -502,8 +503,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", choices=("C20S", "C200T"), default="C20S")
     parser.add_argument("--pitch-hold", type=float, default=10.0)
-    parser.add_argument("--pitch-aim", type=float, default=-90.0,
-                        help="AIM offset (deg, nose-up); -90 keeps the existing ground target visible")
+    parser.add_argument("--pitch-aim", type=float, default=90.0,
+                        help="AIM offset (deg); body-relative pitch is -90 + pitch_aim (ROS FLU, up = -90 deg), "
+                             "so 90 keeps the existing ground target visible (level boresight)")
     parser.add_argument("--ros-domain-id", type=int, default=173,
                         help="isolated DDS domain for this simulation experiment")
     args = parser.parse_args()

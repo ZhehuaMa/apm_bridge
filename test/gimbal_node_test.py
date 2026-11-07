@@ -278,7 +278,7 @@ def test_actual_node_modes_and_los_subscription(tmp_path, monkeypatch):
                 "-p", f"link.tcp_port:={server.getsockname()[1]}",
                 "-p", f"gimbal_port:={os.ttyname(slave)}",
                 "-p", "gimbal.model:=C20S", "-p", "gimbal.pitch_hold:=12.0",
-                "-p", "gimbal.pitch_aim:=-55.0",
+                "-p", "gimbal.pitch_aim:=55.0",
                 # 本用例考察模式选择器/LOS 语义, 关闭启动回中 (专用用例覆盖)
                 "-p", "gimbal.home_on_connect:=false",
                 "-p", "baro_compensation:=false",
@@ -428,7 +428,7 @@ def test_home_on_connect_before_aim(tmp_path, monkeypatch):
                 str(binary), "--ros-args", "-p", "link.transport:=tcp",
                 "-p", f"link.tcp_port:={server.getsockname()[1]}",
                 "-p", f"gimbal_port:={os.ttyname(slave)}",
-                "-p", "gimbal.model:=C20S", "-p", "gimbal.pitch_aim:=-55.0",
+                "-p", "gimbal.model:=C20S", "-p", "gimbal.pitch_aim:=55.0",
                 "-p", "gimbal.home_timeout_s:=4.0",
                 "-p", "baro_compensation:=false",
             ], stdout=log, stderr=subprocess.STDOUT)

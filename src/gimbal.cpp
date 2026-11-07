@@ -121,17 +121,31 @@ double GimbalAxisConfig::constrainDegrees(double angle) const
 
 std::array<double, 3> GimbalConfig::aimTargetDegrees() const
 {
+    // AIM 相对机身俯仰期望 = -90 + pitch_aim (ROS FLU 域: X 轴向 +Z 旋转为负,
+    // 向上 = -90°)。内部抬头正关节域与其反号, 目标 = 90 - pitch_aim, 再钳制
+    // 到机械行程 (同样在抬头正域)。
     if (!std::isfinite(pitch_aim_deg) || std::abs(pitch_aim_deg) > 90)
-        throw std::invalid_argument("gimbal.pitch_aim must be within [-90,90] degrees, positive nose-up");
+        throw std::invalid_argument("gimbal.pitch_aim must be within [-90,90] degrees; "
+                                    "body-relative target is -90 + pitch_aim (ROS FLU, +Z up = -90 deg)");
     const std::array<double, 3> target = {roll.constrainDegrees(0),
-        pitch.constrainDegrees(90.0 + pitch_aim_deg), yaw.constrainDegrees(0)};
+        pitch.constrainDegrees(90.0 - pitch_aim_deg), yaw.constrainDegrees(0)};
     for (double value : target)
         if (std::abs(value) > 327.67)
             throw std::invalid_argument("AIM joint angle exceeds the vendor angle command range");
     return target;
 }
 
-tf2::Quaternion GimbalConfig::constrainMissionOrientation(const tf2::Quaternion &relative) const
+double GimbalConfig::missionJointMinDeg() const
+{
+    return std::max(90.0 - static_cast<double>(pitch_mission_max_deg), static_cast<double>(pitch.min_deg));
+}
+
+double GimbalConfig::missionJointMaxDeg() const
+{
+    return std::min(90.0 - static_cast<double>(pitch_mission_min_deg), static_cast<double>(pitch.max_deg));
+}
+
+tf2::Quaternion GimbalConfig::constrainMissionOrientation(const tf2::Quaternion &relative, bool mission_window) const
 {
     // Physical joint order matches the vendor pose: yaw * roll * pitch.
     // Unlike ZYX, ZXY has no pitch singularity at the new body-Z AIM reference.
@@ -143,10 +157,16 @@ tf2::Quaternion GimbalConfig::constrainMissionOrientation(const tf2::Quaternion 
     const double y = singular ? std::atan2(matrix[1][0], matrix[0][0]) :
         std::atan2(-matrix[0][1], matrix[1][1]);
     const auto wrap = [](double angle) { return std::atan2(std::sin(angle), std::cos(angle)); };
-    const auto limited = [this](double roll_angle, double pitch_angle, double yaw_angle) {
+    const auto limited = [this, mission_window](double roll_angle, double pitch_angle, double yaw_angle) {
         const double deg = 180.0 / M_PI;
+        // mission_window: 俯仰钳到 MISSION 窗口 (抬头正关节域, 已与机械行程取交);
+        // 否则仅机械行程 (HORIZON 回平不受 MISSION 窗口约束)。
+        const double pitch_lo = mission_window ? missionJointMinDeg() : pitch.min_deg;
+        const double pitch_hi = mission_window ? missionJointMaxDeg() : pitch.max_deg;
+        const double pitch_joint = pitch.present ?
+            std::clamp(-pitch_angle * deg, pitch_lo, pitch_hi) : 0.0;
         return apm_bridge::gimbalCameraToWorld(tf2::Quaternion(0, 0, 0, 1),
-            {roll.constrainDegrees(roll_angle * deg) / deg, pitch.constrainDegrees(-pitch_angle * deg) / deg,
+            {roll.constrainDegrees(roll_angle * deg) / deg, pitch_joint / deg,
              yaw.constrainDegrees(-yaw_angle * deg) / deg}, {roll.present, pitch.present, yaw.present});
     };
     const auto first = limited(r, p, y);
@@ -213,8 +233,9 @@ GimbalConfig GimbalConfig::fromParameters(rclcpp::Node &node)
     if (!std::isfinite(cfg.pitch_mission_min_deg) || !std::isfinite(cfg.pitch_mission_max_deg) ||
         cfg.pitch_mission_min_deg >= cfg.pitch_mission_max_deg)
         throw std::invalid_argument("Invalid gimbal MISSION pitch window (min < max required)");
-    if (90.0 + cfg.pitch_mission_min_deg > cfg.pitch.max_deg ||
-        90.0 + cfg.pitch_mission_max_deg < cfg.pitch.min_deg)
+    // ROS 域窗口 [-90+min, -90+max] 取反到抬头正关节域后与机械行程取交,
+    // 不相交 (lo > hi) 时拒绝启动。
+    if (cfg.missionJointMinDeg() > cfg.missionJointMaxDeg())
         throw std::invalid_argument("Gimbal MISSION pitch window does not intersect mechanical travel");
     cfg.aimTargetDegrees();
 
@@ -496,7 +517,8 @@ void GimbalControl::run()
             // AIM: LOCK+真实角速度, P(位置)+FF(载机俯仰速率前馈)。角度通道方案实测
             // 滞后 ~0.15s (固件角度环内轨迹 + 驱动轨迹 8x 误差项), 速率通道台架实测
             // 严格 1:1 即时响应, 滞后降至更新周期量级。目标角 = 机身抬头角 +
-            // 相对角 (90+pitch_aim); 不使用云台 FPV 跟随/uav 融合 (固件无 uav 数据时
+            // 相对角 (-90+pitch_aim, ROS FLU 域; 抬头域即 90-pitch_aim);
+            // 不使用云台 FPV 跟随/uav 融合 (固件无 uav 数据时
             // 不随机身转动, 且约定 send_uav_data 恒 false)。滚转/偏航轴锁定当前姿态。
             ctrl_wk_mode = WK_MODE_LOCK;
             const bool homing = !homing_done.load();
@@ -842,10 +864,10 @@ void GimbalControl::setMode(apm_bridge::GimbalMode requested)
     tracking_on = false;
     const auto previous = mode.exchange(requested);
     if (requested == apm_bridge::GimbalMode::AIM && previous != requested &&
-        std::abs(aim_target_degrees[1] - (90.0 + cfg.pitch_aim_deg)) > 1e-6)
+        std::abs(aim_target_degrees[1] - (90.0 - cfg.pitch_aim_deg)) > 1e-6)
         RCLCPP_WARN(node ? node->get_logger() : rclcpp::get_logger("xfrobot_gimbal"),
-            "AIM requested %.2f deg relative pitch, limited to %.2f deg; body FLU +Z is not reachable with this offset/limit",
-            90.0 + cfg.pitch_aim_deg, aim_target_degrees[1]);
+            "AIM requested %.2f deg body-relative pitch (-90 + pitch_aim), limited to %.2f deg by mechanical travel",
+            -90.0 + cfg.pitch_aim_deg, -aim_target_degrees[1]);
 }
 
 void GimbalControl::updateTargetLos(const apm_bridge::TargetLos &target)
@@ -891,12 +913,11 @@ void GimbalControl::updateMissionControl(double dt)
         // 编码器低头正: 取反到抬头域, 与限位 (FRD 抬头正) 和速度符号同域比较,
         // 否则门控方向相反会把云台推进机械限位 (台架实测)。
         const double angle = -last_response.mtr_angle[encoder[i]] * 0.01;
-        // 俯仰用 MISSION 相对机身窗口 (FLU +Z 为 90°, 基准同 pitch_aim), 夹紧到机械行程;
-        // 滚转/偏航用机械行程。门控只拦朝界外方向, 允许回界内。
-        const double limit_lo = i == 1 ?
-            std::max(90.0 + cfg.pitch_mission_min_deg, (double)cfg.pitch.min_deg) : axes[i].min_deg;
-        const double limit_hi = i == 1 ?
-            std::min(90.0 + cfg.pitch_mission_max_deg, (double)cfg.pitch.max_deg) : axes[i].max_deg;
+        // 俯仰用 MISSION 相对机身窗口 (ROS FLU 域 [-90+min, -90+max], 向上 = -90°,
+        // 取反到抬头域 [90-max, 90-min] 并夹紧到机械行程); 滚转/偏航用机械行程。
+        // 门控只拦朝界外方向, 允许回界内。
+        const double limit_lo = i == 1 ? cfg.missionJointMinDeg() : axes[i].min_deg;
+        const double limit_hi = i == 1 ? cfg.missionJointMaxDeg() : axes[i].max_deg;
         if (!axes[i].present || protection ||
             (limit_lo < limit_hi &&
              ((angle <= limit_lo && speed < 0) || (angle >= limit_hi && speed > 0))))

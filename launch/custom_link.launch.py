@@ -119,7 +119,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'pitch_aim', default_value='',
-            description='Optional AIM offset (deg, nose-up): body-relative target is 90 + pitch_aim, subject to limits; empty keeps YAML.'
+            description='Optional AIM offset (deg): body-relative pitch is -90 + pitch_aim (ROS FLU, +Z up = -90 deg), subject to travel limits; empty keeps YAML.'
         ),
         DeclareLaunchArgument(
             'bind_rx', default_value='', choices=['', 'true', 'false'],

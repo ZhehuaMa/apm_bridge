@@ -10,9 +10,9 @@ custom_link_bridge:
     gimbal:
       mission_on_ground: true
       model: "C20S"
-      pitch_aim: -10.0 # AIM is 80 deg relative to the launcher-mounted body.
-      pitch_mission_min: -70.0
-      pitch_mission_max: 20.0
+      pitch_aim: 10.0 # AIM is -80 deg body-relative pitch (= -90 + pitch_aim, ROS FLU: up = -90 deg).
+      pitch_mission_min: -20.0 # MISSION joint window [-90+min, -90+max] = [-110, -20] deg.
+      pitch_mission_max: 70.0
       pitch_travel_min: -120.0
       pitch_travel_max: 120.0
       pitch_hold: 0.0 # HORIZON alone: positive nose-up, degrees. MISSION centers LOS at zero.
