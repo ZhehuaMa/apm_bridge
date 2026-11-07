@@ -50,6 +50,6 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_name", default_value="0"),
         DeclareLaunchArgument("gimbal_enabled", default_value="true"),
         DeclareLaunchArgument("pitch_aim", default_value="",
-                             description="Optional body-Z AIM pitch offset (deg, nose-up); empty keeps YAML."),
+                             description="Optional AIM offset (deg): body-relative pitch is -90 + pitch_aim (ROS FLU, +Z up = -90 deg), subject to travel limits; empty keeps YAML."),
         OpaqueFunction(function=_launch_node),
     ])
