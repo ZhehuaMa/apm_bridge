@@ -107,7 +107,7 @@ def main():
         if axes is None and pkt is not None:
             cam_pitch = pkt['cam'][1] * 0.01
             joint = -pkt['mtr'][0] * 0.01
-            speed = 8.0 * (80.0 - cam_pitch)  # 驱动 AIM 律: 目标 90+pitch_aim(-10)
+            speed = 8.0 * (80.0 - cam_pitch)  # 驱动 AIM 律: 目标 90-pitch_aim (YAML 10.0 → 80)
             if joint <= -40 or joint >= 110:  # 机械限位门 (YAML travel -40/110)
                 speed = 0.0
             speed = max(-600.0, min(600.0, speed))

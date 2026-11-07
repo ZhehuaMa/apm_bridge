@@ -121,7 +121,7 @@ int main(int argc, char **argv)
         require(capture.last.header.frame_id == "base_link", "发布 frame_id 为 base_link");
     }
 
-    std::printf("== 阶段2: AIM 上视 %.1f deg (12s) ==\n", 90.0 + pitch_aim);
+    std::printf("== 阶段2: AIM 上视 %.1f deg (12s) ==\n", 90.0 - pitch_aim);
     drive(12.0, apm_bridge::GimbalMode::AIM);
     const double p2 = meanPitch(capture, {});
     std::printf("   发布俯仰 = %+.2f deg (期望 <= -80, 抬头)\n", p2);

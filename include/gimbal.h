@@ -154,13 +154,21 @@ struct GimbalConfig
     // HORIZON 回平及 AIM/HORIZON 角度轨迹共用 (合并了原 max_angle_speed 参数)。
     apm_bridge::GimbalTrackingConfig tracking;
 
-    // AIM: camera +X aims toward body FLU +Z, with a nose-up pitch offset.
+    // AIM: camera +X aims toward body FLU +Z. 相对机身俯仰期望为
+    // -90 + pitch_aim (deg, ROS FLU 域: X 轴向 +Z 旋转为负, 向上 = -90°;
+    // 正值 pitch_aim 使瞄准线自 +Z 向机身鼻端回摆)。
     float pitch_aim_deg = 0.0f;
-    // MISSION 相对机身俯仰窗口 (deg, 基准同 pitch_aim: FLU +Z(向上) = 90°):
-    // 跟踪时关节角限制在 [90+pitch_mission_min, 90+pitch_mission_max]。
+    // MISSION 相对机身俯仰窗口 (deg, 基准同 pitch_aim: ROS FLU +Z(向上) = -90°):
+    // 跟踪时关节角 (ROS 域) 限制在 [-90+pitch_mission_min, -90+pitch_mission_max]。
     // 默认 ±1000 = 不额外限制 (退化为机械行程); 窗口须与机械行程相交。
     float pitch_mission_min_deg = -1000.0f;
     float pitch_mission_max_deg = 1000.0f;
+    // MISSION 俯仰窗口换算到抬头正关节域 (ROS 域取反) 并与机械行程取交:
+    // [90-pitch_mission_max, 90-pitch_mission_min] ∩ [pitch.min_deg, pitch.max_deg]。
+    // 默认 ±1000 (不设窗口) 时退化为机械行程本身。真机 updateMissionControl 的
+    // 限位门与 AirSim constrainMissionOrientation(mission_window=true) 共用。
+    double missionJointMinDeg() const;
+    double missionJointMaxDeg() const;
     // AIM 速率跟随环: 位置增益 (1/s), 与机身俯仰速率前馈 (增益 1) 配合,
     // 目标角误差 → LOCK+真实角速度指令。台架实测滞后 ~0.05s (角度环方案 ~0.15s)。
     float aim_follow_gain = 8.0f;
@@ -213,7 +221,9 @@ struct GimbalConfig
      */
     static GimbalConfig fromParameters(rclcpp::Node &node);
     std::array<double, 3> aimTargetDegrees() const;
-    tf2::Quaternion constrainMissionOrientation(const tf2::Quaternion &relative) const;
+    // relative: 机身系下的期望相机姿态。mission_window=true 时俯仰额外钳制到
+    // MISSION 窗口 (HORIZON 复位回平/极性分支判定不受窗口约束, 保持 false)。
+    tf2::Quaternion constrainMissionOrientation(const tf2::Quaternion &relative, bool mission_window = false) const;
 };
 
 /**

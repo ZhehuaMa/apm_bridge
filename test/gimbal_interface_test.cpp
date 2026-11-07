@@ -176,12 +176,13 @@ namespace
         require(rejected, "obsolete fixed_pitch was silently ignored");
 
         options.parameter_overrides({rclcpp::Parameter("gimbal.model", "C20S"),
-                                     rclcpp::Parameter("gimbal.pitch_aim", -55.0),
+                                     rclcpp::Parameter("gimbal.pitch_aim", 55.0),
                                      rclcpp::Parameter("gimbal.pitch_hold", 18.0)});
         auto hardware = std::make_shared<rclcpp::Node>("gimbal_shared_pitch_test", options);
         const auto config = xfrobot::GimbalConfig::fromParameters(*hardware);
         require(config.pitch_hold_deg == 18.0f, "shared pitch_hold changed the hardware control target");
-        require(config.pitch_aim_deg == -55.0f && config.aimTargetDegrees()[1] == 35.0,
+        // ROS 域期望 -90+55 = -35° (上仰 35°); 抬头域目标 90-55 = 35° (未触限位)。
+        require(config.pitch_aim_deg == 55.0f && config.aimTargetDegrees()[1] == 35.0,
                 "pitch_aim was coupled to HORIZON pitch_hold");
         require(hardware->has_parameter("gimbal.pitch_hold") && !hardware->has_parameter("gimbal.fixed_pitch"),
                 "hardware declared more than one pitch parameter");
@@ -203,9 +204,10 @@ namespace
                 const auto aim = config.aimTargetDegrees();
                 const auto desired = fromPitch(aim[1]);
                 const auto forward = tf2::quatRotate(desired, tf2::Vector3(1, 0, 0));
-                require(std::abs(forward.x() + std::sin(offset * M_PI / 180.0)) < 1e-8 &&
+                // ROS 域期望 = -90+offset: 正 offset 使瞄准线自 +Z 向鼻端 (+X) 回摆。
+                require(std::abs(forward.x() - std::sin(offset * M_PI / 180.0)) < 1e-8 &&
                         std::abs(forward.z() - std::cos(offset * M_PI / 180.0)) < 1e-8,
-                        "AIM does not reference body FLU +Z with a nose-up offset");
+                        "AIM does not reference body FLU +Z with a pitch_aim offset");
                 require(std::abs(desired.dot(config.constrainMissionOrientation(desired))) > .999999,
                         "joint-limit decomposition flipped the camera at 90-degree pitch");
             }
@@ -439,7 +441,7 @@ namespace
                     std::abs(msg.angular_velocity.z - 30 * radians) < 1e-5,
                     "C20S pitch/roll/yaw feedback order or FRD signs");
         }
-        imu.orientation = tf2::toMsg(tf2::Quaternion(0, 0, 0, 1)); // AIM 目标角回 75° (水平机身)
+        imu.orientation = tf2::toMsg(tf2::Quaternion(0, 0, 0, 1)); // AIM 目标角回 105° (水平机身, 90-(-15))
         drive(1500);
         require(simulator.control.gbc[1].op_type == 2 && simulator.control.gbc[1].op_value == 1400,
                 "C20S AIM rate did not saturate toward the corrected pitch target");
@@ -477,7 +479,7 @@ namespace
         auto config = xfrobot::GimbalConfig::defaultsFor(xfrobot::GimbalModel::C20S);
         config.pitch.min_deg = -120;
         config.pitch.max_deg = 120;
-        config.pitch_aim_deg = -10;
+        config.pitch_aim_deg = 10; // 抬头域目标 90-10 = 80°
         config.tracking.max_rate_dps = 140;
         config.tracking.max_accel_dps2 = 600;
         xfrobot::GimbalControl gimbal(simulator.pty.port, config);
@@ -542,8 +544,9 @@ namespace
         auto config = xfrobot::GimbalConfig::defaultsFor(xfrobot::GimbalModel::C20S);
         config.pitch.min_deg = -120;
         config.pitch.max_deg = 120;
-        config.pitch_mission_min_deg = -40; // 窗口 [50, 70] (FLU +Z 为 90°)
-        config.pitch_mission_max_deg = -20;
+        // ROS 域窗口 [-90+20, -90+40] = [-70°, -50°] => 抬头域关节窗口 [50, 70]。
+        config.pitch_mission_min_deg = 20;
+        config.pitch_mission_max_deg = 40;
         xfrobot::GimbalControl gimbal(simulator.pty.port, config);
         gimbal.setMode(apm_bridge::GimbalMode::MISSION);
         gimbal.start();
@@ -568,7 +571,7 @@ namespace
         drive(500, 70, -0.2);
         require(simulator.control.gbc[1].op_value == 0, "upper mission bound blocks outward motion");
         gimbal.stop();
-        std::cout << "PASS: MISSION pitch window gates at 90+min/max, inward allowed\n";
+        std::cout << "PASS: MISSION pitch window gates at 90-min/max (joint domain), inward allowed\n";
     }
 
     void serialReconnect()
@@ -1003,7 +1006,7 @@ namespace
                                      rclcpp::Parameter("airsim.port", static_cast<int64_t>(server.port())),
                                      rclcpp::Parameter("gimbal.model", "C20S"),
                                      rclcpp::Parameter("gimbal.pitch_travel_max", 120.0),
-                                     rclcpp::Parameter("gimbal.pitch_aim", -10.0),
+                                     rclcpp::Parameter("gimbal.pitch_aim", 10.0),
                                      rclcpp::Parameter("gimbal.tracking_max_rate", 140.0),
                                      rclcpp::Parameter("gimbal.tracking_max_accel", 600.0)});
         auto node = std::make_shared<rclcpp::Node>("airsim_transition_rates_test", options);
@@ -1138,9 +1141,9 @@ namespace
         std::this_thread::sleep_for(std::chrono::milliseconds(1800));
         {
             std::lock_guard<std::mutex> lock(rpc_mutex);
-            const tf2::Quaternion desired(tf2::Vector3(0, 1, 0), 100 * M_PI / 180);
+            const tf2::Quaternion desired(tf2::Vector3(0, 1, 0), 80 * M_PI / 180);
             require(writes > 3 && std::abs(camera_relative.dot(desired)) > .999999,
-                    "AirSim AIM did not preserve body +Z plus pitch_aim beyond 90 degrees");
+                    "AirSim AIM did not reach the body-relative pitch target (90 - pitch_aim)");
         }
         tf2::Quaternion camera_enu;
         tf2::fromMsg(capture.last().orientation, camera_enu);
@@ -1232,7 +1235,7 @@ namespace
                                          rclcpp::Parameter("airsim.port", static_cast<int64_t>(server.port())),
                                          rclcpp::Parameter("airsim.vehicle_name", "TestVehicle"),
                                          rclcpp::Parameter("gimbal.model", "C20S"),
-                                         rclcpp::Parameter("gimbal.pitch_aim", joint_pitch - 90),
+                                         rclcpp::Parameter("gimbal.pitch_aim", 90 - joint_pitch),
                                          rclcpp::Parameter("gimbal.pitch_travel_max", 120.0)});
             auto mixed_node = std::make_shared<rclcpp::Node>("gimbal_c20s_reconstruction_test", options);
             mixed_node->declare_parameter<bool>("airsim.enabled", false);

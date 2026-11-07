@@ -126,10 +126,10 @@ namespace custom_link_bridge
         {
             const auto previous = mode_.exchange(mode);
             if (mode == apm_bridge::GimbalMode::AIM && previous != mode &&
-                std::abs(aim_target_degrees_[1] - (90.0 + cfg_.pitch_aim_deg)) > 1e-6)
+                std::abs(aim_target_degrees_[1] - (90.0 - cfg_.pitch_aim_deg)) > 1e-6)
                 RCLCPP_WARN(node_.get_logger(),
-                    "AIM requested %.2f deg relative pitch, limited to %.2f deg; body FLU +Z is not reachable with this offset/limit",
-                    90.0 + cfg_.pitch_aim_deg, aim_target_degrees_[1]);
+                    "AIM requested %.2f deg body-relative pitch (-90 + pitch_aim), limited to %.2f deg by mechanical travel",
+                    -90.0 + cfg_.pitch_aim_deg, -aim_target_degrees_[1]);
         }
         void updateTargetLos(const apm_bridge::TargetLos &target) { tracking_.update(target); }
 
@@ -261,7 +261,9 @@ namespace custom_link_bridge
                     }
                     if (mode == apm_bridge::GimbalMode::MISSION)
                     {
-                        relative = cfg_.constrainMissionOrientation(relative);
+                        // MISSION: 俯仰额外钳制到相对机身窗口 (ROS 域 [-90+min,
+                        // -90+max], 向上 = -90°; 抬头域 [90-max, 90-min] ∩ 行程)。
+                        relative = cfg_.constrainMissionOrientation(relative, true);
                     }
                     else if (mode == apm_bridge::GimbalMode::HORIZON)
                         relative = cfg_.constrainMissionOrientation(relative);
@@ -294,7 +296,13 @@ namespace custom_link_bridge
                     const xfrobot::GimbalAxisConfig limits[3] = {cfg_.roll, cfg_.pitch, cfg_.yaw};
                     for (size_t i = 0; i < target_joints.size(); ++i)
                     {
-                        trajectory.constrain(i, limits[i].min_deg, limits[i].max_deg);
+                        // MISSION 俯仰轨迹同样受窗口+行程约束 (与 constrainMission
+                        // 一致), 其余模式仅机械行程。
+                        const double lo = mode == apm_bridge::GimbalMode::MISSION && i == 1 ?
+                            cfg_.missionJointMinDeg() : limits[i].min_deg;
+                        const double hi = mode == apm_bridge::GimbalMode::MISSION && i == 1 ?
+                            cfg_.missionJointMaxDeg() : limits[i].max_deg;
+                        trajectory.constrain(i, lo, hi);
                         target_joints[i] = trajectory.positions()[i] * M_PI / 180;
                     }
                     relative = apm_bridge::gimbalCameraToWorld(tf2::Quaternion(0, 0, 0, 1), target_joints, axes);

@@ -82,8 +82,10 @@ custom_link_bridge:
       # 共用俯仰角 (deg)：捷联仍为机身固定角 (FLU 正值低头)。
       # 真机/AirSim 增稳云台正值抬头，仅 HORIZON 使用；MISSION 以画面中心为目标。
       pitch_hold: 0.0
-      # AIM 相对机身俯仰期望为 90 + pitch_aim (deg)，对齐 ROS FLU +Z（向上）。
-      pitch_aim: -10.0
+      # AIM 相对机身俯仰期望为 -90 + pitch_aim (deg, ROS FLU 域: X 轴向 +Z 旋转
+      # 为负, 向上 = -90°, 即对齐 ROS FLU +Z)。正值使瞄准线自 +Z 向鼻端回摆;
+      # 10.0 => -80° (上仰 80°)。
+      pitch_aim: 10.0
       tracking_gain: 2.0
       tracking_max_rate: 600.0 # deg/s，每轴统一角速度上限。
       tracking_max_accel: 900.0 # deg/s^2.
@@ -99,12 +101,12 @@ custom_link_bridge:
       pitch_travel_max: 110.0
       # yaw_travel_min: 0.0
       # yaw_travel_max: 0.0
-      # ---- MISSION 相对机身俯仰窗口 (deg, 基准同 pitch_aim: FLU +Z 向上 = 90°) ----
-      # 跟踪中关节角限制在 [90+pitch_mission_min, 90+pitch_mission_max] 内,
+      # ---- MISSION 相对机身俯仰窗口 (deg, 基准同 pitch_aim: ROS FLU +Z 向上 = -90°) ----
+      # 跟踪中关节角限制在 [-90+pitch_mission_min, -90+pitch_mission_max] 内,
       # 超界只拦朝外方向 (允许回界)。默认不设 = 机械行程全范围; 须与机械行程相交。
-      # 例: min=-45/max=10 => 关节角 ∈ [45°, 100°] (上视为主, 略过顶)。
-      pitch_mission_min: -70.0
-      pitch_mission_max: 20.0
+      # 例: min=-20/max=70 => 关节角 ∈ [-110°, -20°] (上视为主, 略过顶)。
+      pitch_mission_min: -20.0
+      pitch_mission_max: 70.0
       # pitch_roll_speed_scale: 12.0
       # yaw_speed_scale: 10.0
       # ---- C-20S HORIZON 单轴俯仰逻辑 ----

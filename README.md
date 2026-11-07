@@ -202,7 +202,7 @@ mode is published on `/fpv/gimbal_mode` (`std_msgs/msg/String`, transient-local)
 | Mode | Selection | Actuated camera behavior |
 | --- | --- | --- |
 | HOMING | First connection of the serial gimbal when `gimbal.home_on_connect` is true (default) | FPV + angle 0 (encoder zero = mechanical zero, bench-verified `mtr = -op`) with `fl_sens=15`; all axes are driven to encoder zero before any mode control runs. Ends when every present axis is within `gimbal.home_tolerance_deg` of zero or after `gimbal.home_timeout_s` (warning, mode control resumes). Once per node lifetime. |
-| AIM | Disarmed/startup, manual aiming before a mission, or a new tracker `ON` | Vendor command 4, FPV angle control; camera +X aims toward body ROS FLU +Z (up), offset by `pitch_aim`, within joint limits. |
+| AIM | Disarmed/startup, manual aiming before a mission, or a new tracker `ON` | Vendor command 4, FPV angle control; camera +X aims toward body ROS FLU +Z (up), offset by `pitch_aim` (body-relative pitch `-90 + pitch_aim`, up = -90 deg), within joint limits. |
 | MISSION | `/fpv/mission_state=true` and FC OFFBOARD authorized | Center LOS pitch/yaw at zero using external feedback + compensated rate feedforward; command 4, LOCK + REAL_SPEED, with mechanical limits. |
 | HORIZON | Mission exit, tracker `OFF`, API manual request, or pilot takeover while airborne | Keep heading aligned with the body and pitch at `pitch_hold` above horizontal. Stabilize roll on models that have a roll motor. |
 
@@ -225,27 +225,43 @@ zero and holds the current stabilized orientation. Missing/invalid/stale LOS is
 logged. Real hardware also stops MISSION rates and suppresses camera pose
 publication after 200 ms without valid gimbal feedback.
 
-For **both actuated backends**, `gimbal.pitch_aim` and `gimbal.pitch_hold` are
-startup settings in degrees, **positive nose-up**:
+For **both actuated backends**, `gimbal.pitch_hold` stays **positive nose-up**
+(degrees above horizontal, HORIZON only). `gimbal.pitch_aim` (and the MISSION
+window below) uses the **ROS FLU relative-pitch convention**: rotating the body
++X axis toward +Z is negative, so body FLU +Z (up) is **-90 deg**:
 
-- AIM requests body-relative pitch **`90 + pitch_aim`**. At offset zero, camera
-  +X is parallel to body FLU +Z (up); a positive offset tilts beyond +Z toward
-  the body's rear. It follows body motion and does not use `pitch_hold`.
+- AIM requests body-relative pitch **`-90 + pitch_aim`**. At offset zero, camera
+  +X is parallel to body FLU +Z (up); a positive offset tips the boresight back
+  from +Z toward the body nose (e.g. `pitch_aim=10` -> -80 deg = 80 deg up). It
+  follows body motion and does not use `pitch_hold`.
 - MISSION always requests **zero pitch/yaw LOS error**, independent of both
-  offsets. Travel limits can prevent full centering; unavailable axes are not
-  commanded, and hardware rates cannot push farther outward at a limit.
+  offsets. During tracking the pitch joint is additionally bounded by the
+  body-relative window **`[-90+pitch_mission_min, -90+pitch_mission_max]`**
+  (same ROS FLU reference), intersected with mechanical travel. Travel limits
+  can prevent full centering; unavailable axes are not commanded, and hardware
+  rates cannot push farther outward at a bound.
 - HORIZON alone uses `pitch_hold`, relative to horizontal, exactly as before.
 
+Mechanical pitch travel uses positive nose-up joint angles, opposite in sign
+to ROS FLU relative pitch.
+
 The class defaults use pitch travel **[-135,+40] degrees** and `pitch_aim=0`.
-Without YAML overrides, AIM is limited to +40 degrees and logs a warning.
+Without YAML overrides, AIM requests ROS pitch -90 degrees (straight up),
+but travel limits restrict it to +40 degrees in joint coordinates
+(ROS pitch -40 degrees), and a warning is logged.
+
 The hardware YAML sets pitch travel to **[-40,+110] degrees**; the SITL YAML
-sets it to **[-120,+120] degrees**. Both set `pitch_aim=-10`, so both request
-AIM at **+80 degrees** relative to the body.
+sets it to **[-120,+120] degrees**. Both set `pitch_aim=10`, so both request
+AIM at **-80 degrees ROS pitch**, equivalent to **80 degrees nose-up**.
+
 Do not enlarge real mechanical limits without checking the device/drawing.
-`pitch_aim=-90` requests the former body-forward AIM direction.
-For exact +Z alignment in AirSim, use a simulation-only config with
-`gimbal.pitch_travel_max>=90` and `gimbal.pitch_aim=0`. Equal min/max disables
-that axis limit.
+`pitch_aim=50` requests ROS pitch -40 degrees (40 degrees nose-up).
+`pitch_aim=90` requests the former body-forward AIM direction.
+
+For exact +Z alignment in AirSim, use a simulation-only configuration with
+`gimbal.pitch_aim=0` and mechanical pitch travel that includes +90 degrees
+in joint coordinates, such as `gimbal.pitch_travel_max=120`.
+Equal minimum and maximum travel values disable that axis's travel limit.
 
 AirSim AIM uses the explicit joint angles without folding pitch into ZYX's
 [-90,+90] branch. MISSION constraints use the vendor's yaw-roll-pitch joint order
@@ -870,9 +886,9 @@ AirSim ground-truth APIs were used solely for independent observation.
 The measurements below predate the body-+Z AIM / zero-centered MISSION revision:
 they tested the former body-forward AIM and MISSION `pitch_hold` image offset.
 They are retained as historical evidence, not claimed as live validation of the
-revised defaults. The script now verifies the limited `90 + pitch_aim` AIM
-reference and zero-centered MISSION; its `--pitch-aim` defaults to **-90**
-explicitly so the existing ground target remains visible. For zero-offset
+revised defaults. The script now verifies the limited `-90 + pitch_aim` AIM
+reference and zero-centered MISSION; its `--pitch-aim` defaults to **90**
+explicitly so the existing ground target remains visible (level boresight). For zero-offset
 upward AIM, supply an airborne/visible target; the script will not fabricate LOS
 for a target behind the camera.
 
