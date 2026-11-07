@@ -20,7 +20,7 @@ namespace custom_link
         constexpr uint8_t kSync1 = 0xEB;
         constexpr uint8_t kSync2 = 0x90;
         constexpr uint8_t kFrameOverhead = 7;                       // sync(2)+id+len+seq+crc(2)
-        constexpr uint8_t kMaxPayload = 64;
+        constexpr uint8_t kMaxPayload = 80;
         constexpr uint8_t kFrameMax = kFrameOverhead + kMaxPayload;
 
         enum MsgId : uint8_t
@@ -43,10 +43,11 @@ namespace custom_link
             uint32_t ts_us;            // FC micros() 时间戳
             int16_t gyro[3];           // 0.1 deg/s, body FLU: x forward, y left, z up
             int16_t acc[3];            // 1 mg
-            int16_t attitude[3];       // roll/pitch/yaw, 0.01 deg，固件原生欧拉角，
-                                       // 即 FLU 右手系 (REP-103)：roll 右滚为正、
-                                       // pitch 低头为正；yaw 为右手数学角（绕 +Z
-                                       // 逆时针为正，0=磁北，±180° 折返）
+            int16_t quat[4];           // 姿态四元数 w,x,y,z，各 ×16384。旋转
+                                       // body-FLU -> world-ENU（固件端已做 +pi/2
+                                       // 参考旋转），可直通发布为 Imu orientation；
+                                       // ±90° 俯仰（垂直发射/过顶）连续无奇异性。
+                                       // 水平朝北 = (11585,0,0,11585)
         };
 
         struct PayloadMedium
@@ -94,11 +95,11 @@ namespace custom_link
             uint16_t origin_id;
             int32_t position_cm[3];     // ENU, ARM origin
             int16_t velocity_cms[3];    // ENU
-            int16_t attitude_cdeg[3];   // same FLU/North-yaw convention as 0x10
+            int16_t quat[4];            // 姿态四元数，与 0x10 同约定（FLU->ENU, ×16384）
             int16_t gyro_dps_x10[3];    // FLU body
             float position_variance[3]; // m^2, ENU diagonal
             float velocity_variance[3]; // (m/s)^2, ENU diagonal
-            int16_t arm_yaw_cdeg;       // ARM yaw, same North-yaw convention as attitude_cdeg
+            int16_t arm_yaw_cdeg;       // ARM 朝向快照，CCW from North（航向，非姿态）
         };
 
         struct PayloadEscTelemetry
@@ -130,7 +131,7 @@ namespace custom_link
             uint16_t req_id;           // 回显在响应中，用于配对
             uint8_t cmd;               // CLI_CMD_*
             uint8_t reserved;          // 必须为 0
-            char args[60];             // NUL 结尾：GET/INFO 设置名，SET "name = value"
+            char args[76];             // NUL 结尾：GET/INFO 设置名，SET "name = value"
         };
 
         struct PayloadCliResp
@@ -140,19 +141,19 @@ namespace custom_link
             uint16_t offset;           // data[0] 在完整文本中的偏移
             uint8_t status;            // CLI_STATUS_*
             uint8_t flags;             // CLI_FLAG_MORE：后续还有分块
-            char data[56];
+            char data[72];
         };
 #pragma pack(pop)
 
-        static_assert(sizeof(PayloadFast) == 22, "fast payload size");
+        static_assert(sizeof(PayloadFast) == 24, "fast payload size");
         static_assert(sizeof(PayloadMedium) == 47, "medium payload size");
         static_assert(sizeof(PayloadSlow) == 36, "slow payload size");
         static_assert(sizeof(PayloadControl) == 20, "control payload size");
-        static_assert(sizeof(PayloadOdometry) == 64, "odometry payload size");
+        static_assert(sizeof(PayloadOdometry) == 66, "odometry payload size");
         static_assert(sizeof(PayloadTimesyncReq) == 8, "timesync req size");
         static_assert(sizeof(PayloadTimesyncResp) == 16, "timesync resp size");
-        static_assert(sizeof(PayloadCliReq) == 64, "cli req size");
-        static_assert(sizeof(PayloadCliResp) == 64, "cli resp size");
+        static_assert(sizeof(PayloadCliReq) == 80, "cli req size");
+        static_assert(sizeof(PayloadCliResp) == 80, "cli resp size");
         static_assert(sizeof(PayloadEscTelemetry) == 22, "esc telemetry payload size");
 
         constexpr uint8_t CLI_CMD_GET = 0;    // args = 设置名 -> "name = value"
@@ -164,8 +165,8 @@ namespace custom_link
         constexpr uint8_t CLI_STATUS_OK = 0;
         constexpr uint8_t CLI_STATUS_ERR = 1; // data 为错误文本
         constexpr uint8_t CLI_FLAG_MORE = 0x01;
-        constexpr uint8_t CLI_MAX_ARGS = 60;  // args 域字节上限（含 NUL）
-        constexpr uint8_t CLI_MAX_DATA = 56;  // 响应分块数据上限
+        constexpr uint8_t CLI_MAX_ARGS = 76;  // args 域字节上限（含 NUL）
+        constexpr uint8_t CLI_MAX_DATA = 72;  // 响应分块数据上限
 
         constexpr uint16_t STATUS_ARMED = 0x0001;
         constexpr uint16_t STATUS_FAILSAFE = 0x0002;
