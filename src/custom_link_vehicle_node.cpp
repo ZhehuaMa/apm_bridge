@@ -509,15 +509,16 @@ CustomLinkVehicleNode::~CustomLinkVehicleNode()
 
 void CustomLinkVehicleNode::handleFast(const custom_link::protocol::PayloadFast &p, int64_t hostUs)
 {
-    // Betaflight 原生传感器/姿态与 ROS FLU 完全同轴同号，全部直通即可
+    // Betaflight 原生传感器与 ROS FLU 完全同轴同号，全部直通
     //（SITL 刚体闭环实证 src/test/sitl/sitl_custom_link_frames_test.py，
     // 固件三源互证 mavlink.c/sitl_gyro.h/pid.c pidLevel）：
     //   acc   = FLU（x 前、y 左、z 上，水平 z=+1g）
     //   gyro  = FLU 角速度（roll 右滚+、pitch 低头+ 即 FLU +y、yaw 逆时针+）
-    //   姿态  = FLU 代数 RPY（roll 右滚+、pitch 低头+），yaw 右手系数学角
-    //（逆时针+，0=磁北）。tf2 setRPY 即标准 ZYX 代数，pitch 参数同为低头正。
-    // 此前代码误将 BF 当作左手系而取反 gyro/acc 的 y 与上行 pitch/yaw 速率，
-    // 导致闭环 pitch 发散（真机 OFFBOARD 失控根因）。
+    //   姿态  = 四元数 w,x,y,z ×16384，FLU 体 -> ENU 世（固件端已完成
+    //           +pi/2 参考旋转），解码归一化后直通发布为 Imu orientation。
+    //           四元数在 ±90° 俯仰（垂直发射/过顶）连续；旧欧拉传输在该处
+    //           折返（pitch 变号、roll 翻 180°）——2026-11 姿态符号偶发
+    //           反向的根因，协议已彻底移除欧拉姿态。
     const double ax = p.acc[0] * 0.001 * gravity;
     const double ay = p.acc[1] * 0.001 * gravity;
     const double az = p.acc[2] * 0.001 * gravity;
@@ -525,15 +526,32 @@ void CustomLinkVehicleNode::handleFast(const custom_link::protocol::PayloadFast 
     const double gy = p.gyro[1] * 0.1 * kDegToRad;
     const double gz = p.gyro[2] * 0.1 * kDegToRad;
 
+    // CRC 之后仍做一次廉价的四元数健全性检查（非有限/范数偏离即拒帧，
+    // 保留上一帧姿态）。×16384 量化误差 ~1e-4，0.1 门限极宽松。
+    std::array<double, 4> q;
+    double norm2 = 0.0;
+    bool finite = true;
+    for (int i = 0; i < 4; ++i)
+    {
+        q[i] = p.quat[i] / 16384.0;
+        finite = finite && std::isfinite(q[i]);
+        norm2 += q[i] * q[i];
+    }
+    if (!finite || std::fabs(norm2 - 1.0) > 0.1)
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Invalid custom-link attitude quaternion (norm2=%.4f)", norm2);
+        return;
+    }
+    const double inv_norm = 1.0 / std::sqrt(norm2);
+    for (double &v : q)
+        v *= inv_norm;
+
     {
         std::lock_guard<std::mutex> lk(mtx_att);
         accel_flu = {ax, ay, az};
         gyro_flu = {gx, gy, gz};
-        // 姿态直通；yaw 仅做参考角旋转："0=磁北" → ENU 数学角 (0=东)：
-        // yaw_enu = yaw + pi/2。
-        roll_flu = p.attitude[0] * 0.01 * kDegToRad;
-        pitch_flu = p.attitude[1] * 0.01 * kDegToRad;
-        yaw_enu = normalizeAngle(p.attitude[2] * 0.01 * kDegToRad + M_PI_2);
+        quat_flu_enu = q;   // [w, x, y, z]，FLU->ENU，已归一化
         att_valid = true;
     }
     publishImu(hostUs);
@@ -547,7 +565,8 @@ void CustomLinkVehicleNode::publishImu(int64_t hostUs)
         std::lock_guard<std::mutex> lk(mtx_att);
         if (!att_valid)
             return;
-        q.setRPY(roll_flu, pitch_flu, yaw_enu);
+        // tf2 构造参数序为 (x, y, z, w)；内部缓存为 [w, x, y, z]
+        q = tf2::Quaternion(quat_flu_enu[1], quat_flu_enu[2], quat_flu_enu[3], quat_flu_enu[0]);
         msg.angular_velocity.x = gyro_flu[0];
         msg.angular_velocity.y = gyro_flu[1];
         msg.angular_velocity.z = gyro_flu[2];
@@ -825,10 +844,21 @@ void CustomLinkVehicleNode::handleOdometry(const custom_link::protocol::PayloadO
     msg.pose.pose.position.x = position.x();
     msg.pose.pose.position.y = position.y();
     msg.pose.pose.position.z = position.z();
-    tf2::Quaternion q;
-    q.setRPY(p.attitude_cdeg[0] * 0.01 * kDegToRad,
-             p.attitude_cdeg[1] * 0.01 * kDegToRad,
-             normalizeAngle(p.attitude_cdeg[2] * 0.01 * kDegToRad + M_PI_2));
+    // 姿态四元数：0x14 与 0x10 同约定（w,x,y,z ×16384，FLU->ENU），
+    // 解码归一化后直用，无任何参考旋转/符号变换
+    tf2::Quaternion q(p.quat[1] / 16384.0, p.quat[2] / 16384.0,
+                      p.quat[3] / 16384.0, p.quat[0] / 16384.0);   // (x, y, z, w)
+    {
+        const double n = std::sqrt(q.x() * q.x() + q.y() * q.y() +
+                                   q.z() * q.z() + q.w() * q.w());
+        if (!std::isfinite(n) || std::fabs(n - 1.0) > 0.1)
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                 "Ignoring odometry with invalid attitude quaternion");
+            return;
+        }
+        q = tf2::Quaternion(q.x() / n, q.y() / n, q.z() / n, q.w() / n);
+    }
     msg.pose.pose.orientation = tf2::toMsg(arm_heading.inverse() * q);
     // Twist stays in body FLU; only the pose frame changes from ENU to ARM heading.
     const tf2::Matrix3x3 world_to_body(q.inverse());

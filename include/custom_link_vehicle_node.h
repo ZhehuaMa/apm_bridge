@@ -227,7 +227,8 @@ namespace custom_link_bridge
 
         // 姿态/IMU 快照（0x10 读取线程写，本线程发布）
         std::mutex mtx_att;
-        double roll_flu = 0.0, pitch_flu = 0.0, yaw_enu = 0.0;
+        // 姿态四元数 w,x,y,z（FLU->ENU，已归一化），0x10 直通解码
+        std::array<double, 4> quat_flu_enu{{1.0, 0.0, 0.0, 0.0}};
         std::array<double, 3> gyro_flu{{0.0, 0.0, 0.0}};
         std::array<double, 3> accel_flu{{0.0, 0.0, 0.0}};
         bool att_valid = false;
