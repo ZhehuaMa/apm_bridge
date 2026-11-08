@@ -192,6 +192,21 @@ namespace custom_link_bridge
                     const auto info = response.get().as<ObjectMap>();
                     const auto pose = info.at("pose").as<ObjectMap>();
                     tf2::Quaternion enu = nedToEnu(readQuaternion(pose));
+                    // Measured camera attitude as reported by the simulator. The published
+                    // /fpv/gimbal orientation and the angular-velocity finite differencing use
+                    // THIS value: it is the best available truth of where the camera actually
+                    // points. (On hardware the equivalent estimate is body attitude composed
+                    // with the encoder joint angles — also the ACTUAL mount state, not a
+                    // projection of it.) Projecting the measured pose onto the actuable-joint
+                    // manifold below is only for the control chain: when the body rolls/yaws
+                    // faster than the mount can follow, body^-1 * camera contains roll/yaw
+                    // components OFF the manifold, and the no-yaw joint extraction absorbs
+                    // them into the pitch angle — the reconstructed attitude then diverges
+                    // from the real camera (observed ~2x angular exaggeration of camera
+                    // error at |roll| > 60 deg, 2026-11-08 intercept runs). Consumers that
+                    // derotate image measurements with this stream (interceptor UKF) and the
+                    // mission camera-error supervision must see the measured attitude.
+                    const tf2::Quaternion measured_enu = enu;
                     const auto vehicle_response = client.call("simGetVehiclePose", vehicle_);
                     const auto vehicle_pose = vehicle_response.get().as<ObjectMap>();
                     const auto body_ned = readQuaternion(vehicle_pose);
@@ -324,16 +339,16 @@ namespace custom_link_bridge
                     auto msg = std::make_unique<sensor_msgs::msg::Imu>();
                     msg->header.stamp = camera_stamp;
                     msg->header.frame_id = "base_link";
-                    msg->orientation = tf2::toMsg(enu);
+                    msg->orientation = tf2::toMsg(measured_enu);
                     const tf2::Quaternion heading(tf2::Vector3(0, 0, 1), vehicle_heading_.load());
-                    tf2::Matrix3x3(heading.inverse() * enu).getRPY(msg->orientation_covariance[0],
+                    tf2::Matrix3x3(heading.inverse() * measured_enu).getRPY(msg->orientation_covariance[0],
                         msg->orientation_covariance[1], msg->orientation_covariance[2]);
                     msg->angular_velocity_covariance[0] = -1;
                     msg->linear_acceleration_covariance[0] = -1;
                     const double sample_time = rclcpp::Time(msg->header.stamp).seconds();
                     if (previous)
                     {
-                        auto delta = previous->inverse() * enu;
+                        auto delta = previous->inverse() * measured_enu;
                         if (delta.w() < 0)
                             delta = tf2::Quaternion(-delta.x(), -delta.y(), -delta.z(), -delta.w());
                         const double sample_dt = sample_time - last_sample_time;
@@ -347,7 +362,7 @@ namespace custom_link_bridge
                             msg->angular_velocity_covariance[0] = 0;
                         }
                     }
-                    previous = enu;
+                    previous = measured_enu;
                     last_sample_time = sample_time;
                     callback_(std::move(msg));
                 }
