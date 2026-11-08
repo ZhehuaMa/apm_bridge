@@ -259,14 +259,14 @@ namespace custom_link_bridge
                             tf2::Quaternion(omega / speed, speed * dt) : tf2::Quaternion(0, 0, 0, 1);
                         relative = body.inverse() * *mission_world * delta;
                     }
-                    if (mode == apm_bridge::GimbalMode::MISSION)
+                    if (mode == apm_bridge::GimbalMode::MISSION || mode == apm_bridge::GimbalMode::HORIZON)
                     {
-                        // MISSION: 俯仰额外钳制到相对机身窗口 (ROS 域 [-90+min,
-                        // -90+max], 向上 = -90°; 抬头域 [90-max, 90-min] ∩ 行程)。
-                        relative = cfg_.constrainMissionOrientation(relative, true);
-                    }
-                    else if (mode == apm_bridge::GimbalMode::HORIZON)
+                        // 仅机械行程位置钳制。MISSION 窗口不再在此位置钳制: 阶跃窗外
+                        // 姿态到边界会在接管瞬间跳变相机, 且按机体相对域钳制会扭曲
+                        // mission_world 的世界姿态积分 —— 窗口改由下方关节域速率门控
+                        // 执行 (vendor GimbalControl::updateMissionControl 同款语义)。
                         relative = cfg_.constrainMissionOrientation(relative);
+                    }
                     if (protection && mode != apm_bridge::GimbalMode::AIM)
                     {
                         trajectory.reset(measured_joints);
@@ -279,6 +279,18 @@ namespace custom_link_bridge
                         if (i == 2 && cfg_.yaw.min_deg == cfg_.yaw.max_deg)
                             target_joints[i] = trajectory.positions()[i] + std::remainder(
                                 target_joints[i] - trajectory.positions()[i], 360.0);
+                    }
+                    if (mode == apm_bridge::GimbalMode::MISSION && axes[1] &&
+                        cfg_.missionJointMinDeg() < cfg_.missionJointMaxDeg())
+                    {
+                        // MISSION 俯仰窗口速率门控 (vendor 同款): 以实测关节位置判定,
+                        // 只拦朝界外方向的目标, 允许回界 —— 接管瞬间窗外姿态平滑收敛
+                        // 而非阶跃到边界。
+                        const double measured = measured_joints[1];
+                        if (measured <= cfg_.missionJointMinDeg() && target_joints[1] < measured)
+                            target_joints[1] = measured;
+                        else if (measured >= cfg_.missionJointMaxDeg() && target_joints[1] > measured)
+                            target_joints[1] = measured;
                     }
                     if (dt > 0)
                     {
@@ -296,13 +308,9 @@ namespace custom_link_bridge
                     const xfrobot::GimbalAxisConfig limits[3] = {cfg_.roll, cfg_.pitch, cfg_.yaw};
                     for (size_t i = 0; i < target_joints.size(); ++i)
                     {
-                        // MISSION 俯仰轨迹同样受窗口+行程约束 (与 constrainMission
-                        // 一致), 其余模式仅机械行程。
-                        const double lo = mode == apm_bridge::GimbalMode::MISSION && i == 1 ?
-                            cfg_.missionJointMinDeg() : limits[i].min_deg;
-                        const double hi = mode == apm_bridge::GimbalMode::MISSION && i == 1 ?
-                            cfg_.missionJointMaxDeg() : limits[i].max_deg;
-                        trajectory.constrain(i, lo, hi);
+                        // 全模式仅机械行程位置钳制 (物理硬限); MISSION 窗口已由上方
+                        // 速率门控执行, 不再参与位置钳制。
+                        trajectory.constrain(i, limits[i].min_deg, limits[i].max_deg);
                         target_joints[i] = trajectory.positions()[i] * M_PI / 180;
                     }
                     relative = apm_bridge::gimbalCameraToWorld(tf2::Quaternion(0, 0, 0, 1), target_joints, axes);

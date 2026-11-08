@@ -815,17 +815,17 @@ void GimbalControl::smoothAngleCommands(double dt, bool fresh_feedback)
         axes[i] = present[i] && ctrl_op_type[i] == OP_TYPE_ANGLE;
         target[i] = ctrl_op_value[i] * .01;
     }
-    const int encoder[3] = {1, 0, 2};
     auto seed = angle_trajectory.positions();
     auto rates = angle_trajectory.rates();
     for (size_t i = 0; i < axes.size(); ++i)
         if (!angle_trajectory_ready || !angle_axes[i])
         {
-            // 角度命令域: AIM/HORIZON 均为 LOCK 相机姿态角域 (抬头正), 俯仰从 cam_angle[1] 播种。
+            // 角度命令域: AIM/HORIZON 均为 LOCK 相机姿态角域 (载机 FRD 轴序与 ctrl 槽序
+            // 相同, 右滚/抬头/右转正), 各轴一律从同域 cam_angle 播种。旧实现按"全轴编码器
+            // 反号"从 mtr_angle 播种: 俯仰域恰好正确 (台架实测), 滚转/偏航的域与符号按
+            // §3.1 模型皆错; 该路径当前无滚转/偏航角度命令产生者, 属清除陷阱的域修正。
             // (FPV 相对角域与编码器反号: FPV op -> mtr = -op, 台架实测; 驱动现已不使用 FPV。)
-            seed[i] = -last_response.mtr_angle[encoder[i]] * .01;
-            if (i == 1)
-                seed[i] = last_response.cam_angle[1] * .01;
+            seed[i] = last_response.cam_angle[i] * .01;
             rates[i] = 0;
         }
     if (fresh_feedback)
@@ -913,12 +913,16 @@ void GimbalControl::updateMissionControl(double dt)
     const GimbalAxisConfig axes[3] = {cfg.roll, cfg.pitch, cfg.yaw};
     const int encoder[3] = {1, 0, 2};
     const double signs[3] = {1.0, -1.0, -1.0}; // FLU -> vendor roll / nose-up pitch / clockwise yaw.
+    // 编码器域 -> 右滚/抬头/右转正关节域: 仅俯仰反号 (低头正, 台架实测);
+    // 滚转/偏航按 LFD 右手编码器模型同号 (doc/gimbal_protocol_verified.md §3.1/§5.5,
+    // 与位姿链 gimbalCameraToWorld 的 {+mtr[1], -mtr[0], +mtr[2]} 及测试假云台一致,
+    // C40D/C200T 待实机复验)。统一取反会使限位门方向相反, 把云台推进机械限位
+    // (俯仰方向的该错误已由台架实测证实, 滚转/偏航为同一机理)。
+    const double encoder_signs[3] = {1.0, -1.0, 1.0};
     for (int i = 0; i < 3; ++i)
     {
         double speed = rates[i] * signs[i] * 180.0 / M_PI;
-        // 编码器低头正: 取反到抬头域, 与限位 (FRD 抬头正) 和速度符号同域比较,
-        // 否则门控方向相反会把云台推进机械限位 (台架实测)。
-        const double angle = -last_response.mtr_angle[encoder[i]] * 0.01;
+        const double angle = encoder_signs[i] * last_response.mtr_angle[encoder[i]] * 0.01;
         // 俯仰用 MISSION 相对机身窗口 (ROS FLU 域 [-90+min, -90+max], 向上 = -90°,
         // 取反到抬头域 [90-max, 90-min] 并夹紧到机械行程); 滚转/偏航用机械行程。
         // 门控只拦朝界外方向, 允许回界内。
