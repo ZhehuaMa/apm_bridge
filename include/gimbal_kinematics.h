@@ -10,7 +10,13 @@ namespace apm_bridge
     using GimbalJointAngles = std::array<double, 3>; // FRD roll, pitch, yaw in radians.
     using GimbalAxes = std::array<bool, 3>;
 
-    // Aligned frames at encoder zero; physical joint order is yaw * roll * pitch.
+    // Aligned frames at encoder zero. The ZXY chain (yaw * roll * pitch) matches
+    // both the physical joint order and the vendor camera-frame euler order
+    // Z -> Y -> X from protocol appendix 2: psi/theta/phi are rotations about the
+    // LFD camera axes (X left = pitch, Y front = roll, Z down = yaw), and the
+    // same chain expressed in the carrier FRD basis is Rz(yaw)*Rx(roll)*Ry(pitch)
+    // (theta -> +roll, -phi -> pitch-up, psi -> yaw). See
+    // doc/gimbal_protocol_verified.md section 3.1 (2026-11-08 revision).
     inline tf2::Quaternion gimbalCameraToWorld(const tf2::Quaternion &body_to_world,
                                               const GimbalJointAngles &joints, const GimbalAxes &axes)
     {
@@ -20,7 +26,8 @@ namespace apm_bridge
         return (body_to_world * yaw * roll * pitch).normalized();
     }
 
-    // ZXY virtual encoders avoid the +/-90-degree ZYX pitch fold.
+    // ZXY virtual encoders avoid the +/-90-degree ZYX pitch fold (ZXY is also
+    // the vendor euler order, see gimbalCameraToWorld above).
     inline GimbalJointAngles gimbalJointAngles(const tf2::Quaternion &camera_to_body, const GimbalAxes &axes)
     {
         const tf2::Matrix3x3 rotation(camera_to_body.normalized());

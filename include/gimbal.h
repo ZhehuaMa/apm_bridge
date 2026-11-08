@@ -98,9 +98,19 @@ typedef struct
         uint8_t value : 5; // 命令码回报
     } cmd;
 
-    int16_t cam_rate[3];  // 相机本体角速度 (0.1deg/s) [俯仰, 滚转, 偏航]
-    int16_t cam_angle[3]; // 相机姿态角 (0.01deg) [滚转, 俯仰, 偏航]
-    int16_t mtr_angle[3]; // 相机相对角 (0.01deg) [俯仰, 滚转, 偏航]
+    // 轴序/符号的坐标系依据见 doc/gimbal_protocol_verified.md §3.1 (2026-11-08 修订):
+    // 载机系 = FRD (X前Y右Z下); 相机系 = LFD (X左Y前Z下, 与载机系差 90° 偏航)。
+    int16_t cam_rate[3];  // 相机体轴角速度 (0.1deg/s) [俯仰, 滚转, 偏航]。
+                          // 轴序 = 相机 LFD 系 [X,Y,Z]; 各通道正方向 = 绕对应
+                          // LFD 轴右手正转 (低头/右滚/右转为正)
+    int16_t cam_angle[3]; // 相机姿态角 (0.01deg) [滚转, 俯仰, 偏航]。
+                          // 轴序 = 载机 FRD 系 [X,Y,Z]; 由 LFD 欧拉角按附录2 转换
+                          // (cam_angle = [+θ, -φ, +ψ], 右滚/抬头/右转为正),
+                          // 欧拉序 Z→Y→X = Yaw→Roll→Pitch (ZXY, 非 ZYX!)
+    int16_t mtr_angle[3]; // 相机相对角 (0.01deg) [俯仰, 滚转, 偏航]。
+                          // 轴序 = 相机 LFD 系 [X,Y,Z] (同 cam_rate); 俯仰低头正
+                          // (实测); 滚转/偏航按 LFD 右手模型预测右滚/右转正
+                          // (C40D/C200T 待验)
     uint8_t crc[2];       // CRC16 (大端序)
 } Gbc2GcuPkt_t;
 
