@@ -769,14 +769,20 @@ void GimbalControl::run()
                         // (cam_angle[1] ≈ -mtr_angle[0] + 慢漂移水平偏置), 需取反成
                         // 运动学约定的 FRD 抬头正。C-20S 无滚转/偏航电机 (mtr 恒 0), 其编码器符号
                         // 在本机不可测, 沿用原值 (C-40D/C-200T 待验)。
+                        // ZXY 链 (yaw*roll*pitch) 与协议附录2 欧拉序 Z→Y→X 同构
+                        // (相机 LFD 系 -> FRD 基: Rz(ψ)*Rx(θ)*Ry(−φ)), 非 ZYX;
+                        // 依据见 doc/gimbal_protocol_verified.md §3.1 (2026-11-08 修订)。
                         camera_orientation = apm_bridge::gimbalCameraToWorld(vehicle_orientation,
                             {last_response.mtr_angle[1] * radians, -last_response.mtr_angle[0] * radians,
                              last_response.mtr_angle[2] * radians},
                             {cfg.roll.present, cfg.pitch.present, cfg.yaw.present});
                         camera_heading = vehicle_heading;
                     }
-                    // 陀螺域 (2026-10-26 台架手动激励实测, 三轮复验): cam_rate[0]+ = 低头 (=FLU 俯仰速率+,
-                    // 与 cam_angle[1] 反号); cam_rate[1]+ = 右滚 (=FLU 滚转速率+, 与 cam_angle[0] 同号);
+                    // 陀螺域: cam_rate 是相机 LFD 系体轴角速度 (轴序 [X,Y,Z] = 俯仰/滚转/偏航,
+                    // 各通道正方向 = 绕对应 LFD 轴右手正转; 体轴速率按分量重排+变号转 FLU 是精确的),
+                    // 模型依据 doc/gimbal_protocol_verified.md §3.1。台架实测 (2026-10-26 手动激励,
+                    // 三轮复验): cam_rate[0]+ = 低头 (=FLU 俯仰速率+, 与 cam_angle[1] 反号);
+                    // cam_rate[1]+ = 右滚 (=FLU 滚转速率+, 与 cam_angle[0] 同号);
                     // cam_rate[2]+ = 右偏航 (罗盘式, FLU 偏航取反, 与 cam_angle[2] 同号)。
                     ema_filter.filter( last_response.cam_rate[1] * 0.1f, 0);    // Roll rate
                     ema_filter.filter( last_response.cam_rate[0] * 0.1f, 1);    // Pitch rate
