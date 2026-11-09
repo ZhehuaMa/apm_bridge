@@ -17,6 +17,10 @@ namespace
     constexpr double kDegToRad = M_PI / 180.0;
     constexpr double kRadToDeg = 180.0 / M_PI;
     constexpr int kAbsoluteZeroCdeg = -27315;
+    // 视觉锁定迟滞宽限: tracker "Target lost -> Re-initializing" 空档实测 ~0.3-0.7 s
+    // (nanotrack 5 帧惯性耗尽到重初始化), 留 1.0 s 覆盖重捕周期。任务监督层另有
+    // "丢失 2 s 结束交战" 兜底, 短宽限不会放大陈旧锁定的风险。
+    constexpr double TRACKING_HOLDOVER_S = 1.0;
 
     static double normalizeAngle(double a)
     {
@@ -223,7 +227,12 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     tracker_state_sub = this->create_subscription<std_msgs::msg::Int8>(
         "/fpv/tracker_state", 1,
         [&](const std_msgs::msg::Int8::SharedPtr msg) {
-            in_tracking = (msg->data == 2); // TRACKING
+            const bool locked = (msg->data == 2); // TRACKING
+            in_tracking = locked;
+            // 迟滞锚点: 记住最近一次锁定时刻, 供 MISSION 脉冲判定的宽限窗口使用
+            // (见 rcTriggerUpdate 的 TRACKING_HOLDOVER_S)。
+            if (locked)
+                tracking_hold_s = this->now().seconds();
         });
     radar_state_sub = this->create_subscription<std_msgs::msg::Int8>(
         "/fpv/radar_state", 1,
@@ -1238,6 +1247,14 @@ void CustomLinkVehicleNode::offboardCallback(const std_msgs::msg::Bool::SharedPt
                 msg->data ? "OFFBOARD" : "MANUAL");
 }
 
+bool CustomLinkVehicleNode::visionLockHoldover() const
+{
+    if (in_tracking.load())
+        return true;
+    const double last_locked = tracking_hold_s.load();
+    return last_locked > 0.0 && (now().seconds() - last_locked) < TRACKING_HOLDOVER_S;
+}
+
 void CustomLinkVehicleNode::rcTriggerUpdate(const uint16_t *channels, size_t count)
 {
     // RC 触发脉冲（>0.5 s 保持判定、单次锁存、释放复位）只负责 MISSION 的
@@ -1276,7 +1293,7 @@ void CustomLinkVehicleNode::rcTriggerUpdate(const uint16_t *channels, size_t cou
                 {
                     msg->frame_id = "DISMISS";
                 }
-                else if (in_tracking.load() || radar_tracking.load())
+                else if (visionLockHoldover() || radar_tracking.load())
                 {
                     msg->frame_id = "MISSION";
                 }
@@ -1284,6 +1301,11 @@ void CustomLinkVehicleNode::rcTriggerUpdate(const uint16_t *channels, size_t cou
                 {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                         "Trigger pulse ignored: no vision/radar lock and no mission running");
+                    // 拒绝时不消耗脉冲锁存: 重置后在持续高电平下, 下一个 >=0.5 s 保持
+                    // 窗口自动重试, 视觉锁定恢复 (tracker 丢失->重捕典型 0.3-0.7 s) 即补发,
+                    // 无需飞行员/测试脚本重新完整打一个脉冲 (2026-11-09 发射失败根因之一)。
+                    last_triggered_time = rclcpp::Time(0);
+                    toggled = false;
                     return;
                 }
                 RCLCPP_INFO(this->get_logger(), "Tracker Triggered : %s (vision=%d radar=%d)",

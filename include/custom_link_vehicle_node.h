@@ -169,6 +169,9 @@ namespace custom_link_bridge
         void armCallback(const std_msgs::msg::Bool::SharedPtr msg);
         void offboardCallback(const std_msgs::msg::Bool::SharedPtr msg);
         void rcTriggerUpdate(const uint16_t *channels, size_t count);
+        // 视觉锁定迟滞判定: 当前锁定, 或距最近一次锁定不足 TRACKING_HOLDOVER_S。
+        // 供 MISSION 脉冲发射条件使用 (tracker 丢失->重捕的空档不拒发)。
+        bool visionLockHoldover() const;
 
         // ---- 链路回调 (读取线程上下文) ----
         void handleFast(const custom_link::protocol::PayloadFast &p, int64_t hostUs);
@@ -236,6 +239,11 @@ namespace custom_link_bridge
         std::atomic_bool armed{false};
         std::atomic_uint8_t landed_state{mavros_msgs::msg::ExtendedState::LANDED_STATE_UNDEFINED};
         std::atomic_bool in_tracking{false};
+        // 最近一次视觉锁定为 true 的时刻 (节点时钟秒)。MISSION 脉冲判定用迟滞宽限:
+        // tracker 丢失->重捕期间 /fpv/tracker_state 短暂离开 2 (nanotrack 惯性耗尽到
+        // 重初始化, 实测 ~0.3-0.7 s), 单采样门控会在脉冲判定瞬间恰好拒发
+        // (2026-11-09 orbit 4.5 m/s 发射失败)。0 = 从未锁定。
+        std::atomic<double> tracking_hold_s{0.0};
         std::atomic_bool radar_tracking{false};
         std::atomic_bool in_mission{false};
         std::atomic<double> altitude_m{0.0};
