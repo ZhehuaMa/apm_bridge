@@ -340,6 +340,10 @@ private:
     double vehicle_heading = 0.0;
     tf2::Quaternion vehicle_orientation{0, 0, 0, 1};
     std::chrono::steady_clock::time_point vehicle_stamp{};
+    // 同帧 FC 体轴角速度 (rad/s, FLU)：合成相机姿态时把 vehicle_orientation 前推到
+    // 编码器采样时戳用（见 COMPOSE_SKEW_* 门控）。非有限输入置 valid=false。
+    tf2::Vector3 vehicle_rates{0, 0, 0};
+    bool vehicle_rates_valid = false;
     tf2::Quaternion camera_orientation{0, 0, 0, 1};
     double camera_heading = 0.0;
     bool camera_pose_valid = false;

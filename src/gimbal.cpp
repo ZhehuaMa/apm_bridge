@@ -40,6 +40,14 @@ using namespace xfrobot;
 #define SERIAL_READ_TIMEOUT_MS 10
 #define UAV_DATA_TIMEOUT_MS 200 // 载机惯导数据过期阈值
 
+// 相机姿态合成时戳对齐门控 (2026-11-09 加固): FC 姿态与云台编码器反馈是两条独立流,
+// 直接拼不同时戳的采样会把合成相机姿态旋转 omega*skew (旧 200ms 门控下 180deg/s 即 36deg);
+// 机体滚转时该错位正是 j*sin(roll) 虚假方位的来源之一 (2026-11-08 拦截滚转发散的真机同类,
+// AirSim 侧对应 /fpv/gimbal 实测姿态修复 c96e375)。skew <= DIRECT 直接合成; <= MAX 用与姿态
+// 同帧的 FC 陀螺前推对齐到编码器时戳 (残余误差 = 陀螺零偏*skew); 超过 MAX 判无效不合成。
+#define COMPOSE_SKEW_DIRECT_MS 5   // 低于此时戳错位直接合成 (旋转误差可忽略)
+#define COMPOSE_SKEW_MAX_MS 100    // 超过此错位不再合成 (前推亦不覆盖)
+
 static uint16_t CalculateCrc16(uint8_t *ptr, uint8_t len)
 {
     uint16_t crc = 0;
@@ -381,6 +389,14 @@ void GimbalControl::updateVehicleState(const sensor_msgs::msg::Imu &imu, double 
         std::lock_guard<std::mutex> lock(mtx);
         vehicle_heading = yaw;
         vehicle_orientation = q;
+        // 同帧 FC 体轴角速度 (rad/s, FLU): 合成相机姿态时按编码器 skew 前推姿态用。
+        // 与 orientation 同一条 Imu, 时戳天然一致, 前推残余只含陀螺零偏项。
+        const auto &rates = imu.angular_velocity;
+        vehicle_rates_valid = std::isfinite(rates.x) && std::isfinite(rates.y) &&
+            std::isfinite(rates.z);
+        vehicle_rates = vehicle_rates_valid
+            ? tf2::Vector3(rates.x, rates.y, rates.z)
+            : tf2::Vector3(0.0, 0.0, 0.0);
         // BF 陀螺 FLU 俯仰速率低头正; 转抬头域供 AIM 前馈
         vehicle_pitch_rate_up = -imu.angular_velocity.y * 180.0 / M_PI;
         vehicle_stamp = std::chrono::steady_clock::now();
@@ -760,8 +776,46 @@ void GimbalControl::run()
                     std::lock_guard<std::mutex> lock(mtx);
                     feedback_stamp = std::chrono::steady_clock::now();
                     orientation_stamp = node ? node->now() : rclcpp::Clock().now();
-                    camera_pose_valid = vehicle_stamp != std::chrono::steady_clock::time_point{} &&
-                        feedback_stamp - vehicle_stamp <= std::chrono::milliseconds(UAV_DATA_TIMEOUT_MS);
+                    // 时戳对齐后再合成 (2026-11-09 加固): FC 姿态与编码器采样来自独立流,
+                    // 拼不同时戳的样本会把相机姿态旋转 omega*skew, 滚转下即 j*sin(roll)
+                    // 虚假方位 (2026-11-08 拦截滚转发散的真机同类)。小错位直接合成;
+                    // 常规抖动用同帧 FC 陀螺把姿态前推到编码器时戳 (残余 = 陀螺零偏*skew);
+                    // 大错位/无陀螺判无效, 宁缺毋错。
+                    tf2::Quaternion body_attitude = vehicle_orientation;
+                    camera_pose_valid = vehicle_stamp != std::chrono::steady_clock::time_point{};
+                    if (camera_pose_valid)
+                    {
+                        const auto compose_skew = feedback_stamp - vehicle_stamp;
+                        if (compose_skew > std::chrono::milliseconds(COMPOSE_SKEW_MAX_MS))
+                        {
+                            camera_pose_valid = false;
+                            rclcpp::Clock fallback_compose_clock;
+                            RCLCPP_WARN_THROTTLE(
+                                node ? node->get_logger() : rclcpp::get_logger("xfrobot_gimbal"),
+                                node ? *node->get_clock() : fallback_compose_clock, 2000,
+                                "camera pose dropped: FC attitude %.0f ms older than encoder feedback",
+                                std::chrono::duration<double, std::milli>(compose_skew).count());
+                        }
+                        else if (compose_skew > std::chrono::milliseconds(COMPOSE_SKEW_DIRECT_MS))
+                        {
+                            if (!vehicle_rates_valid)
+                            {
+                                camera_pose_valid = false;
+                                rclcpp::Clock fallback_compose_clock;
+                                RCLCPP_WARN_THROTTLE(
+                                    node ? node->get_logger() : rclcpp::get_logger("xfrobot_gimbal"),
+                                    node ? *node->get_clock() : fallback_compose_clock, 2000,
+                                    "camera pose dropped: FC body rates unavailable to cover %.0f ms "
+                                    "attitude/encoder skew",
+                                    std::chrono::duration<double, std::milli>(compose_skew).count());
+                            }
+                            else
+                            {
+                                body_attitude = apm_bridge::propagateBodyRates(vehicle_orientation,
+                                    vehicle_rates, std::chrono::duration<double>(compose_skew).count());
+                            }
+                        }
+                    }
                     if (camera_pose_valid)
                     {
                         const double radians = 0.01 * M_PI / 180.0;
@@ -772,7 +826,7 @@ void GimbalControl::run()
                         // ZXY 链 (yaw*roll*pitch) 与协议附录2 欧拉序 Z→Y→X 同构
                         // (相机 LFD 系 -> FRD 基: Rz(ψ)*Rx(θ)*Ry(−φ)), 非 ZYX;
                         // 依据见 doc/gimbal_protocol_verified.md §3.1 (2026-11-08 修订)。
-                        camera_orientation = apm_bridge::gimbalCameraToWorld(vehicle_orientation,
+                        camera_orientation = apm_bridge::gimbalCameraToWorld(body_attitude,
                             {last_response.mtr_angle[1] * radians, -last_response.mtr_angle[0] * radians,
                              last_response.mtr_angle[2] * radians},
                             {cfg.roll.present, cfg.pitch.present, cfg.yaw.present});
