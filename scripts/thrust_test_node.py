@@ -483,8 +483,10 @@ class ThrustTestNode(Node):
                 self.offboard_pub.publish(Bool(data=True))
             self.arm_pub.publish(Bool(data=True))
             if not self._wait_armed(True, 15.0):
-                hint = ('pass --no-offboard and hold BOXOFFBOARD' if args.no_offboard
-                        else 'check the link (host OFFBOARD request not accepted)')
+                hint = ('check that the pilot holds BOXOFFBOARD and the FC arming checks pass'
+                        if self.args.no_offboard
+                        else 'check the link (host OFFBOARD/arm request not accepted); '
+                             'alternatively pass --no-offboard and hold BOXOFFBOARD')
                 raise FatalError(f'FC did not ARM ({hint})')
         except Exception:
             with self.lock:
@@ -661,7 +663,7 @@ def parse_args(argv=None):
                              "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")
     parser.add_argument('--u-start', type=float, default=0.05, help='first throttle duty (§2.2)')
     parser.add_argument('--u-step', type=float, default=0.05, help='throttle duty step (§2.2)')
-    parser.add_argument('--u-end', type=float, default=1.00, help='last throttle duty (§2.2, adjustable)')
+    parser.add_argument('--u-end', type=float, default=0.50, help='last throttle duty (§2.2, adjustable)')
     parser.add_argument('--step-time', type=float, default=2.5, help='duration of each step [s]')
     parser.add_argument('--settle-time', type=float, default=0.5,
                         help='discarded settling part of each step [s]; the rest is averaged')
@@ -672,7 +674,7 @@ def parse_args(argv=None):
     parser.add_argument('--gravity', type=float, default=9.80665)
     parser.add_argument('--tare-time', type=float, default=2.0,
                         help='scale averaging before arming for the zero-thrust reference [s]')
-    parser.add_argument('--critical-weight', type=float, default=0.3,
+    parser.add_argument('--critical-weight', type=float, default=1.0,
                         help='abort if the scale reads below this [kg] (lift-off protection)')
     parser.add_argument('--no-env-comp', action='store_true',
                         help='skip §3.1 step 1 (no baro, e.g. AirSim; pairs with baro_compensation=false)')
@@ -686,7 +688,7 @@ def parse_args(argv=None):
                         help='skip the post-fit §4 verification on the scale')
     parser.add_argument('--verify-sample-time', type=float, default=3.0,
                         help='settle+average per verification thrust level [s]')
-    parser.add_argument('--control-rate', type=float, default=50.0, help='command stream rate [Hz]')
+    parser.add_argument('--control-rate', type=float, default=100.0, help='command stream rate [Hz]')
     parser.add_argument('--yes', action='store_true', help='skip the Enter confirmation')
     parser.add_argument('--output-dir', type=str, default='.')
     parser.add_argument('--no-plot', action='store_true')

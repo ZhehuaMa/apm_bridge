@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -252,6 +253,8 @@ namespace custom_link_bridge
         double sitl_ground_altitude = 0.0;
         bool sitl_ground_valid = false;
         bool armed_feedback_valid = false;
+        /// 上次 /fpv/offboard 日志电平：2 Hz level 保活连续同电平，仅变化时记日志。
+        std::optional<bool> last_offboard_log_level;
         double previous_altitude_m = 0.0;
         int64_t previous_altitude_us = 0;
         double landing_altitude = 0.2;
