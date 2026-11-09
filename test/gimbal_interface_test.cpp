@@ -1322,6 +1322,89 @@ namespace
 #endif
 }
 
+    void bodyRatePropagation()
+    {
+        const tf2::Quaternion level(0, 0, 0, 1);
+        const tf2::Quaternion zero_omega_out = apm_bridge::propagateBodyRates(level, tf2::Vector3(0, 0, 0), 0.5);
+        require(std::abs(zero_omega_out.dot(level)) > 1 - 1e-12, "zero body rate must leave attitude unchanged");
+        // omega = 90 deg/s about +Z for 0.5 s -> 45 deg yaw: boresight (1,0,0) -> (cos45, sin45, 0)
+        const auto quarter = apm_bridge::propagateBodyRates(level, tf2::Vector3(0, 0, M_PI_2), 0.5);
+        const auto forward = tf2::quatRotate(quarter, tf2::Vector3(1, 0, 0));
+        require(std::abs(forward.x() - std::cos(M_PI / 4)) < 1e-9 &&
+                std::abs(forward.y() - std::sin(M_PI / 4)) < 1e-9,
+                "body-rate propagation produced the wrong rotation angle");
+        // RIGHT product = body-frame increment: expected R = R(q) * Rz(omega*dt)
+        const tf2::Quaternion rolled(tf2::Vector3(1, 0, 0), 1.1);
+        const tf2::Vector3 omega(0.3, -0.7, 0.9);
+        const auto propagated = apm_bridge::propagateBodyRates(rolled, omega, 0.2);
+        const tf2::Vector3 axis = omega.normalized();
+        const tf2::Quaternion step(axis, omega.length() * 0.2);
+        const tf2::Quaternion expected = (rolled * step).normalize();
+        require(std::abs(propagated.dot(expected)) > 1 - 1e-9,
+                "body-rate propagation must right-multiply the increment in the body frame");
+        std::cout << "PASS: propagateBodyRates identity, angle and body-frame composition\n";
+    }
+
+    void skewAlignedComposition()
+    {
+        SerialGimbalSimulator simulator;
+        Capture capture;
+        auto node = std::make_shared<rclcpp::Node>("gimbal_skew_test");
+        auto config = xfrobot::GimbalConfig::defaultsFor(xfrobot::GimbalModel::C20S);
+        config.pitch.min_deg = -120;
+        config.pitch.max_deg = 120;
+        xfrobot::GimbalControl gimbal(*node, simulator.pty.port, config,
+            [&](auto msg) { capture.receive(std::move(msg)); });
+        gimbal.setMode(apm_bridge::GimbalMode::AIM);
+        gimbal.start();
+        auto imu = vehicle(0);                              // level attitude
+        imu.angular_velocity.z = 90.0 * M_PI / 180.0;       // yawing right at 90 deg/s
+        const auto drive = [&](int milliseconds, bool update) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+            while (std::chrono::steady_clock::now() < end)
+            {
+                if (update)
+                    gimbal.updateVehicleState(imu, 9.80665);
+                simulator.service();
+                rclcpp::spin_some(node);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+        // Continuous updates keep the attitude/encoder skew under the direct-compose
+        // threshold: the published pose must stay at the vehicle attitude (yaw ~ 0).
+        drive(150, true);
+        require(capture.count() > 0, "skew test gimbal did not publish");
+        tf2::Quaternion q;
+        double roll, pitch, yaw;
+        tf2::fromMsg(capture.last().orientation, q);
+        tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+        require(std::abs(yaw) < 1e-3, "negligible skew must compose directly (no propagation)");
+        // Stop the attitude stream for ~60 ms: composition must forward-propagate the
+        // attitude with the same-message gyro, so the published yaw advances by omega*skew
+        // (90 deg/s * ~60 ms = ~5.4 deg). Without propagation it would stay at 0.
+        drive(60, false);
+        tf2::fromMsg(capture.last().orientation, q);
+        tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+        require(yaw > 3.0 * M_PI / 180.0 && yaw < 8.0 * M_PI / 180.0,
+                "encoder-epoch pose must reflect gyro forward propagation over the skew");
+        // Skew past the hard cap invalidates the pose instead of misreporting it
+        // (tightened from the old 200 ms UAV_DATA_TIMEOUT gate).
+        drive(80, false);
+        require(!gimbal.getOrientationFLU(),
+                "camera pose must drop once FC attitude is older than the skew cap");
+        drive(80, true);
+        require(gimbal.getOrientationFLU() != nullptr, "camera pose did not recover with fresh attitude");
+        // Non-finite body rates cannot cover the skew: the pose must drop rather than
+        // compose un-propagated epochs.
+        imu.angular_velocity.z = std::numeric_limits<double>::quiet_NaN();
+        gimbal.updateVehicleState(imu, 9.80665);
+        drive(12, false);   // past the direct threshold with invalid rates
+        require(!gimbal.getOrientationFLU(),
+                "camera pose must drop when FC rates are unavailable to cover the skew");
+        gimbal.stop();
+        std::cout << "PASS: skew-aligned composition (direct, propagated, capped, invalid rates)\n";
+    }
+
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
@@ -1339,6 +1422,8 @@ int main(int argc, char **argv)
         aimAndMissionLimits();
         strapdownBackend();
         jointKinematics();
+        bodyRatePropagation();
+        skewAlignedComposition();
         for (const auto model : {xfrobot::GimbalModel::C20S, xfrobot::GimbalModel::C40D, xfrobot::GimbalModel::C200T})
             hardwarePose(model);
         hardwareBackend();

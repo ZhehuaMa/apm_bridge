@@ -43,4 +43,22 @@ namespace apm_bridge
             std::atan2(rotation[0][1], rotation[1][1]);
         return {axes[0] ? roll : 0, axes[1] ? pitch : 0, axes[2] ? yaw : 0};
     }
+
+    // Forward-propagate a body attitude by dt with body-frame angular rates omega (rad/s):
+    // q(t+dt) = q(t) * exp(omega*dt). The RIGHT product applies the increment in the body
+    // frame (strapdown gyro integration), so an attitude sampled at t1 can be re-epoched to
+    // t2 using the gyro from the same message — residual error is gyro bias * dt only.
+    // Inputs must be finite; near-zero omega returns q unchanged. 2026-11-09: used to
+    // time-align the FC attitude to the gimbal-encoder sample before composing the camera
+    // pose (epoch mismatch rotates the composed pose by omega*skew — 36 deg at 180 deg/s
+    // over the old 200 ms gate — which under bank becomes the j*sin(roll) false azimuth).
+    inline tf2::Quaternion propagateBodyRates(const tf2::Quaternion &q, const tf2::Vector3 &omega, double dt)
+    {
+        const double speed = omega.length();
+        if (speed < 1e-12)
+            return q;
+        tf2::Quaternion out = q * tf2::Quaternion(omega / speed, speed * dt);
+        out.normalize();
+        return out;
+    }
 }
