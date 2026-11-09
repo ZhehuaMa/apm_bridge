@@ -185,7 +185,7 @@ class MotorCheckNode(Node):
                 self.offboard_pub.publish(Bool(data=True))
             self.arm_pub.publish(Bool(data=True))
             if not self._wait_armed(True, timeout=15.0):
-                hint = ('pass --no-offboard and hold BOXOFFBOARD' if args.no_offboard
+                hint = ('pass --no-offboard and hold BOXOFFBOARD' if self.args.no_offboard
                         else 'check the link (host OFFBOARD request not accepted)')
                 raise FatalError(f'FC did not ARM ({hint})')
         except Exception:

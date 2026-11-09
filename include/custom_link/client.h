@@ -99,10 +99,16 @@ namespace custom_link
         void setArmRequest(bool arm) { arm_request_ = arm; }
         void setArmedFeedback(bool armed) { armed_feedback_ = armed; }
 
+        /// FC 实际模式反馈（0x12 mode_flags 的 OFFBOARD 位）：OFFBOARD 已生效
+        /// 时重复 setOffboardRequest(true) 视为 level 保活（无操作），不再产生
+        /// 0->2 重试边沿。
+        void setOffboardFeedback(bool offboard) { offboard_feedback_ = offboard; }
+
         /// 显式模式请求：发送一次 0x20（即使无控制量），随后控制帧沿用该模式。
         /// 不改变 arm 请求，也不替代持续控制流/FC 看门狗。
-        /// 重复 setOffboardRequest(true) 会自动产生一次 mode_req 0->2 新边沿
-        ///（先发一帧 0 再回 2），等价于重新请求——用于解锁 FC 侧 apiBlocked。
+        /// FC 未确认 OFFBOARD 时，重复 setOffboardRequest(true) 自动产生一次
+        /// mode_req 0->2 新边沿（先发一帧 0 再回 2），等价于重新请求——用于
+        /// 解锁 FC 侧 apiBlocked；FC 已在 OFFBOARD 时重复 true 为 level 保活。
         void setOffboardRequest(bool offboard);
 
         /// 主动触发一次对时（另有周期性自动对时）。
@@ -198,6 +204,7 @@ namespace custom_link
         uint64_t mode_request_sent_revision_ = 0;
         std::atomic_bool arm_request_{false};
         std::atomic_bool armed_feedback_{false};
+        std::atomic_bool offboard_feedback_{false};
 
         // 发送侧序列
         uint16_t cmd_seq_ = 0;

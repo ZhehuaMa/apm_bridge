@@ -718,6 +718,11 @@ void CustomLinkVehicleNode::handleSlow(const custom_link::protocol::PayloadSlow 
     const bool was_armed = armed.exchange(now_armed);
     armed_feedback_valid = true;
     client->setArmedFeedback(now_armed);
+    // OFFBOARD 实际生效状态反馈给客户端：已生效时上层 2 Hz 重复的
+    // /fpv/offboard=true 保活不再触发 mode_req 0->2 重试边沿（那会让 FC
+    // 随每次保活退出再重进 OFFBOARD，油门在 RC 与主机间来回切换，转速抖动）。
+    client->setOffboardFeedback(
+        (p.mode_flags & custom_link::protocol::mode::OFFBOARD) != 0);
 
     // 起桨/落桨边沿驱动下游：从未起桨到起桨发布 ON 触发 Tracker，从起桨到
     // 未起桨发布 OFF 停止 Tracker 与 Interceptor（0x12 10 Hz，边沿单次发布；
@@ -1243,8 +1248,14 @@ void CustomLinkVehicleNode::offboardCallback(const std_msgs::msg::Bool::SharedPt
     if (!msg->data)
         gimbal_abort_requested = true;
     client->setOffboardRequest(msg->data);
-    RCLCPP_INFO(this->get_logger(), "Requested custom-link mode: %s",
-                msg->data ? "OFFBOARD" : "MANUAL");
+    // 工具的 2 Hz level 保活会连续到达相同电平（客户端按 FC 反馈去重），
+    // 日志同样只在电平变化时记一次。
+    if (!last_offboard_log_level || *last_offboard_log_level != msg->data)
+    {
+        last_offboard_log_level = msg->data;
+        RCLCPP_INFO(this->get_logger(), "Requested custom-link mode: %s",
+                    msg->data ? "OFFBOARD" : "MANUAL");
+    }
 }
 
 bool CustomLinkVehicleNode::visionLockHoldover() const

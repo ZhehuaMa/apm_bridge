@@ -106,9 +106,16 @@ namespace custom_link
         std::lock_guard<std::mutex> lk(cmd_mtx_);
         if (offboard && mode_request_ && *mode_request_ == 2)
         {
-            // 重复 true = 重新请求：FC 侧解锁 apiBlocked 需要 mode_req 新
-            // 边沿，仅重发 2 不产生边沿。置 rearm_pending_，发送线程先发
-            // 一帧 mode_req=0 再回到 2（0 -> 2 即新请求）。
+            // FC 已确认在 OFFBOARD（mode 反馈带 OFFBOARD 位）：重复 true 是
+            // level 保活语义，直接忽略。若在这里发 0->2 撤销边沿，FC 会随
+            // 每次保活退出再重进 OFFBOARD，油门在 RC 与主机间来回切换，
+            // 电机转速以保活频率抖动。
+            if (offboard_feedback_.load())
+                return;
+            // FC 未进入 OFFBOARD（请求被拒/已掉出）：重复 true = 重新请求。
+            // FC 侧解锁 apiBlocked 需要 mode_req 新边沿，仅重发 2 不产生
+            // 边沿。置 rearm_pending_，发送线程先发一帧 mode_req=0 再回到
+            // 2（0 -> 2 即新请求）。
             rearm_pending_ = true;
             ++mode_request_revision_;
             return;
