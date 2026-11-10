@@ -202,9 +202,30 @@ namespace
         m.a2 = 50.0;
         m.a1 = 10.0;
         require(!validateModel(m).empty(), "dF/du < 0 at u=1 accepted");
+        // 最小放宽 (2026-11-10): 判据窗口 [0,1] -> [u_idle,1]。纯二次 (a1 = 0) 在
+        // [u_idle,1] 单调 -> 合法 (旧版因 a1 > 0 拒绝)
         m = PropulsionModel{};
         m.a2 = 50.0;
-        require(!validateModel(m).empty(), "a1 = 0 accepted");
+        require(validateModel(m).empty(), "pure quadratic (a1 = 0) rejected");
+        // 凸数据拟合形态: dip 到 u≈0.012 < 默认 u_idle=0.05 -> 放行; u_idle=0 时仍拒
+        m.a3 = 5.5;
+        m.a2 = 57.87;
+        m.a1 = -1.344;
+        require(validateModel(m).empty(), "sub-idle dip rejected");
+        m.u_idle = 0.0;
+        require(!validateModel(m).empty(), "dip crossing u = 0 accepted");
+        // 负斜率侵入可操作域 / F_std(u_idle) <= 0 -> 仍然拒绝
+        m = PropulsionModel{};
+        m.a2 = -50.0;
+        m.a1 = 0.5;
+        require(!validateModel(m).empty(), "negative slope on [u_idle,1] accepted");
+        m = PropulsionModel{};
+        m.a2 = 3.0;
+        m.a1 = -4.0;
+        m.u_idle = 0.9;
+        require(!validateModel(m).empty(), "F_std(u_idle) <= 0 with positive window slope accepted");
+        m = PropulsionModel{};
+        m.a2 = 50.0;
         m.a1 = 1.0;
         require(validateModel(m).empty(), "valid model rejected");
         auto bad = m;

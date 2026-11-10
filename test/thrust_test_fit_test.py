@@ -134,10 +134,21 @@ def test_zero_intercept_cubic_normal_equations_exact():
 
 def test_monotonic_check():
     assert pm.monotonic_check(-15.0, 70.0, 6.0)[0]
-    assert not pm.monotonic_check(0.0, 50.0, -1.0)[0]           # a1 <= 0
+    # u_idle=0 (默认) 时窗口 [0,1] 退化为旧版: slope(0) = a1 <= 0 拒绝
+    assert not pm.monotonic_check(0.0, 50.0, -1.0)[0]
+    # 凸数据拟合的典型形态: 负斜率区只到 u≈0.012, 完全落在 u_idle=0.055 之下 -> 放行
+    ok, slope = pm.monotonic_check(5.50, 57.87, -1.344, 0.055)
+    assert ok and slope == pytest.approx(3 * 5.50 * 0.055 ** 2 + 2 * 57.87 * 0.055 - 1.344)
+    # 负斜率区侵入可操作域 / 窗口内非单调 -> 仍然拒绝
+    assert not pm.monotonic_check(0.0, -50.0, 0.5, 0.05)[0]     # slope(u_idle) < 0
     ok, slope = pm.monotonic_check(-100.0, 50.0, 10.0)          # dF/du(1) = -190
     assert not ok and slope == pytest.approx(-190.0)
+    # F_std(u_idle) <= 0 护栏的隔离用例: 窗口斜率为正 (slope(0.9)=+1.4) 但
+    # F(0.9) = -1.17 < 0 -> 仅因怠速点推力非正被拒 (单调+F(1)>0 不蕴含窗口恒正)
+    ok, slope = pm.monotonic_check(0.0, 3.0, -4.0, 0.9)
+    assert not ok and slope == pytest.approx(1.4)
     assert pm.min_slope_on_unit_interval(10.0, -10.0, 5.0) == pytest.approx(5.0 - 100.0 / 30.0)
+    assert pm.min_slope_on_unit_interval(10.0, -10.0, 5.0, 0.5) == pytest.approx(2.5)  # 驻点 1/3 在窗外
 
 
 def test_calibrate_recovers_standard_curve_and_closed_loop():
@@ -200,3 +211,78 @@ def test_render_param_yaml_is_pasteable():
     assert p['motor_parameters'] == {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5}
     assert p['baro_compensation'] is False and p['voltage_compensation'] is True
     assert len(args.levels) == 20
+
+
+# ---------------------------------------------------------------- plot
+
+def _agg_pyplot():
+    matplotlib = pytest.importorskip('matplotlib')
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def test_plot_results_dashes_extrapolation_beyond_calibrated_domain(tmp_path):
+    plt = _agg_pyplot()
+    # 截短扫描 (u = 0.1..0.5): 拟合曲线在标定域内实线, 域外虚线并从 u_max 起
+    pts = [plant.bench_point(u, 85000.0, 30.0) for u in [round(0.1 * i, 1) for i in range(1, 6)]]
+    res = pm.calibrate(pts, plant.V_REF)
+    assert res['monotonic']
+    png = str(tmp_path / 'plot.png')
+    fig = tool.plot_results(res, png)
+    assert fig is not None and os.path.exists(png)
+    lines = {line.get_label(): line for line in fig.axes[0].get_lines()}
+    assert lines['F_std(u) fit'].get_xdata()[-1] <= 0.5 + 1e-9
+    assert lines['extrapolated fit'].get_xdata()[0] == pytest.approx(0.5)
+    assert 'REJECTED' not in fig.axes[0].get_title()
+    plt.close(fig)
+
+
+def test_calibrate_accepts_convex_fit_with_sub_idle_dip(tmp_path):
+    """最小放宽 (spec 3.2, 2026-11-10 修订): 凸推力数据 (F ~ u^2.1, 真实桨典型) 的
+    无截距三次拟合 a1 < 0, 但负斜率区 (u <~ 0.012) 完全落在 u_idle=0.055 之下 --
+    运行时 clamp 不可达, u_idle 传入后应整体放行 (参数片段可出、图不盖章)。"""
+    plt = _agg_pyplot()
+    pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
+            'F': 62.0 * u ** 2.1, 'P': math.nan, 't': math.nan} for u in LEVELS]
+    res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
+                       environment_normalization=False, u_idle=0.055)
+    assert res['a1'] < 0.0                      # 拟合形态不变, 只是判据窗口收紧
+    assert res['monotonic'] and res['min_slope'] > 0.0
+    assert not pm.monotonic_check(res['a3'], res['a2'], res['a1'])[0]  # 旧版 [0,1] 仍会拒
+    model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], u_idle=0.055)
+    assert model.validate() == ''               # 运行时同口径放行
+    fig = tool.plot_results(res, str(tmp_path / 'accepted.png'))
+    assert fig is not None and 'REJECTED' not in fig.axes[0].get_title()
+    plt.close(fig)
+
+
+def test_plot_results_stamps_rejected_deadband_fit(tmp_path):
+    plt = _agg_pyplot()
+    # 负斜率区侵入可操作域的实例: 推力起始死区 (u <~ 0.09 无推力) 的拟合 dip 到
+    # u≈0.068 > u_idle=0.055 -> 仍拒绝; 被拒拟合出图必须盖章 REJECTED。
+    onset = [62.0 * max(u - 0.09, 0.0) ** 2 / (1 - 0.09) ** 2 for u in LEVELS]
+    pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
+            'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, onset)]
+    res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
+                       environment_normalization=False, u_idle=0.055)
+    assert not res['monotonic'] and res['a1'] < 0.0
+    fig = tool.plot_results(res, str(tmp_path / 'rejected.png'))
+    assert fig is not None and 'REJECTED' in fig.axes[0].get_title()
+    plt.close(fig)
+
+
+def test_calibrate_rejects_deadband_with_sub_idle_negative_thrust():
+    """F_std(u_idle) > 0 护栏的数据级用例: 推力起始死区略高于 u_idle (onset 0.065
+    vs u_idle 0.055) 时, 窗口斜率仍为正但 F(u_idle) < 0 —— 放行会让反解初值
+    sqrt(负数) 产出 NaN 油门, 必须拒绝且原因指向 F_std(u_idle)。"""
+    onset = [62.0 * max(u - 0.065, 0.0) ** 2 / (1 - 0.065) ** 2 for u in LEVELS]
+    pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
+            'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, onset)]
+    res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
+                       environment_normalization=False, u_idle=0.055)
+    assert not res['monotonic']
+    assert res['min_slope'] > 0.0                          # 拒绝不是因为斜率
+    assert 'F_std(u_idle) <= 0' in res['monotonic_reason']  # 而是怠速点推力非正
+    model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], u_idle=0.055)
+    assert model.validate() and model.inverse is None       # 运行时同口径拒绝, 反函数不安装

@@ -85,7 +85,13 @@ def test_step4_clip_and_zero_force():
 def test_validation_and_low_pass():
     assert model().validate() == ''
     assert 'dF/du' in pm.PropulsionModel(-100.0, 50.0, 10.0).validate()
-    assert pm.PropulsionModel(0.0, 50.0, 0.0).validate()                # a1 must be > 0
+    # 最小放宽 (2026-11-10): a1 = 0 的纯二次曲线在 [u_idle,1] 单调 -> 合法
+    assert pm.PropulsionModel(0.0, 50.0, 0.0).validate() == ''
+    # 但负斜率侵入 [u_idle,1] 或 F_std(u_idle) <= 0 仍拒绝
+    assert 'dF/du' in pm.PropulsionModel(0.0, -50.0, 0.5).validate()
+    assert 'dF/du' in pm.PropulsionModel(0.0, 3.0, -4.0, u_idle=0.9).validate()  # 斜率正但 F(u_idle)<0
+    assert 'dF/du' in pm.PropulsionModel(5.50, 57.87, -1.344, u_idle=0.0).validate()  # dip 越过 0
+    assert pm.PropulsionModel(5.50, 57.87, -1.344, u_idle=0.055).validate() == ''     # dip 在窗口外
     assert model(u_idle=1.0).validate() and model(r_eq=-1.0).validate()
     lpf = pm.LowPassFilter(3.2, 22.2)
     lpf.update(21.2, 0.001)

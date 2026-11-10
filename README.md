@@ -639,16 +639,20 @@ are converted to throttle exactly as fpv_test.md §4 specifies, in
 motor_parameters:      # paste the block produced by thrust_test_node
   a3: …                # N
   a2: …                # N
-  a1: …                # N, must be > 0; dF/du > 0 on [0,1] is enforced
+  a1: …                # N; dF/du > 0 on [u_idle,1] and F_std(u_idle) > 0 are enforced
   r_eq: …              # Ω, identified on the bench (0 = first-order step 3)
   k_i: …               # A/N, I_std = k_i·F_std (0 = first-order step 3)
 voltage_lpf_hz: 3.0
 ```
 
-The node rejects an invalid calibrated model (non-finite, `a1 ≤ 0`,
-`dF/du ≤ 0` somewhere on [0, 1], negative `r_eq`/`k_i`) and any other
-`motor_parameters` key (legacy `A..D`, `n`, `thrust_limit`, `spin_k`, `vbat_*`,
-or `u_idle`/`motor_idle`, which come from the FC) at startup. With all-zero
+The node rejects invalid calibrated-model parameters (non-finite, negative
+`r_eq`/`k_i`, bad `v_ref`/`v_min` ranges) at startup; the curve gate
+(`dF/du > 0` and `F_std(u_idle) > 0` on the commandable window `[u_idle, 1]`,
+where `u_idle` is the FC `motor_idle` — sub-idle dips of convex-prop fits are
+accepted) is re-validated once the FC motor_idle is read, and force commands
+are rejected until it passes. Any other `motor_parameters` key (legacy `A..D`,
+`n`, `thrust_limit`, `spin_k`, `vbat_*`,
+or `u_idle`/`motor_idle`, which come from the FC) is rejected at startup. With all-zero
 `a3..a1` (uncalibrated) it starts but drops force commands;
 `~/control_command_raw` still works, which is what the calibration tools use.
 Non-finite `collective_thrust` or body rates are dropped as well.
@@ -679,7 +683,8 @@ squares `u·V = (1/K_v*)·RPM_rms + R_eq·I`; standard-voltage thrust
 `F_std = F0·((u·V_ref − I_std·R_eq)/(u·V − I·R_eq))²` with
 `I_std = I·(V_ref/V)²` (first-order `(V_ref/V)²` when RPM/current are
 missing); zero-intercept cubic via the normal equations; monotonicity check
-(`a1 > 0`, `dF/du > 0` on [0, 1]); `k_i` by least squares of `I_std` on
+(`dF/du > 0` on `[u_idle, 1]` plus `F_std(u_idle) > 0` — the gate window uses
+the FC `motor_idle` read at start-up); `k_i` by least squares of `I_std` on
 `F_std`. Output: CSV with raw and normalized values, `*_result.yaml` with a
 ready-to-paste `motor_parameters` block (written only if the check passes),
 and a PNG. **After the fit, the tool verifies the calibration on the scale
