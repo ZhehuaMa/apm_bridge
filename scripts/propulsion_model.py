@@ -189,20 +189,36 @@ def fit_zero_intercept_cubic(u, force):
     return tuple(float(v) for v in theta), stats
 
 
-def min_slope_on_unit_interval(a3, a2, a1):
-    """min_{u∈[0,1]} dF/du, dF/du = 3a3u² + 2a2u + a1 (端点与驻点取最小)。"""
-    candidates = [0.0, 1.0]
+def min_slope_on_unit_interval(a3, a2, a1, u_lo=0.0):
+    """min_{u∈[u_lo,1]} dF/du, dF/du = 3a3u² + 2a2u + a1 (端点与驻点取最小)。"""
+    u_lo = _clamp(u_lo, 0.0, 1.0)
+    candidates = [u_lo, 1.0]
     if a3 != 0.0:
         vertex = -a2 / (3.0 * a3)
-        if 0.0 < vertex < 1.0:
+        if u_lo < vertex < 1.0:
             candidates.append(vertex)
     return min(3.0 * a3 * u * u + 2.0 * a2 * u + a1 for u in candidates)
 
 
-def monotonic_check(a3, a2, a1):
-    """§3.2 物理合法性: a1 > 0 且 dF/du > 0 ∀u∈[0,1]。返回 (ok, min_slope)。"""
-    slope = min_slope_on_unit_interval(a3, a2, a1)
-    return (a1 > 0.0 and slope > 0.0), slope
+def monotonic_check(a3, a2, a1, u_idle=0.0):
+    """§3.2 物理合法性 (2026-11-10 修订): dF/du > 0 ∀u∈[u_idle,1] 且 F_std(u_idle) > 0。
+
+    原版要求 a1 > 0 (原点斜率)。但真实螺旋桨静推力对占空比呈凸性 (F ∝ u² 量级),
+    无截距三次最小二乘逼近凸曲线会系统性地以微小负 a1 换取更优的 a2——负斜率区
+    往往完全落在 u < u_idle (运行时 clamp(u, u_idle, 1) 永远命令不到)。判据窗口
+    因此从 [0,1] 收紧到可操作域 [u_idle,1]: 放行这类无害拟合, 仍拒绝负斜率区
+    侵入可操作域或谷底落入 [u_idle,1] 的危险拟合 (那会破坏 §4 牛顿反解的根唯一
+    性与收敛性)。正推力条件取 F_std(u_idle) > 0: 斜率>0 使 F 在窗口上单调递增,
+    min F = F(u_idle), 故它蕴含窗口内恒正 (含 F(1) > 0), 反解初值 w = sqrt(F/F(1))
+    亦良定义 —— 注意单调 + F(1) > 0 并不蕴含窗口恒正 (曲线可在窗口左端为负、
+    中途穿零, 初值拟合将 sqrt 负数产出 NaN 油门)。u_idle=0 时退化为原版
+    (slope(0) = a1 > 0)。返回 (ok, min_slope on [u_idle,1])。
+    """
+    slope = min_slope_on_unit_interval(a3, a2, a1, u_idle)
+    # standardThrust 求值序 ((a3*u + a2)*u + a1)*u, 与 C++ 逐位一致
+    f_idle = ((a3 * u_idle + a2) * u_idle + a1) * u_idle
+    positive = f_idle > 0.0 if u_idle > 0.0 else True  # u_idle=0: slope(0)=a1>0 已蕴含
+    return (slope > 0.0 and positive), slope
 
 
 def fit_current_coefficient(f_std, i_std):
@@ -215,11 +231,14 @@ def fit_current_coefficient(f_std, i_std):
     return num / den if den > 0.0 else 0.0
 
 
-def calibrate(points, v_ref, voltage_normalization=True, environment_normalization=True):
+def calibrate(points, v_ref, voltage_normalization=True, environment_normalization=True, u_idle=0.0):
     """§3.1 + §3.2 完整流水线。
 
     points: dict 列表, 键 u(占空比) V I rpm(四电机列表) F(N) P(Pa) t(°C); 缺失量用 NaN。
     voltage_normalization=False (AirSim 无压降) 跳过步骤 3/4; 无气压/温度时跳过步骤 1。
+    u_idle: 飞控 motor_idle 占空比, 单调性判据的窗口下沿 (dF/du > 0 on [u_idle,1],
+    2026-11-10 修订; 0 = 严格旧版 [0,1] 且 a1 > 0)。调用方 (thrust_test_node) 从
+    飞控 CLI 读回后传入。
     返回 dict: a3 a2 a1 r_eq ke kv k_i stats monotonic min_slope rows warnings。
     """
     warnings = []
@@ -249,6 +268,11 @@ def calibrate(points, v_ref, voltage_normalization=True, environment_normalizati
             r['F_std'], r['I_std'] = standard_voltage_thrust(r['u'], r['V'], r['I'], r['F0'], r_eq, v_ref)
         else:
             r['F_std'], r['I_std'] = r['F0'], float('nan')
+    if voltage_normalization and r_eq is not None:
+        no_current = [r for r in rows if not (math.isfinite(r['I']) and r['I'] >= 0.0)]
+        if no_current:
+            warnings.append(f'{len(no_current)} point(s) without current normalized with the '
+                            f'first-order (V_ref/V)^2 formula while the rest use R_eq')
 
     used = [r for r in rows if r['u'] > 0.0 and math.isfinite(r['F_std'])]
     if len(used) < len(rows):
@@ -256,7 +280,14 @@ def calibrate(points, v_ref, voltage_normalization=True, environment_normalizati
     if len(used) < MIN_POINTS_RECOMMENDED:
         warnings.append(f'only {len(used)} points; fpv_test.md recommends N >= {MIN_POINTS_RECOMMENDED}')
     (a3, a2, a1), stats = fit_zero_intercept_cubic([r['u'] for r in used], [r['F_std'] for r in used])
-    ok, slope = monotonic_check(a3, a2, a1)
+    ok, slope = monotonic_check(a3, a2, a1, u_idle)
+    if ok:
+        reason = ''
+    elif slope <= 0.0:
+        reason = f'dF/du <= 0 on [u_idle={u_idle:.4f}, 1] (min slope {slope:.4g} N)'
+    else:
+        f_idle = ((a3 * u_idle + a2) * u_idle + a1) * u_idle
+        reason = f'F_std(u_idle) <= 0 (F_std({u_idle:.4f}) = {f_idle:.4g} N)'
     k_i = fit_current_coefficient([r['F_std'] for r in used], [r['I_std'] for r in used]) if r_eq else 0.0
     return {'a3': a3, 'a2': a2, 'a1': a1,
             'r_eq': r_eq if r_eq is not None else 0.0,
@@ -264,6 +295,7 @@ def calibrate(points, v_ref, voltage_normalization=True, environment_normalizati
             'kv': electrical['kv'] if electrical else float('nan'),
             'electrical_rms': electrical['rms'] if electrical else float('nan'),
             'k_i': k_i, 'stats': stats, 'monotonic': ok, 'min_slope': slope,
+            'monotonic_reason': reason,
             'rows': rows, 'warnings': warnings}
 
 
@@ -338,11 +370,12 @@ class PropulsionModel:
         if not all(math.isfinite(v) for v in (self.a3, self.a2, self.a1, self.v_ref, self.u_idle,
                                                self.r_eq, self.k_i, self.v_min)):
             return 'parameters must be finite'
-        ok, slope = monotonic_check(self.a3, self.a2, self.a1)
-        if not ok:
-            return f'thrust curve must satisfy a1 > 0 and dF/du > 0 on [0,1] (min slope {slope:.4g})'
         if not 0.0 <= self.u_idle < 1.0:
             return 'u_idle must be in [0, 1)'
+        ok, slope = monotonic_check(self.a3, self.a2, self.a1, self.u_idle)
+        if not ok:
+            return (f'thrust curve must satisfy dF/du > 0 on [u_idle, 1] and F_std(u_idle) > 0 '
+                    f'(min slope {slope:.4g})')
         if self.v_ref <= 0.0 or not 0.0 <= self.v_min < self.v_ref:
             return 'require v_ref > 0 and 0 <= v_min < v_ref'
         if self.r_eq < 0.0 or self.k_i < 0.0:
@@ -358,8 +391,11 @@ class PropulsionModel:
         w = np.sqrt(np.array([self.thrust(x) for x in u]) / f_max)
         x = np.stack([np.ones_like(w), w, w ** 2, w ** 3], axis=1)
         c = np.linalg.solve(x.T @ x, x.T @ u)
+        max_error = float(np.max(np.abs(x @ c - u)))
+        if not math.isfinite(max_error):
+            return  # 病态/含 NaN (如窗口左端 F<0 使 sqrt 出 NaN): 不安装反函数
         self.inverse = (float(f_max), tuple(float(v) for v in c))
-        self.inverse_max_error = float(np.max(np.abs(x @ c - u)))
+        self.inverse_max_error = max_error
 
     def initial_guess(self, f_std):
         if self.inverse is not None:

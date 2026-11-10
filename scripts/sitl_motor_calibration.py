@@ -40,9 +40,9 @@ def fit_samples(samples, mass: float, gravity: float, max_error: float, u_idle: 
         raise ValueError("insufficient throttle levels or force range")
     duty = np.array([pm.collective_to_duty(c, u_idle) for c in collective])
     (a3, a2, a1), stats = pm.fit_zero_intercept_cubic(duty, force)
-    monotonic, min_slope = pm.monotonic_check(a3, a2, a1)
+    monotonic, min_slope = pm.monotonic_check(a3, a2, a1, u_idle)
     if not monotonic:
-        raise ValueError(f"fitted F(u) violates dF/du > 0 on [0,1] (min slope {min_slope:.4g})")
+        raise ValueError(f"fitted F(u) violates dF/du > 0 on [u_idle,1] (min slope {min_slope:.4g})")
     model = pm.PropulsionModel(a3=a3, a2=a2, a1=a1, u_idle=u_idle)
     # Residual in throttle (duty) units: model inversion of each measured force.
     error = np.array([model.solve_standard_throttle(f) for f in force]) - duty

@@ -132,14 +132,14 @@ def average_window(window, tare_kg, gravity):
 def verification_weights(w_kg, gravity, f_max, count=3):
     """§4 在线反解 + 台秤闭环验证的期望总推力 (N)。
 
-    各取静重推力的 25%/50%/100%, 都相对整机/缆线的静重可分辨 (台秤误差
-    ~10 g·g ≈ 0.1 N), 且不超出标定域 [0, F_std(1)]。静重可分辨性不满足
-    时返回空列表 (验证段安全跳过)。
+    各取静重推力的 25%/50%/75%, 都相对整机/缆线的静重可分辨 (台秤误差
+    ~10 g·g ≈ 0.1 N), 且不超出标定域 [0, f_max] (调用方传实测扫描上界的
+    F_std, 见 verify_with_model)。静重可分辨性不满足时返回空列表 (验证段安全跳过)。
     """
     w = w_kg * gravity
     levels = [0.25 * i * w for i in range(1, count + 1)]
     min_resolvable = 0.010 * gravity  # 台秤分辨率 ~10 g
-    # 小于分辨率的档舍去; 超过标定域 F_std(1) 的档舍去 (f_max 不够覆盖 100% 静重时
+    # 小于分辨率的档舍去; 超过标定域上界 f_max 的档舍去 (f_max 不够覆盖 75% 静重时
     # 至少保留一档, 除非连最低档都越界)。
     return [f for f in levels if f >= min_resolvable and f <= f_max]
 
@@ -412,9 +412,10 @@ class ThrustTestNode(Node):
         为使"实测拉力 F_meas = 台秤减静重"恰与期望总推力同口径, 机体须保持静平衡
         (飞控只受零角速度, 不机动): 使用与标定段一致的控制通道。电缆拉力台秤误差
         的量级即静重推力分辨率的约束 (见 verification_weights)。"""
-        # §4 反解在标定域 [0, F_std(1)] 内; 静重台秤下的期望推力须满足
-        # |F_meas| >= 10 g·g (分辨) 且 <= F_std(1) (不越界)。
-        f_max = model.thrust(1.0)
+        # §4 反解在标定域内; 静重台秤下的期望推力须满足 |F_meas| >= 10 g·g (分辨)
+        # 且不超过实测扫描上界的模型推力 (截短扫描时不能拿外推的 F_std(1) 验证)。
+        u_max = max((p['u'] for p in self.points), default=1.0)
+        f_max = model.thrust(min(u_max, 1.0))
         weights = verification_weights(self.tare_kg, self.args.gravity, f_max)
         if not weights:
             print(f'{bcolors.WARNING}verification skipped: static weight {self.tare_kg:.3f} kg '
@@ -538,12 +539,16 @@ def write_outputs(node, args, aborted):
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs(args.output_dir, exist_ok=True)
     base = os.path.join(args.output_dir, f'thrust_curve_{stamp}')
+    n = 1
+    while any(os.path.exists(base + suffix) for suffix in ('.csv', '_result.yaml', '.png')):
+        n += 1
+        base = os.path.join(args.output_dir, f'thrust_curve_{stamp}_{n}')
     v_ref = args.lipo_cells * pm.V_REF_PER_CELL
 
     result, error = None, None
     try:
         result = pm.calibrate(points, v_ref, voltage_normalization=not args.no_voltage_comp,
-                              environment_normalization=not args.no_env_comp)
+                              environment_normalization=not args.no_env_comp, u_idle=args.u_idle)
     except (ValueError, np.linalg.LinAlgError) as e:
         error = str(e)
     rows = result['rows'] if result else [{**p, 'F0': float('nan'), 'F_std': float('nan'),
@@ -597,11 +602,16 @@ def write_outputs(node, args, aborted):
                         f"current_A: {v['current']:.3f}}}\n")
             worst = max(abs(v['rel']) for v in verification)
             f.write(f'verification_worst_rel_error: {worst:.4f}\n')
+            passed = verification_verify_pass(verification)
+            f.write(f'verification_pass: {str(passed).lower()}  # |rel| <= 2% at every level\n')
+            print(f"{bcolors.OKGREEN if passed else bcolors.WARNING}verification on the scale: "
+                  f"{'PASS' if passed else 'FAIL'} (worst |rel error| {worst:.1%}){bcolors.ENDC}")
         if result and result['monotonic']:
             f.write('\n# ---- paste into parameters/custom_link_parameters.yaml ----\n')
             f.write(render_param_yaml(result, args) + '\n')
         elif result:
-            f.write('# NOT MONOTONIC on [0,1]: model rejected (fpv_test.md 3.2), repeat the test\n')
+            f.write(f'# NOT MONOTONIC on [u_idle, 1]: model rejected (spec 3.2, 2026-11-10 '
+                    f'revision), repeat the test\n')
         else:
             f.write(f'# fit failed: {error}\n')
     print(f'result YAML written to {yaml_path}')
@@ -614,8 +624,12 @@ def write_outputs(node, args, aborted):
         for w in result['warnings']:
             print(f'{bcolors.WARNING}warning: {w}{bcolors.ENDC}')
         if not result['monotonic']:
-            print(f'{bcolors.ERROR}fitted curve violates dF/du > 0 on [0,1] (min slope '
-                  f"{result['min_slope']:.4g}): rejected{bcolors.ENDC}")
+            print(f"{bcolors.ERROR}fitted curve rejected: {result.get('monotonic_reason') or 'gate failed'}"
+                  f"{bcolors.ENDC}")
+            print(f'{bcolors.WARNING}note: either the negative-slope region reaches into the '
+                  f'commandable domain [u_idle, 1], or F_std at the idle duty is non-positive '
+                  f'(typically a thrust-onset dead band or bad low-throttle data); '
+                  f'the PNG is stamped REJECTED accordingly{bcolors.ENDC}')
     else:
         print(f'{bcolors.ERROR}fit failed: {error}{bcolors.ENDC}')
 
@@ -625,6 +639,12 @@ def write_outputs(node, args, aborted):
 
 
 def plot_results(result, png_path):
+    """标定结果图: 实测 F (蓝 x) / 归一化 F_std (绿 o) + 拟合曲线。
+
+    拟合曲线在实测标定域 [0, u_max] 上实线, u_max..1 段虚线 (纯外推) 并在 u_max
+    处画竖线, 避免把外推段误读为标定结果; 非单调 (规格 §3.2 拒绝) 时标题盖章
+    REJECTED 与最小斜率。返回 matplotlib figure (None = 无 matplotlib), 便于测试。
+    """
     try:
         import matplotlib
         if not os.environ.get('DISPLAY'):
@@ -632,23 +652,43 @@ def plot_results(result, png_path):
         import matplotlib.pyplot as plt
     except Exception as e:
         print(f'{bcolors.WARNING}matplotlib unavailable ({e}), skipping plot{bcolors.ENDC}')
-        return
+        return None
     try:
         rows = result['rows']
-        plt.figure()
-        plt.plot([r['u'] for r in rows], [r['F'] for r in rows], 'bx', label='measured F')
-        plt.plot([r['u'] for r in rows], [r['F_std'] for r in rows], 'go', label='normalized F_std')
-        u = np.linspace(0.0, 1.0, 200)
-        plt.plot(u, result['a3'] * u ** 3 + result['a2'] * u ** 2 + result['a1'] * u, '-r',
-                 label='F_std(u) fit')
-        plt.xlabel('throttle duty u')
-        plt.ylabel('total thrust [N]')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(png_path)
+        # 与 calibrate 的 used 过滤同口径: 拟合实际约束的数据域上界
+        used_u = [r['u'] for r in rows if r['u'] > 0.0 and math.isfinite(r['F_std'])]
+        u_max = max(used_u) if used_u else 1.0
+
+        def curve(u):
+            return result['a3'] * u ** 3 + result['a2'] * u ** 2 + result['a1'] * u
+
+        fig = plt.figure()
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot([r['u'] for r in rows], [r['F'] for r in rows], 'bx', label='measured F')
+        ax.plot([r['u'] for r in rows], [r['F_std'] for r in rows], 'go', label='normalized F_std')
+        u_fit = np.linspace(0.0, u_max, 200)
+        ax.plot(u_fit, curve(u_fit), '-r', label='F_std(u) fit')
+        title = f'zero-intercept cubic fit, calibrated u <= {u_max:.2f}'
+        if u_max < 1.0 - 1e-9:
+            u_ext = np.linspace(u_max, 1.0, 100)
+            ax.plot(u_ext, curve(u_ext), '--r', alpha=0.55, label='extrapolated fit')
+            ax.axvline(u_max, color='0.5', linestyle=':', linewidth=1.0)
+            title += f'\nbeyond {u_max:.2f} dashed: extrapolated F(1)={curve(1.0):.1f} N'
+        if not result['monotonic']:
+            title += f'\nREJECTED (spec 3.2): {result.get("monotonic_reason") or "gate failed"}'
+            ax.set_title(title, color='tab:red', fontsize=9.5)
+        else:
+            ax.set_title(title, fontsize=9.5)
+        ax.set_xlabel('throttle duty u')
+        ax.set_ylabel('total thrust [N]')
+        ax.legend()
+        ax.grid(True)
+        fig.savefig(png_path)
         print(f'plot written to {png_path}')
+        return fig
     except Exception as e:
         print(f'{bcolors.WARNING}plotting failed ({e}){bcolors.ENDC}')
+        return None
 
 
 # ======================================================================
@@ -663,7 +703,9 @@ def parse_args(argv=None):
                              "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")
     parser.add_argument('--u-start', type=float, default=0.05, help='first throttle duty (§2.2)')
     parser.add_argument('--u-step', type=float, default=0.05, help='throttle duty step (§2.2)')
-    parser.add_argument('--u-end', type=float, default=0.50, help='last throttle duty (§2.2, adjustable)')
+    parser.add_argument('--u-end', type=float, default=1.00, help='last throttle duty (§2.2, adjustable); '
+                         'a value below 1.0 leaves the model extrapolated above it -- the fit and every '
+                         'downstream consumer still run to u=1')
     parser.add_argument('--step-time', type=float, default=2.5, help='duration of each step [s]')
     parser.add_argument('--settle-time', type=float, default=0.5,
                         help='discarded settling part of each step [s]; the rest is averaged')
@@ -687,7 +729,8 @@ def parse_args(argv=None):
     parser.add_argument('--no-verify', action='store_true',
                         help='skip the post-fit §4 verification on the scale')
     parser.add_argument('--verify-sample-time', type=float, default=3.0,
-                        help='settle+average per verification thrust level [s]')
+                        help='averaging window per verification thrust level [s]; '
+                             'the --settle-time wait runs before it, on top')
     parser.add_argument('--control-rate', type=float, default=100.0, help='command stream rate [Hz]')
     parser.add_argument('--yes', action='store_true', help='skip the Enter confirmation')
     parser.add_argument('--output-dir', type=str, default='.')
@@ -766,6 +809,13 @@ def main():
         except RuntimeError as e:
             raise FatalError(f'cannot read FC motor_idle via /fpv/cli: {e}')
         args.u_idle = node.u_idle
+        # 低于 FC u_idle 的阶实际以 c=0 (怠速) 运行并被记录在 u_idle -- 塌缩成
+        # 单个怠速数据点, 避免同 u 重复行 (motor_idle 调大时整段阶都会塌缩)。
+        collapsed = sorted({round(max(u, node.u_idle), 6) for u in args.levels})
+        if len(collapsed) < len(args.levels):
+            print(f'{bcolors.WARNING}{len(args.levels) - len(collapsed)} SOP level(s) below FC '
+                  f'u_idle {node.u_idle:.4f} collapse to a single idle step{bcolors.ENDC}')
+            args.levels = collapsed
         args.timeline = sop_timeline(args.levels, args.step_time, args.settle_time,
                                      args.cooldown_threshold, args.cooldown_time, node.u_idle)
         total = sum(d for _, _, d in args.timeline)
@@ -784,11 +834,15 @@ def main():
             node.start_testing()
             node.run_sop(args.timeline)
             if node.points and not args.no_verify and not node.abort_event.is_set():
-                result = pm.calibrate(node.points, args.lipo_cells * pm.V_REF_PER_CELL,
+                v_ref = args.lipo_cells * pm.V_REF_PER_CELL
+                result = pm.calibrate(node.points, v_ref,
                                       voltage_normalization=not args.no_voltage_comp,
-                                      environment_normalization=not args.no_env_comp)
+                                      environment_normalization=not args.no_env_comp,
+                                      u_idle=args.u_idle)
                 if result['monotonic']:
                     model = pm.PropulsionModel(result['a3'], result['a2'], result['a1'],
+                                               v_ref=v_ref,
+                                               v_min=args.lipo_cells * pm.V_MIN_PER_CELL,
                                                u_idle=args.u_idle, r_eq=result['r_eq'],
                                                k_i=result['k_i'])
                     print(f'{bcolors.OKBLUE}verifying the calibration on the scale...{bcolors.ENDC}')

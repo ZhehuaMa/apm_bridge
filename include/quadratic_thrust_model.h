@@ -57,33 +57,52 @@ namespace quadratic_thrust_model
         return (3.0 * m.a3 * u + 2.0 * m.a2) * u + m.a1;
     }
 
-    /// min_{u∈[0,1]} dF/du (端点与驻点)。
+    /// min_{u∈[u_idle,1]} dF/du (端点与驻点; u_idle 先钳到 [0,1], 范围校验见 validateModel)。
     inline double minSlopeOnUnitInterval(const PropulsionModel &m)
     {
-        double slope = std::min(standardThrustSlope(m, 0.0), standardThrustSlope(m, 1.0));
+        const double lo = std::clamp(m.u_idle, 0.0, 1.0);
+        double slope = std::min(standardThrustSlope(m, lo), standardThrustSlope(m, 1.0));
         if (m.a3 != 0.0)
         {
             const double vertex = -m.a2 / (3.0 * m.a3);
-            if (vertex > 0.0 && vertex < 1.0)
+            if (vertex > lo && vertex < 1.0)
                 slope = std::min(slope, standardThrustSlope(m, vertex));
         }
         return slope;
     }
 
-    /// §3.2 物理合法性与单调性检验 + 运行参数范围; 空串 = 合法。
-    inline std::string validateModel(const PropulsionModel &m)
+    /// 与曲线无关的参数范围校验 (有限性、u_idle/v_ref/v_min/r_eq/k_i 范围); 空串 = 合法。
+    /// 启动时 u_idle 仅为占位值 (FC motor_idle 未读), 曲线判据须等真实 u_idle
+    /// (validateModel) 再执行, 故拆出此函数。
+    inline std::string validateParameters(const PropulsionModel &m)
     {
         for (double v : {m.a3, m.a2, m.a1, m.v_ref, m.u_idle, m.r_eq, m.k_i, m.v_min})
             if (!std::isfinite(v))
                 return "parameters must be finite";
-        if (!(m.a1 > 0.0) || !(minSlopeOnUnitInterval(m) > 0.0))
-            return "thrust curve must satisfy a1 > 0 and dF/du > 0 on [0, 1]";
         if (m.u_idle < 0.0 || m.u_idle >= 1.0)
             return "u_idle must be in [0, 1)";
         if (!(m.v_ref > 0.0) || m.v_min < 0.0 || m.v_min >= m.v_ref)
             return "require v_ref > 0 and 0 <= v_min < v_ref";
         if (m.r_eq < 0.0 || m.k_i < 0.0)
             return "r_eq and k_i must be non-negative";
+        return {};
+    }
+
+    /// §3.2 物理合法性与单调性检验 + 运行参数范围; 空串 = 合法。
+    /// 单调窗口为可操作域 [u_idle, 1] (2026-11-10 修订, 与 propulsion_model.monotonic_check
+    /// 同口径): u < u_idle 被 §4 步骤 4 的饱和限幅截止、运行时不可达, 真实桨凸数据的
+    /// 无截距三次拟合常带完全落在其下的微小负斜率区。正推力条件取 F_std(u_idle) > 0:
+    /// 斜率>0 使 F 在窗口上单调递增, min F = F(u_idle), 故它蕴含窗口内恒正 (含
+    /// F_std(1) > 0) 且反解初值 w = sqrt(F/F(1)) 良定义; 单调 + F(1) > 0 并不蕴含
+    /// 窗口恒正 (曲线可在窗口左端为负、中途穿零)。u_idle=0 时退化为原版 a1 > 0。
+    inline std::string validateModel(const PropulsionModel &m)
+    {
+        const std::string param_error = validateParameters(m);
+        if (!param_error.empty())
+            return param_error;
+        if (!(minSlopeOnUnitInterval(m) > 0.0) ||
+            (m.u_idle > 0.0 && !(standardThrust(m, m.u_idle) > 0.0)))
+            return "thrust curve must satisfy dF/du > 0 on [u_idle, 1] and F_std(u_idle) > 0";
         return {};
     }
 
@@ -160,7 +179,10 @@ namespace quadratic_thrust_model
             const double u = lo + (1.0 - lo) * i / 1000.0;
             const double w = std::sqrt(standardThrust(m, u) / f_max);
             const double fit = ((coef[3] * w + coef[2]) * w + coef[1]) * w + coef[0];
-            max_error = std::max(max_error, std::abs(fit - u));
+            const double err = std::abs(fit - u);
+            if (!std::isfinite(err))
+                return -1.0; // 防御: NaN 不得经 std::max(0, NaN) 吞掉后安装全 NaN 反函数
+            max_error = std::max(max_error, err);
         }
         if (!std::isfinite(max_error))
             return -1.0;

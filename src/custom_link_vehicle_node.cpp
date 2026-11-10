@@ -160,20 +160,29 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
         throw std::invalid_argument("Invalid SITL mass, gravity or timeout");
     if (!std::isfinite(voltage_lpf_hz) || voltage_lpf_hz < 2.0 || voltage_lpf_hz > 5.0)
         throw std::invalid_argument("voltage_lpf_hz must be within 2..5 Hz (fpv_test.md section 4)");
-    // a3..a1 全零 = 未标定: 只允许 raw 油门通道 (台架标定工具即走 raw); 已标定模型须通过
-    // §3.2 单调性/合法性校验, 否则拒绝启动。
+    // a3..a1 全零 = 未标定: 只允许 raw 油门通道 (台架标定工具即走 raw); 已标定模型须
+    // 通过 §3.2 合法性校验。曲线判据 (dF/du > 0 on [u_idle,1]) 的窗口依赖 FC
+    // motor_idle, 此刻 u_idle 只是占位值: 只硬性校验与 u_idle 无关的部分, 曲线判据
+    // 延后到 queryMotorIdle 用真实 u_idle 复检 (通过前力指令被 propulsion_valid 拒绝)。
     if (quadratic_thrust_model::configured(propulsion))
     {
-        const std::string model_error = quadratic_thrust_model::validateModel(propulsion);
-        if (!model_error.empty())
-            throw std::invalid_argument("Invalid motor_parameters: " + model_error);
-        RCLCPP_INFO(this->get_logger(),
-                    "Propulsion model: F_std(u) = %.6g u^3 + %.6g u^2 + %.6g u N (F(1)=%.3f N), "
-                    "V_ref=%.2f V, R_eq=%.4g ohm, k_i=%.4g A/N, V_min=%.1f V, LPF %.1f Hz; "
-                    "u_idle pending FC motor_idle (CLI)",
-                    propulsion.a3, propulsion.a2, propulsion.a1,
-                    quadratic_thrust_model::standardThrust(propulsion, 1.0), propulsion.v_ref,
-                    propulsion.r_eq, propulsion.k_i, propulsion.v_min, voltage_lpf_hz);
+        const std::string param_error = quadratic_thrust_model::validateParameters(propulsion);
+        if (!param_error.empty())
+            throw std::invalid_argument("Invalid motor_parameters: " + param_error);
+        const std::string curve_error = quadratic_thrust_model::validateModel(propulsion);
+        if (curve_error.empty())
+            RCLCPP_INFO(this->get_logger(),
+                        "Propulsion model: F_std(u) = %.6g u^3 + %.6g u^2 + %.6g u N (F(1)=%.3f N), "
+                        "V_ref=%.2f V, R_eq=%.4g ohm, k_i=%.4g A/N, V_min=%.1f V, LPF %.1f Hz; "
+                        "u_idle pending FC motor_idle (CLI)",
+                        propulsion.a3, propulsion.a2, propulsion.a1,
+                        quadratic_thrust_model::standardThrust(propulsion, 1.0), propulsion.v_ref,
+                        propulsion.r_eq, propulsion.k_i, propulsion.v_min, voltage_lpf_hz);
+        else
+            RCLCPP_WARN(this->get_logger(),
+                        "motor_parameters: \"%s\" at the provisional u_idle=%.4f; re-validated "
+                        "once the FC motor_idle is read (force commands rejected until it passes)",
+                        curve_error.c_str(), propulsion.u_idle);
     }
     else
         RCLCPP_WARN(this->get_logger(),
@@ -1170,6 +1179,14 @@ void CustomLinkVehicleNode::ctrlCommandCallback(const quadrotor_msgs::msg::Contr
                              "Dropping control command: FC motor_idle (u_idle) not yet read via CLI");
         return;
     }
+    // 模型未在真实 u_idle 下通过 §3.2 曲线判据 (非单调窗口/怠速点推力非正)。
+    if (!propulsion_valid.load())
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                              "Dropping control command: thrust model failed the section 3.2 "
+                              "gate at the FC motor_idle");
+        return;
+    }
 
     if (command->collective_thrust < 1e-6) // 准备落地上锁
         set_unarm = true;
@@ -1436,7 +1453,19 @@ bool CustomLinkVehicleNode::queryMotorIdle()
         std::lock_guard<std::mutex> lk(mtx_kp);
         propulsion.u_idle = idle;
         if (quadratic_thrust_model::configured(propulsion))
-            inverse_error = quadratic_thrust_model::initInverse(propulsion);
+        {
+            // §3.2 曲线判据此刻才有真实窗口: 不通过则拒绝力指令 (raw 通道不受影响),
+            // 而不是静默退回 §5 原始初值在非单调窗口上跑牛顿迭代。
+            const std::string curve_error = quadratic_thrust_model::validateModel(propulsion);
+            propulsion_valid = curve_error.empty();
+            if (curve_error.empty())
+                inverse_error = quadratic_thrust_model::initInverse(propulsion);
+            else
+                RCLCPP_ERROR(this->get_logger(),
+                             "motor_parameters fail the section 3.2 gate at the FC u_idle=%.4f: "
+                             "%s; force commands rejected",
+                             idle, curve_error.c_str());
+        }
         motor_idle_known = true;
     }
     if (inverse_error >= 0.0)

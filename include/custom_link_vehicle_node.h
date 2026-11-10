@@ -186,6 +186,9 @@ namespace custom_link_bridge
         // ---- 参数 ----
         quadratic_thrust_model::PropulsionModel propulsion; // fpv_test.md §4 在线反解模型
         std::atomic_bool motor_idle_known{false}; // propulsion.u_idle 已由飞控 CLI 读回 (持 mtx_kp 写 u_idle 后置位)
+        // §3.2 曲线判据 (dF/du>0 on [u_idle,1], 判据窗口依赖 u_idle) 已在真实 FC
+        // motor_idle 下复检通过; 未通过时力指令被拒 (raw 通道不受影响)。
+        std::atomic_bool propulsion_valid{false};
         double voltage_lpf_hz = 3.0; // §4 母线电压低通截止频率 (2~5 Hz)
         double gravity = 9.80665;
         double mass = 2.0;

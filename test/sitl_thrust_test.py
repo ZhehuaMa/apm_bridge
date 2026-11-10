@@ -268,6 +268,19 @@ def main():
         results['csv_points'] = ok
         print(f'csv forces: {forces}')
 
+        # 结果 YAML 必须给出单调通过 + 可粘贴参数片段 (此前从不检查, 工具
+        # 输出坏结果时端到端测试照绿)
+        yaml_files = sorted(f for f in os.listdir(out_dir) if f.endswith('_result.yaml'))
+        ok = bool(yaml_files)
+        if ok:
+            import yaml
+            with open(os.path.join(out_dir, yaml_files[-1])) as f:
+                result = yaml.safe_load(f)
+            ok = result.get('monotonic') is True and \
+                'custom_link_bridge' in result  # paste block present
+        results['result_yaml'] = ok
+        print(f'result yaml: monotonic={ok}')
+
         weight_sim_node_holder.running = False
         executor.remove_node(observer)
         executor.remove_node(weight_sim_node_holder.pub_node)
