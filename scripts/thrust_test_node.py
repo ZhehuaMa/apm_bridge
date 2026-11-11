@@ -514,11 +514,16 @@ class ThrustTestNode(Node):
         print(f'{bcolors.OKGREEN}START TESTING...{bcolors.ENDC}')
 
     def shutdown_sequence(self):
-        """油门回最低 + 上锁并等待确认 (executor 仍在 spin)。"""
+        """油门回最低 + 上锁并等待确认 (executor 仍在 spin)。
+
+        self.testing 先于 arm=False 清除: 2 Hz 保活电平 `testing or _arm_intent`
+        否则会在解锁后重发 True, FC (host arm ≡ BOXARM 电平) 随即重新解锁,
+        _wait_armed(False) 等不到 (同 motor_check 2026-11-11 真机竞争)。"""
         self.quiet = True
         with self.lock:
             self.collective = 0.0
             self.window = None
+            self.testing = False   # 先落保活电平, 再请求上锁
             self.disarming = True
             self._arm_intent = False
         try:
@@ -526,7 +531,6 @@ class ThrustTestNode(Node):
             self._wait_armed(False, max(DISARM_STREAM_TIME, 5.0))
         finally:
             with self.lock:
-                self.testing = False
                 self.disarming = False
                 self._offboard_intent = False
             if self.offboard_pub is not None:

@@ -69,7 +69,7 @@ def fetch_u_idle(node, timeout=5.0, spin=False):
     return u_idle
 
 
-def cli_command(node, cmd, args, timeout=5.0, spin=False, attempts=3):
+def cli_command(node, cmd, args, timeout=5.0, spin=False, attempts=5):
     """经 custom_link_bridge 的 /fpv/cli 执行一条 CLI 命令, 返回回读文本。
 
     cmd 取 CliCommand.Request.CMD_*; spin=True 时用 rclpy.spin_once 驱动 (调用方

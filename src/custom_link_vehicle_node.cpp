@@ -436,9 +436,13 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
             }
             case MSG_FC_SLOW:
             {
+                // 0x12 允许尾部扩展 (固件在 36B 基础字段后追加了诊断计数器,
+                // 同 0x11 追加 rssi_pct 的向前兼容手法): 按前缀解包, 忽略尾部。
                 PayloadSlow p;
-                if (frame.as(p))
+                if (frame.len >= sizeof(PayloadSlow)) {
+                    memcpy(&p, frame.payload.data(), sizeof(PayloadSlow));
                     handleSlow(p, hostUs);
+                }
                 break;
             }
             case MSG_FC_ODOMETRY:
