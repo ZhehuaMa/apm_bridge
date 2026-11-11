@@ -62,6 +62,39 @@ def fetch_u_idle(node, timeout=5.0, spin=False):
     spin=True: 调用方未在后台 spin 该节点 (rclpy.spin_once 驱动); 否则仅等待 future。
     失败抛 RuntimeError。
     """
+    text = cli_command(node, 0, MOTOR_IDLE_SETTING, timeout=timeout, spin=spin)  # 0 = CMD_GET
+    u_idle = idle_duty_from_cli(text)
+    if not math.isfinite(u_idle):
+        raise RuntimeError(f'unexpected motor_idle reply: {text!r}')
+    return u_idle
+
+
+def cli_command(node, cmd, args, timeout=5.0, spin=False, attempts=3):
+    """经 custom_link_bridge 的 /fpv/cli 执行一条 CLI 命令, 返回回读文本。
+
+    cmd 取 CliCommand.Request.CMD_*; spin=True 时用 rclpy.spin_once 驱动 (调用方
+    无后台 executor)。失败抛 RuntimeError。注意 MODE_LOOKUP 类设置 (ON/OFF 表)
+    的 SET 只认字符串值 ("ON"/"OFF"), 数字会被 CLI 引擎拒绝。
+
+    attempts>1 时对超时类失败重试, 退避间隔递增 0.5/2/5 s (真机实测 CLI 通道存在
+    与近期 0x20 活动相关的时间窗性 SET 阻塞, 数分钟后自愈 -- 超时的 SET 在 FC 侧
+    未被应用, 幂等的 GET/SET 重试安全; 非超时类拒绝立即上抛)。
+    """
+    import time as _time
+    last_error = None
+    backoffs = (0.5, 2.0, 5.0, 5.0, 5.0)
+    for attempt in range(attempts):
+        try:
+            return _cli_command_once(node, cmd, args, timeout, spin)
+        except RuntimeError as e:
+            last_error = e
+            if 'timed out' not in str(e) or attempt == attempts - 1:
+                raise
+            _time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+    raise last_error
+
+
+def _cli_command_once(node, cmd, args, timeout, spin):
     import time
     import rclpy
     from quadrotor_msgs.srv import CliCommand
@@ -70,7 +103,7 @@ def fetch_u_idle(node, timeout=5.0, spin=False):
     try:
         if not client.wait_for_service(timeout_sec=timeout):
             raise RuntimeError('/fpv/cli service unavailable (is custom_link_bridge_node running?)')
-        request = CliCommand.Request(cmd=CliCommand.Request.CMD_GET, args=MOTOR_IDLE_SETTING)
+        request = CliCommand.Request(cmd=cmd, args=args)
         future = client.call_async(request)
         deadline = time.monotonic() + timeout
         while not future.done() and time.monotonic() < deadline:
@@ -80,14 +113,11 @@ def fetch_u_idle(node, timeout=5.0, spin=False):
                 time.sleep(0.02)
         if not future.done():
             future.cancel()
-            raise RuntimeError('/fpv/cli get motor_idle timed out')
+            raise RuntimeError(f'cli {args!r} timed out')
         response = future.result()
         if not response.ok or response.status != 0:
-            raise RuntimeError(f'FC rejected get motor_idle: {response.error or response.text}')
-        u_idle = idle_duty_from_cli(response.text)
-        if not math.isfinite(u_idle):
-            raise RuntimeError(f'unexpected motor_idle reply: {response.text!r}')
-        return u_idle
+            raise RuntimeError(f'cli {args!r} rejected: {response.error or response.text}')
+        return response.text
     finally:
         node.destroy_client(client)
 

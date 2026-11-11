@@ -736,7 +736,12 @@ Inputs: `/current_weight` (`[weight_kg, stable_weight_kg]`, ≥ 10 Hz, e.g.
 FC `motor_idle` via `/fpv/cli` (u_idle: duty of collective 0 and of the idle
 cooldown; recorded in the result, not written as a parameter).
 
-The control stream is **BODY_RATES by default** (zero rates + raw collective);
+The control stream is **MOTOR_DIRECT by default** (0x20 mode_req=1: pure
+collective, the FC bypasses the PID differential - bench vibration at high
+throttle cannot excite the rate loop; the tool enables the FC-side
+`custom_link_motor_direct` gate via `/fpv/cli` for the run and reverts it on
+exit; old firmware without the setting falls back to BODY_RATES with a
+warning). `--rates` forces the classic BODY_RATES (zero rates) mode;
 `--attitude` switches to ATTITUDE with orientation echo (keeps thrust constant
 while tilted). Procedure (§2.2, all adjustable): tare before arming, then duty
 steps `u = 0.05, 0.10 … 1.00` (20 steps); each step lasts 2.5 s — the first
@@ -779,7 +784,11 @@ ros2 run apm_bridge thrust_test_node --no-env-comp --no-voltage-comp \
   --yes --output-dir /tmp
 ```
 
-`motor_check_node` is a props-off link/arm/throttle smoke test (no scale needed).
+`motor_check_node` is a props-off link/arm/throttle smoke test (no scale
+needed). Like `thrust_test_node` it defaults to the MOTOR_DIRECT (mode_req=1)
+control mode - enabling `custom_link_motor_direct` on the FC via `/fpv/cli` for
+the run and reverting it on exit - so bench vibration does not reach the rate
+PID; `--rates` forces the classic BODY_RATES mode.
 
 ## SITL motor calibration (flight pulses)
 

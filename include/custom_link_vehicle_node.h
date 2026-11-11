@@ -230,6 +230,9 @@ namespace custom_link_bridge
         rclcpp::Time cmd_stamp{0, 0, RCL_ROS_TIME};
         bool cmd_valid = false;
         bool cmd_angle = false;
+        // mode_req=1 (motor-direct bench mode): 纯集体油门, FC 侧 PID 差动旁路。
+        // 仅 raw 话题的 MOTOR_DIRECT 指令置位; 力指令路径恒 false。
+        bool cmd_motor_direct = false;
         bool set_unarm = false;
 
         // 姿态/IMU 快照（0x10 读取线程写，本线程发布）

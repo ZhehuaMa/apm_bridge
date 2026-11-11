@@ -1068,6 +1068,7 @@ void CustomLinkVehicleNode::pushControl()
                 else
                     input.throttle = cmd_thrust;
                 input.angle = cmd_angle;
+                input.motor_direct = cmd_motor_direct;
                 fresh = true;
             }
             else
@@ -1231,7 +1232,10 @@ void CustomLinkVehicleNode::ctrlCommandRawCallback(const quadrotor_msgs::msg::Co
 
     // 与 ctrlCommandCallback 同一套 ATTITUDE -> 角度模式映射；区别仅在油门：
     // 本回调的 collective_thrust 已是归一化推力 0..1，直接透传。
+    // MOTOR_DIRECT（mode_req=1，台架标定专用）：纯集体油门直通，姿态/角速度
+    // 全部旁路 —— FC 端丢弃 PID 差动项，需 custom_link_motor_direct=ON 才受理。
     const bool angle = command->control_mode == quadrotor_msgs::msg::ControlCommand::ATTITUDE;
+    const bool motor_direct = command->control_mode == quadrotor_msgs::msg::ControlCommand::MOTOR_DIRECT;
     std::array<double, 3> setpoints{command->bodyrates.x, command->bodyrates.y, command->bodyrates.z};
     if (angle && !attitudeSetpoints(*command, setpoints))
     {
@@ -1247,6 +1251,7 @@ void CustomLinkVehicleNode::ctrlCommandRawCallback(const quadrotor_msgs::msg::Co
 
     std::lock_guard<std::mutex> lk(mtx_cmd);
     cmd_angle = angle;
+    cmd_motor_direct = motor_direct;
     cmd_setpoints = setpoints;
     cmd_thrust = std::clamp(command->collective_thrust, 0.0, 1.0);
     cmd_force_mode = false;

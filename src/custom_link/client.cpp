@@ -572,6 +572,8 @@ namespace custom_link
                             input.mode_req = *mode_request_;
                         if (input.mode_req == 2 && input.angle)
                             input.mode_req = 3;
+                        if (input.mode_req == 2 && input.motor_direct)
+                            input.mode_req = 1;
                         mode_revision = mode_request_revision_;
                         mode_pending = mode_revision != mode_request_sent_revision_;
                         if (mode_pending && rearm_pending_)

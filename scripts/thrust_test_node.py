@@ -33,6 +33,10 @@ Ctrl+C 安全关停 (油门回最低、上锁), 已采数据照常输出。
   ros2 run apm_bridge thrust_test_node --lipo-cells 6                      # 真机/台架 (默认主机接管 OFFBOARD)
   ros2 run apm_bridge thrust_test_node --lipo-cells 6 --no-offboard        # 由飞手持 BOXOFFBOARD
   ros2 run apm_bridge thrust_test_node --no-env-comp --no-voltage-comp --yes   # AirSim (无气压/压降)
+
+控制模式: 默认 MOTOR_DIRECT (0x20 mode_req=1, 纯集体油门, FC PID 差动旁路 —— 台架
+大油门振动不经速率环正反馈; 启动时经 /fpv/cli 开 custom_link_motor_direct=ON, 退出
+还原)。--rates 回退经典 BODY_RATES; --attitude 用 ATTITUDE 姿态回显。
 """
 
 from __future__ import annotations
@@ -60,6 +64,7 @@ try:
     from rclpy.signals import SignalHandlerOptions
 
     from quadrotor_msgs.msg import ControlCommand
+    from quadrotor_msgs.srv import CliCommand
     from mavros_msgs.msg import State
     from sensor_msgs.msg import BatteryState, FluidPressure, Imu, Temperature
     from std_msgs.msg import Bool, Float32MultiArray
@@ -152,6 +157,11 @@ def verification_verify_pass(verification, max_rel_error=0.02):
 def new_window(u, collective, n_motors=0):
     return {'u': u, 'collective': collective, 'weight': [], 'V': [], 'I': [],
             'rpm': [[] for _ in range(n_motors)], 'P': [], 't': []}
+
+
+def cli_command(node, cmd, args, timeout=10.0):
+    """经 /fpv/cli 执行一条 CLI 命令 (CMD_GET/CMD_SET); 实现见 pm.cli_command。"""
+    return pm.cli_command(node, cmd, args, timeout=timeout)
 
 
 def render_param_yaml(result, args):
@@ -306,12 +316,19 @@ class ThrustTestNode(Node):
     # ---------------------------------------------------------- 定时器
 
     def control_timer_cb(self):
-        """默认 BODY_RATES: 零角速度 + 直通集体油门 (raw 通道纯油门直通)。
+        """默认 MOTOR_DIRECT (mode_req=1): 纯集体油门, FC 侧 PID 差动旁路 —— 台架
+        大油门振动不再经速率环正反馈失控。
 
-        --attitude 时改用 ATTITUDE + 姿态回显 (验证段的恒推力不随倾斜掉秤)。"""
+        --attitude 改用 ATTITUDE + 姿态回显; --rates 回退经典 BODY_RATES 零角速度
+        (旧固件无 custom_link_motor_direct 时的降级路径)。"""
         cmd = ControlCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.control_mode = ControlCommand.ATTITUDE if self.args.attitude else ControlCommand.BODY_RATES
+        if getattr(self.args, 'motor_direct', False):
+            cmd.control_mode = ControlCommand.MOTOR_DIRECT
+        elif self.args.attitude:
+            cmd.control_mode = ControlCommand.ATTITUDE
+        else:
+            cmd.control_mode = ControlCommand.BODY_RATES
         with self.lock:
             cmd.armed = self.testing
             cmd.collective_thrust = min(max(self.collective, 0.0), 1.0)
@@ -724,8 +741,12 @@ def parse_args(argv=None):
                         help='skip §3.1 steps 3-4 (no voltage sag, e.g. AirSim; pairs with '
                              'voltage_compensation=false)')
     parser.add_argument('--attitude', action='store_true',
-                        help='use ATTITUDE + orientation echo instead of the default BODY_RATES '
-                             '(zero rates); verification holds thrust constant while tilted')
+                        help='use ATTITUDE + orientation echo instead of the default motor-direct '
+                             'mode; verification holds thrust constant while tilted')
+    parser.add_argument('--rates', action='store_true',
+                        help='use the classic BODY_RATES (zero rates) control instead of the '
+                             'default motor-direct mode (PID active - prone to vibration '
+                             'positive feedback on the bench at high throttle)')
     parser.add_argument('--no-verify', action='store_true',
                         help='skip the post-fit §4 verification on the scale')
     parser.add_argument('--verify-sample-time', type=float, default=3.0,
@@ -809,6 +830,19 @@ def main():
         except RuntimeError as e:
             raise FatalError(f'cannot read FC motor_idle via /fpv/cli: {e}')
         args.u_idle = node.u_idle
+        # 默认走纯油门直通 (mode_req=1): FC 端 custom_link_motor_direct 闸门经
+        # /fpv/cli 开启 (RAM-only, 断电即恢复 OFF, 退出时亦还原)。旧固件不认该
+        # 设置 -> 告警并降级 BODY_RATES (PID 仍会响应振动)。
+        args.motor_direct = not (args.rates or args.attitude)
+        if args.motor_direct:
+            try:
+                cli_command(node, CliCommand.Request.CMD_SET, 'custom_link_motor_direct = ON')
+                print(f'{bcolors.OKGREEN}motor-direct mode: FC gate enabled (custom_link_motor_direct=ON, '
+                      f'reverted on exit/power-cycle){bcolors.ENDC}')
+            except RuntimeError as e:
+                args.motor_direct = False
+                print(f'{bcolors.WARNING}motor-direct unavailable ({e}); falling back to BODY_RATES - '
+                      f'the rate PID will react to bench vibration at high throttle{bcolors.ENDC}')
         # 低于 FC u_idle 的阶实际以 c=0 (怠速) 运行并被记录在 u_idle -- 塌缩成
         # 单个怠速数据点, 避免同 u 重复行 (motor_idle 调大时整段阶都会塌缩)。
         collapsed = sorted({round(max(u, node.u_idle), 6) for u in args.levels})
@@ -858,6 +892,12 @@ def main():
         aborted = aborted or node.abort_event.is_set()
         if started:
             node.shutdown_sequence()
+        if getattr(args, 'motor_direct', False):
+            try:  # 还原 FC 闸门 (best-effort; 断电/重启亦自动恢复 OFF)
+                cli_command(node, CliCommand.Request.CMD_SET, 'custom_link_motor_direct = OFF')
+            except RuntimeError as e:
+                print(f'{bcolors.WARNING}failed to revert custom_link_motor_direct=OFF '
+                      f'({e}); power-cycling the FC also restores the default{bcolors.ENDC}')
         print('\nSTOP TESTING')
         executor.remove_node(node)
         rclpy.shutdown()

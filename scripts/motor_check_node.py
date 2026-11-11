@@ -12,6 +12,9 @@ thrust_test_node 的轻量版冒烟测试，不需要台秤/气压温度，用�
   /fpv/offboard, 无需飞手持 BOXOFFBOARD 开关 (固件接受 mode_req 新边沿即接管);
   --no-offboard 退回飞手侧 BOXOFFBOARD 授权。上锁请求后控制流继续保持
   DISARM_STREAM_TIME 秒，让 arm=0 边沿随 0x20 帧送达 FC。
+  控制模式默认 MOTOR_DIRECT (0x20 mode_req=1 纯油门直通, FC PID 差动旁路,
+  台架振动不经速率环; 启动时经 /fpv/cli 开 custom_link_motor_direct=ON, 退出
+  还原 OFF)。旧固件不认该设置时告警并降级 BODY_RATES; --rates 强制旧模式。
 
 安全: 保持期间 FC 意外掉锁立即中止; Ctrl+C 随时安全关停 (油门归零 +
 上锁)。真机检查请先卸桨或将机体可靠固定!
@@ -39,7 +42,10 @@ from rclpy.signals import SignalHandlerOptions
 from mavros_msgs.msg import State
 from sensor_msgs.msg import BatteryState
 from quadrotor_msgs.msg import ControlCommand
+from quadrotor_msgs.srv import CliCommand
 from std_msgs.msg import Bool
+
+import propulsion_model as pm
 
 # 上锁后控制流需继续保持，arm=0 边沿随 0x20 帧送达 FC (同 thrust_test_node)
 DISARM_STREAM_TIME = 2.0
@@ -125,10 +131,12 @@ class MotorCheckNode(Node):
     # ---------------------------------------------------------- 定时器回调
 
     def control_timer_cb(self):
-        """控制流: BODY_RATES 模式 + 零角速度 + 直通油门。"""
+        """控制流: 默认 MOTOR_DIRECT (mode_req=1 纯油门直通, FC PID 差动旁路);
+        --rates 时回退 BODY_RATES + 零角速度 (旧固件降级路径)。"""
         cmd = ControlCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
-        cmd.control_mode = ControlCommand.BODY_RATES
+        cmd.control_mode = (ControlCommand.MOTOR_DIRECT if getattr(self.args, 'motor_direct', False)
+                            else ControlCommand.BODY_RATES)
         with self.lock:
             cmd.armed = self.testing
             cmd.collective_thrust = min(max(self.thrust_pct / 100.0, 0.0), 1.0)
@@ -291,6 +299,9 @@ def parse_args():
     parser.add_argument('--no-offboard', action='store_true',
                         help='do not publish /fpv/offboard; OFFBOARD stays with the pilot '
                              "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")
+    parser.add_argument('--rates', action='store_true',
+                        help='use the classic BODY_RATES (zero rates) control instead of the '
+                             'default motor-direct mode (PID active - reacts to vibration)')
     parser.add_argument('--yes', action='store_true',
                         help='skip the Enter confirmation before starting')
     return parser.parse_args()
@@ -359,6 +370,18 @@ def main():
                              'is custom_link_bridge running?')
         print(f'{bcolors.OKBLUE}custom-link: {"pilot must hold the BOXOFFBOARD switch" if args.no_offboard else "host takes OFFBOARD via the link (/fpv/offboard)"} '
               f'for host arming{bcolors.ENDC}')
+        # 默认纯油门直通 (mode_req=1): FC 闸门经 /fpv/cli 开启 (RAM-only), 退出还原。
+        # 旧固件不认该设置 -> 告警并降级 BODY_RATES。
+        args.motor_direct = not args.rates
+        if args.motor_direct:
+            try:
+                pm.cli_command(node, CliCommand.Request.CMD_SET, 'custom_link_motor_direct = ON')
+                print(f'{bcolors.OKGREEN}motor-direct mode: FC gate enabled '
+                      f'(custom_link_motor_direct=ON, reverted on exit/power-cycle){bcolors.ENDC}')
+            except RuntimeError as e:
+                args.motor_direct = False
+                print(f'{bcolors.WARNING}motor-direct unavailable ({e}); falling back to '
+                      f'BODY_RATES - the rate PID will react to vibration{bcolors.ENDC}')
         if not confirm_start(args, node.abort_event):
             node.abort_event.set()
         else:
@@ -373,6 +396,12 @@ def main():
         exit_code = 1
     finally:
         node.shutdown_sequence()
+        if getattr(args, 'motor_direct', False):
+            try:  # 还原 FC 闸门 (best-effort; 断电/重启亦自动恢复 OFF)
+                pm.cli_command(node, CliCommand.Request.CMD_SET, 'custom_link_motor_direct = OFF')
+            except RuntimeError as e:
+                print(f'{bcolors.WARNING}failed to revert custom_link_motor_direct=OFF '
+                      f'({e}); power-cycling the FC also restores the default{bcolors.ENDC}')
         executor.remove_node(node)
         rclpy.shutdown()
         spin_thread.join(timeout=2.0)

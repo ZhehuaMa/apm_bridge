@@ -61,9 +61,11 @@ SOP_ARGS = ['--yes', '--no-plot', '--u-start', '0.1', '--u-step', '0.1', '--u-en
 
 class FakeBridge(Node):
 
-    def __init__(self, airsim):
+    def __init__(self, airsim, reject_motor_direct_set=False):
         super().__init__('fake_bridge')
         self.airsim = airsim
+        self.reject_motor_direct_set = reject_motor_direct_set  # 仿真旧固件 (无该设置)
+        self.motor_direct_on = False
         self.lock = threading.Lock()
         self.armed = False
         self.offboard = False   # /fpv/offboard 电平 (主机经链路直接接管, 无需飞手开关)
@@ -94,10 +96,28 @@ class FakeBridge(Node):
             self.commands.append((time.monotonic(), msg.collective_thrust, bool(msg.armed), msg))
 
     def on_cli(self, request, response):
+        # 复刻固件 CLI 通道语义: motor_idle GET + custom_link_motor_direct GET/SET
+        # (MODE_LOOKUP 值只认 ON/OFF 字符串; SET 回读新值)。
         response.ok = True
-        if request.cmd == CliCommand.Request.CMD_GET and request.args == 'motor_idle':
-            self.cli_gets.append(request.args)
+        args = (request.args or '').strip()
+        if request.cmd == CliCommand.Request.CMD_GET and args == 'motor_idle':
+            self.cli_gets.append(args)
             response.status, response.text = 0, f'motor_idle = {FC_MOTOR_IDLE}'
+        elif args.startswith('custom_link_motor_direct'):
+            if self.reject_motor_direct_set:
+                response.status, response.text = 1, 'SET FAILED'
+            elif request.cmd == CliCommand.Request.CMD_SET:
+                value = args.split('=', 1)[1].strip() if '=' in args else ''
+                if value.upper() not in ('ON', 'OFF'):
+                    response.status, response.text = 1, 'SET FAILED'
+                else:
+                    self.motor_direct_on = value.upper() == 'ON'
+                    response.status, response.text = 0, f'custom_link_motor_direct = {value.upper()}'
+            elif request.cmd == CliCommand.Request.CMD_GET and args == 'custom_link_motor_direct':
+                response.status = 0
+                response.text = f'custom_link_motor_direct = {"ON" if self.motor_direct_on else "OFF"}'
+            else:
+                response.status, response.text = 1, 'NOT FOUND'
         else:
             response.status, response.text = 1, 'NOT FOUND'
         return response
@@ -149,9 +169,9 @@ class FakeBridge(Node):
             self.temp_pub.publish(Temperature(temperature=TEMPERATURE))
 
 
-def run_tool(airsim, out_dir, extra):
+def run_tool(airsim, out_dir, extra, reject_motor_direct_set=False):
     rclpy.init()
-    fake = FakeBridge(airsim)
+    fake = FakeBridge(airsim, reject_motor_direct_set)
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(fake)
     spin = threading.Thread(target=executor.spin, daemon=True)
@@ -186,19 +206,23 @@ def check(results, name, ok, detail=''):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}")
 
 
-def hardware_mode(out_dir, results):
-    print('== hardware mode (baro + sag + RPM + current) ==')
-    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'])
+def hardware_mode(out_dir, results, reject_gate=False, prefix='hw'):
+    label = 'old-firmware fallback' if reject_gate else 'motor-direct'
+    print(f'== hardware mode ({label}: baro + sag + RPM + current) ==')
+    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'],
+                                                   reject_motor_direct_set=reject_gate)
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
-    check(results, 'hw_exit', proc.returncode == 0, f'rc={proc.returncode}')
-    check(results, 'hw_arm_disarm', True in arm_calls and False in arm_calls)
-    check(results, 'hw_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
+    check(results, f'{prefix}_exit', proc.returncode == 0, f'rc={proc.returncode}')
+    check(results, f'{prefix}_arm_disarm', True in arm_calls and False in arm_calls)
+    check(results, f'{prefix}_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
     test_cmds = [msg for _, _, armed, msg in ((t, c, a, m) for t, c, a, m in commands) if armed]
-    mode_ok = test_cmds and all(m.control_mode == ControlCommand.BODY_RATES for m in test_cmds) and \
+    expected_mode = ControlCommand.BODY_RATES if reject_gate else ControlCommand.MOTOR_DIRECT
+    mode_ok = test_cmds and all(m.control_mode == expected_mode for m in test_cmds) and \
         all(abs(m.bodyrates.x) < 1e-12 and abs(m.bodyrates.y) < 1e-12 and abs(m.bodyrates.z) < 1e-12
             for m in test_cmds)
-    check(results, 'hw_body_rates_stream', mode_ok)
+    check(results, f'{prefix}_control_stream', mode_ok,
+          f'{len(test_cmds)} armed cmds, mode={expected_mode}')
 
     # step order with an idle cooldown (collective 0) after each u >= 0.70 step
 
@@ -265,12 +289,28 @@ def airsim_mode(out_dir, results):
     check(results, 'airsim_rpm_nan', all(math.isnan(float(r['rpm_rms'])) for r in rows))
 
 
+def hardware_fallback_mode(out_dir, results):
+    """旧固件降级路径: CLI SET custom_link_motor_direct 被拒 -> 告警 + BODY_RATES。"""
+    print('== hardware mode (old firmware: gate SET rejected) ==')
+    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'],
+                                                   reject_motor_direct_set=True)
+    if proc.returncode != 0:
+        print(proc.stdout[-3000:], proc.stderr[-2000:])
+    check(results, 'fb_exit', proc.returncode == 0, f'rc={proc.returncode}')
+    test_cmds = [m for _, _, armed, m in commands if armed]
+    check(results, 'fb_body_rates_fallback', bool(test_cmds) and
+          all(m.control_mode == ControlCommand.BODY_RATES for m in test_cmds))
+    check(results, 'fb_warning_logged', 'falling back to BODY_RATES' in proc.stdout)
+
+
 def main():
     results = {}
     with tempfile.TemporaryDirectory(prefix='thrust_test_offline_') as out_dir:
         os.makedirs(os.path.join(out_dir, 'hw'))
+        os.makedirs(os.path.join(out_dir, 'hw_fallback'))
         os.makedirs(os.path.join(out_dir, 'airsim'))
         hardware_mode(os.path.join(out_dir, 'hw'), results)
+        hardware_fallback_mode(os.path.join(out_dir, 'hw_fallback'), results)
         airsim_mode(os.path.join(out_dir, 'airsim'), results)
     print('\n===== summary =====')
     for k, v in results.items():
