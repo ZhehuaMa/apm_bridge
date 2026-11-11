@@ -41,6 +41,8 @@ namespace custom_link
         double rate_dps_or_angle_deg[3] = {0, 0, 0}; // BF body rates deg/s or roll/pitch angle degrees
         uint8_t mode_req = 2;        // offboard
         bool angle = false;          // mode 3: roll/pitch angle degrees, yaw rate deg/s
+        bool motor_direct = false;   // mode 1: pure collective, FC PID bypassed (bench only;
+                                     //   the FC ignores it unless custom_link_motor_direct is on)
     };
 
     struct LinkStats

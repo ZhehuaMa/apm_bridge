@@ -83,7 +83,9 @@ namespace custom_link
             uint64_t host_ts_us;       // 主机单调时钟 us
             uint16_t cmd_seq;
             uint8_t arm;
-            uint8_t mode_req;          // 0 manual, 1 reserved, 2 offboard rates, 3 native ANGLE
+            uint8_t mode_req;          // 0 manual, 1 motor-direct bench mode (pure collective, PID
+                                       //   differential bypassed; FC gates it behind custom_link_motor_direct),
+                                       //   2 offboard rates, 3 native ANGLE
             uint16_t throttle;         // 1000..2000
             int16_t rate_x10[3];       // 0.1 deg/s (BF 体轴)
         };
