@@ -43,7 +43,8 @@ def run_check(fake, extra):
         with fake.lock:
             commands, arm_calls = list(fake.commands), list(fake.arm_calls)
             gate = fake.motor_direct_on
-        return proc, commands, arm_calls, gate
+            rearm = fake.rearm_after_disarm
+        return proc, commands, arm_calls, gate, rearm
     finally:
         executor.shutdown()
         spin.join(timeout=2.0)
@@ -60,21 +61,22 @@ def main():
     try:
         print('== motor-direct (gate accepted) ==')
         fake = FakeBridge(False)
-        proc, commands, arm_calls, gate = run_check(fake, [])
+        proc, commands, arm_calls, gate, rearm = run_check(fake, [])
         check(results, 'md_exit', proc.returncode == 0, f'rc={proc.returncode}')
         armed_cmds = [m for _, _, armed, m in commands if armed]
         check(results, 'md_motor_direct_stream', bool(armed_cmds) and
               all(m.control_mode == ControlCommand.MOTOR_DIRECT for m in armed_cmds),
               f'{len(armed_cmds)} armed cmds')
         check(results, 'md_throttle_passthrough',
-              armed_cmds and any(abs(m.collective_thrust - 0.2) < 1e-9 for m in armed_cmds)
-              and abs(armed_cmds[-1].collective_thrust) < 1e-9)  # hold reaches 20%, exits at zero
+              armed_cmds and all(abs(m.collective_thrust - 0.2) < 1e-9 for m in armed_cmds[-5:]))
+        # 新语义: 解锁即降 armed 字段 (testing 先清), 保持段即为最后的 armed 指令
         check(results, 'md_arm_disarm', True in arm_calls and False in arm_calls)
+        check(results, 'md_no_rearm_after_disarm', rearm == 0, f'{rearm} rearms')
         check(results, 'md_gate_reverted', gate is False)
 
         print('== old firmware (gate SET rejected) ==')
         fake = FakeBridge(False, reject_motor_direct_set=True)
-        proc, commands, arm_calls, gate = run_check(fake, [])
+        proc, commands, arm_calls, gate, rearm = run_check(fake, [])
         check(results, 'fb_exit', proc.returncode == 0, f'rc={proc.returncode}')
         check(results, 'fb_warning_logged', 'falling back to BODY_RATES' in proc.stdout)
         armed_cmds = [m for _, _, armed, m in commands if armed]

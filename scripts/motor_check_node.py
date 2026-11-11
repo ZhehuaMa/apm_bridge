@@ -210,8 +210,14 @@ class MotorCheckNode(Node):
         print('STOP TESTING...')
 
     def _disarm_backend(self):
-        """上锁并等待确认。期间控制流保持 (armed 字段)，让 arm=0 边沿随帧送达。"""
+        """上锁并等待确认。期间控制流保持 (armed 字段)，让 arm=0 边沿随帧送达。
+
+        self.testing 必须在发出 arm=False 之前清除: 2 Hz 保活回调的电平是
+        `testing or _arm_intent`,若保持 True 会在解锁后 0.5 s 重发 True,
+        FC (host arm ≡ BOXARM 电平语义) 随即重新解锁 -- 解锁/重锁竞争让
+        _wait_armed(False) 永远等不到 (2026-11-11 真机 2/3 复现)。"""
         with self.lock:
+            self.testing = False   # 先落保活电平, 再请求上锁
             self.disarming = True
         try:
             self._arm_intent = False

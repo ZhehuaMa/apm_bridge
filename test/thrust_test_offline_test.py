@@ -66,6 +66,9 @@ class FakeBridge(Node):
         self.airsim = airsim
         self.reject_motor_direct_set = reject_motor_direct_set  # 仿真旧固件 (无该设置)
         self.motor_direct_on = False
+        self.rearm_after_disarm = 0   # 解锁后到达的 arm=True (解锁/重锁竞争检测)
+        self._saw_disarm = False
+        self._saw_arm_level = False
         self.lock = threading.Lock()
         self.armed = False
         self.offboard = False   # /fpv/offboard 电平 (主机经链路直接接管, 无需飞手开关)
@@ -126,6 +129,15 @@ class FakeBridge(Node):
         with self.lock:
             self.armed = msg.data
             self.arm_calls.append(msg.data)
+            # 真机语义: host arm 是电平 (≡ BOXARM), 解锁后 True 会重新解锁。
+            # 工具的上锁路径不得在"运行开始后的 False"之后重发 True。
+            # 节点启动期 (start_testing 之前) 保活发布的初始 False 不算解锁。
+            if msg.data:
+                if self._saw_disarm:
+                    self.rearm_after_disarm += 1
+                self._saw_arm_level = True
+            elif getattr(self, '_saw_arm_level', False):
+                self._saw_disarm = True
 
     def on_offboard(self, msg):
         with self.lock:
@@ -182,12 +194,13 @@ def run_tool(airsim, out_dir, extra, reject_motor_direct_set=False):
                               capture_output=True, text=True, timeout=120)
         with fake.lock:
             commands, arm_calls = list(fake.commands), list(fake.arm_calls)
+            rearm = fake.rearm_after_disarm
         cli_gets = list(fake.cli_gets)
     finally:
         executor.shutdown()
         rclpy.shutdown()
         spin.join(timeout=2.0)
-    return proc, commands, arm_calls, cli_gets
+    return proc, commands, arm_calls, cli_gets, rearm
 
 
 def read_outputs(out_dir):
@@ -209,12 +222,13 @@ def check(results, name, ok, detail=''):
 def hardware_mode(out_dir, results, reject_gate=False, prefix='hw'):
     label = 'old-firmware fallback' if reject_gate else 'motor-direct'
     print(f'== hardware mode ({label}: baro + sag + RPM + current) ==')
-    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'],
-                                                   reject_motor_direct_set=reject_gate)
+    proc, commands, arm_calls, cli_gets, rearm = run_tool(False, out_dir, ['--lipo-cells', '6'],
+                                                                   reject_motor_direct_set=reject_gate)
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, f'{prefix}_exit', proc.returncode == 0, f'rc={proc.returncode}')
     check(results, f'{prefix}_arm_disarm', True in arm_calls and False in arm_calls)
+    check(results, f'{prefix}_no_rearm_after_disarm', rearm == 0, f'{rearm} rearms')
     check(results, f'{prefix}_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
     test_cmds = [msg for _, _, armed, msg in ((t, c, a, m) for t, c, a, m in commands) if armed]
     expected_mode = ControlCommand.BODY_RATES if reject_gate else ControlCommand.MOTOR_DIRECT
@@ -274,7 +288,7 @@ def hardware_mode(out_dir, results, reject_gate=False, prefix='hw'):
 
 def airsim_mode(out_dir, results):
     print('== AirSim mode (no baro, no sag, no RPM, no current) ==')
-    proc, _, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp'])
+    proc, _, _, _, _ = run_tool(True, out_dir, ['--no-env-comp', '--no-voltage-comp'])
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, 'airsim_exit', proc.returncode == 0, f'rc={proc.returncode}')
@@ -292,8 +306,8 @@ def airsim_mode(out_dir, results):
 def hardware_fallback_mode(out_dir, results):
     """旧固件降级路径: CLI SET custom_link_motor_direct 被拒 -> 告警 + BODY_RATES。"""
     print('== hardware mode (old firmware: gate SET rejected) ==')
-    proc, commands, arm_calls, cli_gets = run_tool(False, out_dir, ['--lipo-cells', '6'],
-                                                   reject_motor_direct_set=True)
+    proc, commands, arm_calls, cli_gets, rearm_fb = run_tool(False, out_dir, ['--lipo-cells', '6'],
+                                                                       reject_motor_direct_set=True)
     if proc.returncode != 0:
         print(proc.stdout[-3000:], proc.stderr[-2000:])
     check(results, 'fb_exit', proc.returncode == 0, f'rc={proc.returncode}')
