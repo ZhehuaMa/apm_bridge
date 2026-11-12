@@ -40,6 +40,14 @@ custom_link_bridge:
       control_rate: 100.0   # 缓存推送和 0x20 上行频率 (Hz)，周期须小于 FC 看门狗 (默认 50ms)
       rate_limit_dps: 0.0   # 客户端角速度限幅 (deg/s, 0=不限)；固件侧另有 custom_link_rate_limit_dps
       angle_limit_deg: 0.0  # 客户端角度模式 roll/pitch 限幅 (deg, 0=不限)；固件侧兜底为 pid profile angle_limit (默认 60)
+      # ---- raw 通道集体油门成形: EMA 平滑 + 线性斜坡加/减速限制 ----
+      # 阶跃油门在低转速下定子电流缺乏反电动势抑制; 限速给电机转子/螺旋桨
+      # 留出建立转速与反电动势的时间, 抑制大电流冲击与母线电压跌落, 减速
+      # 方向同时抑制占空比骤降的再生回馈电流尖峰。只作用于 ~/control_command_raw
+      # 的集体油门 (力通道与 MOTOR_DIRECT 台架标定直通, 不成形)。0 = 关闭。
+      throttle_ramp_up_s: 1.0    # 0→100% 满量程加速斜坡时间 (s)。1.0 @100Hz 即每 10ms 最多 +1% 油门
+      throttle_ramp_down_s: 0.5  # 100%→0 减速斜坡时间 (s), 缺省比加速快一倍 (转子自然减速更快)
+      throttle_ema_window: 5    # EMA 平滑窗口 (控制周期样本数, α=2/(N+1)); 10@100Hz 时间常数约 45ms; <2 不平滑
       sync_rate: 1.0        # 四时间戳对时频率
       diag_rate: 0.2        # 链路诊断日志频率
 

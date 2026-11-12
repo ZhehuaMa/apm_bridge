@@ -66,16 +66,51 @@ def test_native_angle_transport_and_rate_compatibility(tmp_path, monkeypatch):
             command.orientation.x, command.orientation.y = sr*cp, cr*sp
             command.orientation.z, command.orientation.w = -sr*sp, cr*cp
             command.bodyrates.z = math.radians(4)
-            for _ in range(5):
-                raw.publish(command)
-                pump(.05)
-            angle = [f for f in fc.controls if f[3] == 3]
-            assert angle and all(f[2] == 0 and f[4] == 1120 for f in angle)
+
+            # 默认油门成形开启 (up 1.0 s / down 0.5 s / EMA 10 @100 Hz):
+            # 0x20 油门从 1000 单调爬向 1120 (1000 + 0.12*1000), 不允许一步到位。
+            def frames(mode, since=0):
+                return [f for f in fc.controls[since:] if f[3] == mode]
+
+            def pump_until_converged(publish, mode, since=0, target=1120, timeout=5.):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    publish()
+                    pump(.05)
+                    mode_frames = frames(mode, since)
+                    if mode_frames and mode_frames[-1][4] == target:
+                        return mode_frames
+                return frames(mode, since)
+
+            angle = pump_until_converged(lambda: raw.publish(command), 3)
+            assert angle, "no ANGLE frames received"
+            assert all(f[2] == 0 for f in angle)
+            assert angle[0][4] <= 1050, "throttle ramp must be engaged (first frame near idle)"
+            assert angle[-1][4] == 1120, "throttle must converge to the commanded value"
+            throttles = [f[4] for f in angle]
+            assert throttles == sorted(throttles), "throttle must ramp monotonically"
+            assert all(f[4] <= 1120 for f in angle), "throttle must not overshoot the command"
             assert all(abs(f[5]-20) <= 1 and abs(f[6]+30) <= 1 and abs(f[7]-40) <= 1 for f in angle)
-            raw.publish(ControlCommand(armed=True, control_mode=ControlCommand.BODY_RATES,
-                                       collective_thrust=.12))
+
+            rates_cmd = ControlCommand(armed=True, control_mode=ControlCommand.BODY_RATES,
+                                       collective_thrust=.12)
+            raw.publish(rates_cmd)
             pump(.1)
             assert fc.controls[-1][3] == 2
+
+            # 指令超时 (rc.control_timeout=0.5 s) -> 控制量失效: 无 arm/模式请求时
+            # 停发 0x20; 失效边沿把成形基线归零, 恢复后从怠速重新爬坡而不是一步
+            # 跳回 1120 (阶跃电流冲击正是成形要抑制的对象)。前 0.5 s 仍在发帧,
+            # 先放掉超时窗口再断言停发。
+            pump(.8)
+            stale_mark = len(fc.controls)
+            pump(.2)
+            assert len(fc.controls) == stale_mark, "stale stream must stop transmitting"
+            resumed = pump_until_converged(lambda: raw.publish(rates_cmd), 2, since=stale_mark)
+            assert resumed, "no frames after recovery"
+            assert resumed[0][4] <= 1050, "recovery must re-ramp from idle, not jump to the pre-gap value"
+            assert resumed[-1][4] == 1120, "recovered throttle must converge again"
+
             offboard.publish(Bool(data=False))
             pump(.1)
             assert fc.controls[-1][3] == 0 and all(f[2] == 0 for f in fc.controls)

@@ -41,6 +41,7 @@
 #include "custom_link/client.h"
 #include "quadratic_thrust_model.h"
 #include "ema_filter.h"
+#include "throttle_ramp.h"
 #include "gimbal_interface.h"
 
 namespace custom_link_bridge
@@ -164,6 +165,22 @@ namespace custom_link_bridge
         /// 按 link.control_rate 把最新控制量（含新鲜度判定）推给链路客户端。
         void pushControl();
         void updateGimbalMode();
+
+        // ---- raw 通道油门成形 (EMA + 线性斜坡), 仅 pushControl 定时器触碰 ----
+        /// 油门成形每周期维护: 帧间隔 dt 更新 + 上锁/旁路边沿复位。持 mtx_cmd。
+        void throttleShapeMaintenance();
+        /// 目标油门 -> EMA 平滑 + 斜坡限速后的输出。持 mtx_cmd。
+        double shapeThrottle(double target);
+        apm_bridge::ThrottleShaper throttle_shaper;
+        std::chrono::steady_clock::time_point shape_last_tick{};
+        bool shape_last_valid = false;
+        double shape_dt_s = 0.0;      // 本周期成形用的帧间隔 (s, 已钳制)
+        double shape_dt_cap_s = 0.05; // 停顿后单帧允许的最大成形推进时间 (5 控制周期)
+        bool shape_armed_prev = false;   // 上一周期解锁反馈 (上锁边沿 -> 斜坡基点归零)
+        bool shape_bypass_prev = false;  // 上一周期是否力通道/motor_direct 旁路
+        // 成形器首次使用判定尚未做出: 仅当此刻 landed_state == IN_AIR (空中桥
+        // 重启, 电机实际状态未知) 时基点直通首条指令保连续性; 否则从 0 爬坡。
+        bool shape_first_use = true;
 
         void ctrlCommandCallback(const quadrotor_msgs::msg::ControlCommand::SharedPtr command);
         void ctrlCommandRawCallback(const quadrotor_msgs::msg::ControlCommand::SharedPtr command);
