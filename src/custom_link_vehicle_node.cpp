@@ -69,6 +69,8 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     // I_std(F_std) 三项电流模型的二次/三次项 (2026-11-12 修订; 0 = 线性, 兼容旧 YAML)
     this->declare_parameter<double>("motor_parameters.k_i2", 0.0);
     this->declare_parameter<double>("motor_parameters.k_i3", 0.0);
+    // 动力系统最大集体油门保护 [0.0, 1.0]; 1.0 = 不限制 (见 pushControl 输出端限幅)
+    this->declare_parameter<double>("motor_parameters.throttle_limit", 1.0);
     this->declare_parameter<double>("voltage_lpf_hz", 3.0);
     airsim_enabled = this->declare_parameter<bool>("airsim.enabled", false);
 
@@ -117,7 +119,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     static const std::set<std::string> kModelKeys{
         "motor_parameters.a3", "motor_parameters.a2", "motor_parameters.a1",
         "motor_parameters.r_eq", "motor_parameters.k_i", "motor_parameters.k_i2",
-        "motor_parameters.k_i3"};
+        "motor_parameters.k_i3", "motor_parameters.throttle_limit"};
     for (const auto &[name, value] : this->get_node_parameters_interface()->get_parameter_overrides())
     {
         (void)value;
@@ -137,9 +139,24 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("motor_parameters.k_i", propulsion.k_i);
     this->get_parameter("motor_parameters.k_i2", propulsion.k_i2);
     this->get_parameter("motor_parameters.k_i3", propulsion.k_i3);
+    this->get_parameter("motor_parameters.throttle_limit", propulsion.throttle_limit);
     this->get_parameter("voltage_lpf_hz", voltage_lpf_hz);
     propulsion.v_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;     // 6S: 22.20 V
     propulsion.v_min = n_lipo_cells * kBatteryUndervoltagePerCell;       // 6S: 12.0 V
+    // 油门保护限幅域 = 集体油门 [0, 1] (u_idle 对应 0, 1 = 满占空比)。
+    // 0.0 合法但等于把电机钉死在怠速地板 (仅数据链路运转), 明确告警提示。
+    if (!std::isfinite(propulsion.throttle_limit) || propulsion.throttle_limit < 0.0 ||
+        propulsion.throttle_limit > 1.0)
+        throw std::invalid_argument("motor_parameters.throttle_limit must be in [0.0, 1.0] "
+                                    "(collective throttle domain)");
+    if (propulsion.throttle_limit < 1.0)
+        RCLCPP_INFO(this->get_logger(),
+                    "Throttle limit: %.3f (propulsion protection; force AND raw channels "
+                    "clamped at output)", propulsion.throttle_limit);
+    if (propulsion.throttle_limit <= 0.0)
+        RCLCPP_WARN(this->get_logger(),
+                    "throttle_limit = 0: throttle pinned at idle floor — motors will never "
+                    "spool above idle (data-path-only mode)");
     // §5: 滤波器初值取基准电压; 电流在首个遥测样本处初始化
     voltage_lpf.cutoff_hz = voltage_lpf_hz;
     voltage_lpf.value = propulsion.v_ref;
@@ -1132,6 +1149,10 @@ void CustomLinkVehicleNode::pushControl()
                     // link.throttle_ema_window), 给电机转子/螺旋桨留出建立转速
                     // 与反电动势的时间, 抑制阶跃大电流冲击。
                     input.throttle = shapeThrottle(cmd_thrust);
+                    // 动力系统保护: 输出端统一限幅 (力通道反解 + raw 通道全覆盖;
+                    // 1.0 = 不限制)。成形后再夹, 成形器内部基线可高于限值,
+                    // 但线上的油门永不越界 (NaN 语义保持, 交给下方 SITL 校验)。
+                    input.throttle = std::min(input.throttle, propulsion.throttle_limit);
                 }
                 input.angle = cmd_angle;
                 input.motor_direct = cmd_motor_direct;
