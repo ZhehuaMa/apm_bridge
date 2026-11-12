@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""custom_link 真机联调检查: 解锁 → 恒定油门保持 N 秒 → 上锁。
+"""custom_link 真机联调检查: 解锁 → 零油门保持 --post-arm-delay 秒 (默认 3 s) → 恒定油门保持 N 秒 → 上锁。
 
 thrust_test_node 的轻量版冒烟测试，不需要台秤/气压温度，用于上电后快速
 验证 custom_link_bridge ↔ FC 链路、arm/disarm 流程与 raw 油门直通
@@ -201,7 +201,7 @@ class MotorCheckNode(Node):
                 self.testing = False
                 self._offboard_intent = False
             raise
-        print(f'{bcolors.OKGREEN}ARMED, spinning up...{bcolors.ENDC}')
+        print(f'{bcolors.OKGREEN}ARMED.{bcolors.ENDC}')
 
     def stop_testing(self):
         """油门归零 + 上锁。"""
@@ -255,6 +255,29 @@ class MotorCheckNode(Node):
 
     # ---------------------------------------------------------- 保持
 
+    def settle_after_arm(self):
+        """解锁确认后先保持零油门 --post-arm-delay 秒 (默认 3 s) 再给请求油门:
+        让 ESC/FC 在加载前状态稳定 (与油门阶段相同的 0.1 s 倒计时与中止语义;
+        期间控制流持续 armed=True / thrust=0)。完成返回 True, 中止返回 False。"""
+        delay = max(self.args.post_arm_delay, 0.0)
+        if delay <= 0.0:
+            return True
+        self.quiet = True
+        try:
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline:
+                if self.abort_event.is_set():
+                    return False
+                remain = max(deadline - time.monotonic(), 0.0)
+                sys.stdout.write(f'\r  armed, zero throttle for {remain:4.1f}s '
+                                 f'before {self.args.thrust:.1f}% thrust   ')
+                sys.stdout.flush()
+                time.sleep(0.1)
+            return not self.abort_event.is_set()
+        finally:
+            self.quiet = False
+            print()
+
     def hold_thrust(self):
         """恒定油门保持 --duration 秒 (0.1 s 粒度倒计时)。"""
         self.quiet = True
@@ -294,12 +317,15 @@ class MotorCheckNode(Node):
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Custom-link real-drone smoke check: '
-                    'arm, hold throttle, disarm')
+                    'arm, zero-throttle settle, hold throttle, disarm')
     parser.add_argument('--thrust', type=float, default=10.0,
                         help='throttle to hold during the check [%%, raw '
                              'passthrough, no motor model]')
     parser.add_argument('--duration', type=float, default=3.0,
                         help='hold duration [s]')
+    parser.add_argument('--post-arm-delay', type=float, default=3.0,
+                        help='hold ZERO throttle this long after ARM before applying '
+                             'the requested thrust [s]')
     parser.add_argument('--rate', type=float, default=50.0,
                         help='control command stream rate [Hz]')
     parser.add_argument('--no-offboard', action='store_true',
@@ -320,7 +346,8 @@ def confirm_start(args, abort_event):
         print(f'{bcolors.WARNING}stdin is not a tty and --yes not given; '
               f'proceeding anyway{bcolors.ENDC}')
         return True
-    print(f'{bcolors.OKGREEN}Press Enter to ARM and hold {args.thrust:.1f}% for '
+    print(f'{bcolors.OKGREEN}Press Enter to ARM, hold zero throttle for '
+          f'{max(args.post_arm_delay, 0.0):.1f}s, then hold {args.thrust:.1f}% for '
           f'{args.duration:.1f}s (Ctrl+C to abort)...{bcolors.ENDC}', flush=True)
     while not abort_event.is_set():
         r, _, _ = select.select([sys.stdin], [], [], 0.2)
@@ -394,7 +421,7 @@ def main():
             node.start_testing()
             if node.abort_event.is_set():
                 pass  # 掉锁中止，走安全关停
-            else:
+            elif node.settle_after_arm():  # 解锁后先零油门稳定 --post-arm-delay 秒
                 node.hold_thrust()
             node.stop_testing()
     except FatalError as e:
