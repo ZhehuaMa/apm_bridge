@@ -288,7 +288,8 @@ def hardware_mode(out_dir, results, reject_gate=False, prefix='hw'):
     coef_ok = all(abs(mp[k] - ideal[k]) <= 1e-3 * max(1.0, abs(ideal[k])) for k in ('a3', 'a2', 'a1'))
     check(results, 'hw_fit_matches_pipeline', coef_ok and result['monotonic'],
           f"a3..a1=({mp['a3']:.5g}, {mp['a2']:.5g}, {mp['a1']:.5g})")
-    check(results, 'hw_no_idle_parameter', set(mp) == {'a3', 'a2', 'a1', 'r_eq', 'k_i'}, f'{sorted(mp)}')
+    check(results, 'hw_no_idle_parameter',
+          set(mp) == {'a3', 'a2', 'a1', 'r_eq', 'k_i', 'k_i2', 'k_i3'}, f'{sorted(mp)}')
     model = pm.PropulsionModel.from_parameters(mp, 6, U_IDLE)
     verification = result.get('verification') or []
     ver_ok = verification and all(abs(v['error_pct']) < 2.0 for v in verification)
@@ -334,6 +335,10 @@ def hardware_fallback_mode(out_dir, results):
 
 
 def main():
+    # 本机默认 domain 可能有实机台架图 (scale_reader/mavros 等), 会把真实秤数据混进
+    # FakeBridge 的 /current_weight (2026-11-12 实测: tare 混入 19.16 kg 真秤读数)。
+    # 隔离到独立 domain; 显式设置时尊重操作者覆盖 (同 bench_angle_link_test 约定)。
+    os.environ.setdefault('ROS_DOMAIN_ID', str(100 + os.getpid() % 40))
     results = {}
     with tempfile.TemporaryDirectory(prefix='thrust_test_offline_') as out_dir:
         os.makedirs(os.path.join(out_dir, 'hw'))

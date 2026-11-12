@@ -14,7 +14,11 @@
   2. 四电机均方根转速 RPM_rms
   3. 多元线性最小二乘 u·V = (1/K_v*)·RPM_rms + R_eq·I 辨识 R_eq, K_v*
   4. 折算到 V_ref: F_std = F0·((u·V_ref − I_std·R_eq)/(u·V − I·R_eq))², I_std ≈ I·(V_ref/V)²
-  5. 无截距三次多项式 F_std(u) = a3u³ + a2u² + a1u (正规方程) + 单调性检验
+  5. 无截距三次多项式 F_std(u) = a3u³ + a2u² + a1u (相对误差加权正规方程) + 单调性检验
+拟合通过后按 §4 在台秤上闭环验证: 先回落怠速冷却 (--verify-cooldown, 默认 10 s ——
+扫描尾部大油门后电机/电池与母线电压需要恢复), 再反解几档期望推力实测比对,
+|相对误差| <= 2% 判过, 结果记入 *_result.yaml 的 verification 段 (--no-verify 跳过;
+档位 = min(标定域/env, (tare−critical−margin)·g) 的 35/55/75%, 亏电 <3.5 V/芯跳过)。
 输出 CSV、带 motor_parameters 段的 *_result.yaml (直接粘贴进 custom_link_parameters.yaml)
 与 PNG。
 
@@ -137,19 +141,36 @@ def average_window(window, tare_kg, gravity):
             'weight_kg': weight, 'n_weight': len(window['weight'])}
 
 
-def verification_weights(w_kg, gravity, f_max, count=3):
-    """§4 在线反解 + 台秤闭环验证的期望总推力 (N)。
+VERIFICATION_FRACTIONS = (0.1, 0.3, 0.5)   # 档位 = 上限的比例 (2026-11-12 用户调定;
+                                            # 设计值 0.1/0.3/0.5 —— 最低档过低时
+                                            # 0.1 N 台秤分辨率的相对占比恶化, 见 README)
+VERIFICATION_MIN_LEVEL_N = 0.5                # 每档 >= 5x 台秤 ~0.1 N 分辨率
+VERIFICATION_TARE_MARGIN_KG = 0.3             # 抬离保护线之上的安全余量
+VERIFY_MIN_CELL_V = 3.5                       # 亏电拦截: 验证前每芯最低电压
 
-    各取静重推力的 25%/50%/75%, 都相对整机/缆线的静重可分辨 (台秤误差
-    ~10 g·g ≈ 0.1 N), 且不超出标定域 [0, f_max] (调用方传实测扫描上界的
-    F_std, 见 verify_with_model)。静重可分辨性不满足时返回空列表 (验证段安全跳过)。
+
+def verification_levels(f_max_std, env, gravity, tare_kg, critical_kg,
+                        fractions=VERIFICATION_FRACTIONS,
+                        min_level=VERIFICATION_MIN_LEVEL_N,
+                        tare_margin=VERIFICATION_TARE_MARGIN_KG):
+    """§4 在线反解 + 台秤闭环验证的期望总推力档 (N, 请求系)。
+
+    2026-11-12 修订 (原为静重 2.0 kg 的 25/50/75% 硬编码, 且域过滤漏乘 env):
+      * 上限 1 (标定域): 实测扫描上界 u_max 的模型推力 F_std(u_max) 折回请求系
+        (f_req·env = f_std 不得超出标定域 —— env>1 时请求系域收窄, 2026-11-11
+        17:58 的越界档即漏乘 env 所致), 不拿外推段验证;
+      * 上限 2 (台架安全): (tare − critical − margin)·g, 档位不得把台秤读数压到
+        抬离保护线以下 (2026-11-12 12:05 的 14.7 N 档已贴着 critical 线运行);
+      * 档位取上限的 35/55/75%: 避开最低推力区 (0.1 N 台秤分辨率 + 0x20 链路
+        1000..2000 的量化在 ~5 N 档即占 ±1~2%), 每档须 >= min_level。
+    上限不足以安全分辨任一档时返回空列表 (验证段安全跳过)。
     """
-    w = w_kg * gravity
-    levels = [0.25 * i * w for i in range(1, count + 1)]
-    min_resolvable = 0.010 * gravity  # 台秤分辨率 ~10 g
-    # 小于分辨率的档舍去; 超过标定域上界 f_max 的档舍去 (f_max 不够覆盖 75% 静重时
-    # 至少保留一档, 除非连最低档都越界)。
-    return [f for f in levels if f >= min_resolvable and f <= f_max]
+    if not (math.isfinite(env) and env > 0.0):
+        env = 1.0
+    safe_unload = max(tare_kg - critical_kg - tare_margin, 0.0) * gravity
+    domain = f_max_std / env
+    cap = min(safe_unload, domain)
+    return [frac * cap for frac in fractions if frac * cap >= min_level]
 
 
 def verification_verify_pass(verification, max_rel_error=0.02):
@@ -167,18 +188,35 @@ def cli_command(node, cmd, args, timeout=10.0):
     return pm.cli_command(node, cmd, args, timeout=timeout)
 
 
+def _yaml_float(x):
+    """'%.9g' 但保证 YAML 1.1 解析为 float: 整数值 ('0'/'100000') 与无小数点的科学
+    计数 ('-1e-05') 否则分别被读成 int/字符串, 而 rclcpp 对 double 参数收到 int
+    会在启动时抛 InvalidParameterTypeException (a1=0 的钳位拟合与线性回退的
+    k_i2/k_i3=0 是常规取值, 见 2026-11-12 评审)。"""
+    s = f'{x:.9g}'
+    mant, sep, exp = s.partition('e')
+    if '.' not in mant and 'inf' not in mant and 'nan' not in mant:
+        mant += '.0'
+    return mant + sep + exp
+
+
 def render_param_yaml(result, args):
-    """生成可直接并入 custom_link_parameters.yaml 的片段。"""
+    """生成可直接并入 custom_link_parameters.yaml 的片段。
+
+    k_i2/k_i3 为电流模型二次/三次项 (2026-11-12 修订; 需同版本的 bridge 节点,
+    旧节点会对未知键启动即抛错)。"""
     lines = ['custom_link_bridge:',
              '  ros__parameters:',
              f'    voltage_compensation: {str(not args.no_voltage_comp).lower()}',
              f'    baro_compensation: {str(not args.no_env_comp).lower()}',
              '    motor_parameters:',
-             f"      a3: {result['a3']:.9g}",
-             f"      a2: {result['a2']:.9g}",
-             f"      a1: {result['a1']:.9g}",
-             f"      r_eq: {result['r_eq']:.9g}",
-             f"      k_i: {result['k_i']:.9g}"]
+             f"      a3: {_yaml_float(result['a3'])}",
+             f"      a2: {_yaml_float(result['a2'])}",
+             f"      a1: {_yaml_float(result['a1'])}",
+             f"      r_eq: {_yaml_float(result['r_eq'])}",
+             f"      k_i: {_yaml_float(result['k_i'])}",
+             f"      k_i2: {_yaml_float(result.get('k_i2', 0.0))}",
+             f"      k_i3: {_yaml_float(result.get('k_i3', 0.0))}"]
     return '\n'.join(lines)
 
 
@@ -220,6 +258,7 @@ class ThrustTestNode(Node):
         self.tare_kg = float('nan')
         self.u_idle = float('nan')         # 飞控 motor_idle 占空比 (main 中经 /fpv/cli 读取)
         self.verification = None           # 标定验证结果列表 (见 verify_with_model)
+        self.verification_note = None      # 验证被安全跳过的原因 (写入 result YAML)
 
         qos_be5 = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_be10 = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -443,18 +482,54 @@ class ThrustTestNode(Node):
 
         为使"实测拉力 F_meas = 台秤减静重"恰与期望总推力同口径, 机体须保持静平衡
         (飞控只受零角速度, 不机动): 使用与标定段一致的控制通道。电缆拉力台秤误差
-        的量级即静重推力分辨率的约束 (见 verification_weights)。"""
-        # §4 反解在标定域内; 静重台秤下的期望推力须满足 |F_meas| >= 10 g·g (分辨)
-        # 且不超过实测扫描上界的模型推力 (截短扫描时不能拿外推的 F_std(1) 验证)。
-        u_max = max((p['u'] for p in self.points), default=1.0)
-        f_max = model.thrust(min(u_max, 1.0))
-        weights = verification_weights(self.tare_kg, self.args.gravity, f_max)
-        if not weights:
-            print(f'{bcolors.WARNING}verification skipped: static weight {self.tare_kg:.3f} kg '
-                  f'does not resolve 10 g scale steps{bcolors.ENDC}')
+        的量级即静重推力分辨率的约束 (见 verification_levels)。
+
+        2026-11-12 修订:
+          * 亏电拦截: 电池低于 3.5 V/芯时跳过验证 —— 深 sag 电池上 V/I 遥测与推力
+            采样窗不一致 (11:10 run: 3.26 V/cell @ 119 A, 记录状态偏离自身扫掠流形
+            +0.61 V 反电动势, 验证出 +11.5% 假误差);
+          * 档位: verification_levels —— min(标定域 F_std(u_max)/env, (tare−critical
+            −margin)·g) 的 35/55/75%, 替代静重 2.0 kg 的 25/50/75% 硬编码;
+          * 记录的 V/I/env 改为与推力同一采样窗的均值 (原为 settle 段末瞬值, 与
+            2 s 均值窗内的实际电气状态不一致)。"""
+        # 扫描刚跑完末段大油门: 电机/电池尚热、母线电压仍在恢复, 而 §4 反解用的是
+        # 实时电压/电流 -> 先回落怠速冷却 --verify-cooldown (默认 10 s), 让验证段在
+        # 与标定段相近的机况下闭环 (0 跳过; --u-end 低于降温阈值时扫描尾部没有内置
+        # 降温段, 这里同样补上)。亏电拦截与档位推导都取冷却后的恢复态 (扫描刚结束
+        # 的瞬态深 sag 不代表验证段工况)。
+        if self.args.verify_cooldown > 0.0:
+            self.set_duty(self.u_idle)
+            print(f'cooling down at idle for {self.args.verify_cooldown:.1f} s before verification')
+            if not self.sleep_abortable(self.args.verify_cooldown):
+                return None  # aborted
+        # 亏电拦截 (仅电压补偿开启时有意义: V/I 进入模型; 无 V 遥测不判)。深 sag
+        # 电池上 V/I 遥测与推力采样窗不一致 (11:10 run: 3.26 V/cell @ 119 A, 记录
+        # 状态偏离自身扫掠流形 +0.61 V 反电动势, 验证出 +11.5% 假误差)。
+        with self.lock:
+            voltage_now = self.last_voltage
+        min_v = self.args.lipo_cells * VERIFY_MIN_CELL_V
+        if not self.args.no_voltage_comp and math.isfinite(voltage_now) and voltage_now < min_v:
+            self.verification_note = (f'battery {voltage_now:.2f} V below {min_v:.1f} V '
+                                      f'({VERIFY_MIN_CELL_V} V/cell): V/I telemetry on a '
+                                      'deeply sagged pack is not representative')
+            print(f'{bcolors.WARNING}verification skipped: {self.verification_note}{bcolors.ENDC}')
             return []
+        env, _, _ = self.live_inputs()
+        u_max = max((p['u'] for p in self.points), default=1.0)
+        f_max_std = model.thrust(min(u_max, 1.0))
+        levels = verification_levels(f_max_std, env, self.args.gravity, self.tare_kg,
+                                     self.args.critical_weight)
+        if not levels:
+            self.verification_note = (f'cap min(F_std(u_max)/env={f_max_std / env:.1f}, '
+                                      f'(tare-critical-margin)*g='
+                                      f'{max(self.tare_kg - self.args.critical_weight - VERIFICATION_TARE_MARGIN_KG, 0.0) * self.args.gravity:.1f})'
+                                      f' N does not resolve a {VERIFICATION_MIN_LEVEL_N} N level')
+            print(f'{bcolors.WARNING}verification skipped: {self.verification_note}{bcolors.ENDC}')
+            return []
+        print(f'verification levels {["%.2f" % f for f in levels]} N '
+              f'(cap = min(calibrated domain /env, tare safety), tare {self.tare_kg:.3f} kg)')
         results = []
-        for f_req in weights:
+        for f_req in levels:
             # 与标定段同一 SOP 时序: 前 --settle-time 丢弃 (气流/压降瞬态)。在此等待段
             # 内重采样低通后的电压/电流并迭代油门 (§4 步骤 3 的反馈), 让电机动态
             # 与母线压降在进入采样段前收敛, 而不是用采前瞬间的读数。
@@ -476,16 +551,25 @@ class ThrustTestNode(Node):
                 window, self.window = self.window, None
             if not ok:
                 return None  # aborted mid-step
-            f_meas = average_window(window, self.tare_kg, self.args.gravity)['F']
+            avg = average_window(window, self.tare_kg, self.args.gravity)
+            f_meas = avg['F']
             if not math.isfinite(f_meas):
                 print(f'{bcolors.WARNING}F_req={f_req:.3f} N: no scale data, skipped{bcolors.ENDC}')
                 continue
+            # 记录状态与推力同窗: V/I 取采样窗均值 (settle 末瞬值仅作油门迭代反馈),
+            # env 由窗均 P/t 重算, 使 result 行与 f_meas 同一物理状态。
+            if not self.args.no_env_comp and math.isfinite(avg['P']) and math.isfinite(avg['t']):
+                env = pm.environment_factor(avg['P'], avg['t'])
             err = f_meas - f_req
             rel = err / f_req
             results.append({'f_req': f_req, 'f_meas': f_meas, 'u': u, 'env': env,
-                            'voltage': voltage, 'current': current, 'error': err, 'rel': rel})
+                            'voltage': avg['V'], 'current': avg['I'],
+                            'error': err, 'rel': rel})
             print(f'F_req={f_req:.3f} N -> u={u:.4f} (c={collective:.4f}): '
                   f'F={f_meas:.3f} N, error {err:+.3f} N ({rel:+.1%})')
+        if not results:
+            self.verification_note = ('all verification levels skipped '
+                                      '(no scale data in the sampling windows)')
         with self.lock:
             self.collective = 0.0
         return results
@@ -618,6 +702,7 @@ def write_outputs(node, args, aborted):
         f.write(f'date: {datetime.datetime.now().isoformat(timespec="seconds")}\n')
         f.write(f'aborted: {str(aborted).lower()}\n')
         f.write(f'points: {len(points)}\n')
+        f.write(f'tare_kg: {node.tare_kg:.4f}  # pre-arm static scale reading (verification levels derive from it)\n')
         f.write(f'v_ref: {v_ref:.2f}\n')
         f.write(f'u_idle_fc_motor_idle: {args.u_idle:.4f}  # read from the FC at test time, not a parameter\n')
         f.write(f'environment_normalization: {str(not args.no_env_comp).lower()}\n')
@@ -633,9 +718,16 @@ def write_outputs(node, args, aborted):
             f.write(f"ke_volt_per_rpm: {result['ke']:.6g}\n")
             f.write(f"r_eq_ohm: {result['r_eq']:.6g}\n")
             f.write(f"k_i_A_per_N: {result['k_i']:.6g}\n")
+            f.write(f"k_i2_A_per_N2: {_yaml_float(result.get('k_i2', 0.0))}\n")
+            f.write(f"k_i3_A_per_N3: {_yaml_float(result.get('k_i3', 0.0))}\n")
             for w in result['warnings']:
                 f.write(f'# warning: {w}\n')
         verification = node.verification
+        if node.verification == [] and node.verification_note:
+            import yaml
+            # safe_dump 正确引用含 ': '/逗号的文本; 裸插值会破坏 *_result.yaml 的可解析性
+            f.write('verification_skipped_reason: ' +
+                    yaml.safe_dump(node.verification_note, default_flow_style=True).strip() + '\n')
         if verification:
             f.write('verification:  # fpv_test.md §4 runtime check on the bench scale\n')
             for v in verification:
@@ -663,7 +755,9 @@ def write_outputs(node, args, aborted):
         print(f"{bcolors.OKGREEN}F_std(u) = {result['a3']:.6g} u^3 + {result['a2']:.6g} u^2 + "
               f"{result['a1']:.6g} u   (RMS {result['stats']['rms']:.4g} N, "
               f"R^2 {result['stats']['r_squared']:.6f}){bcolors.ENDC}")
-        print(f"R_eq = {result['r_eq']:.5g} ohm, K_v* = {result['kv']:.5g} rpm/V, k_i = {result['k_i']:.5g} A/N")
+        print(f"R_eq = {result['r_eq']:.5g} ohm, K_v* = {result['kv']:.5g} rpm/V, "
+              f"k_i = {result['k_i']:.5g} A/N (+{result.get('k_i2', 0.0):.5g} F, "
+              f"+{result.get('k_i3', 0.0):.5g} F^2 terms)")
         for w in result['warnings']:
             print(f'{bcolors.WARNING}warning: {w}{bcolors.ENDC}')
         if not result['monotonic']:
@@ -783,6 +877,10 @@ def parse_args(argv=None):
     parser.add_argument('--verify-sample-time', type=float, default=3.0,
                         help='averaging window per verification thrust level [s]; '
                              'the --settle-time wait runs before it, on top')
+    parser.add_argument('--verify-cooldown', type=float, default=10.0,
+                        help='idle cooldown between the scan and the scale verification [s] '
+                             '(0 disables): the scan ends hot with a sagged battery, and the '
+                             'verification inverts the model on the live voltage/current')
     parser.add_argument('--control-rate', type=float, default=100.0, help='command stream rate [Hz]')
     parser.add_argument('--yes', action='store_true', help='skip the Enter confirmation')
     parser.add_argument('--output-dir', type=str, default='.')
@@ -926,7 +1024,8 @@ def main():
                                                v_ref=v_ref,
                                                v_min=args.lipo_cells * pm.V_MIN_PER_CELL,
                                                u_idle=args.u_idle, r_eq=result['r_eq'],
-                                               k_i=result['k_i'])
+                                               k_i=result['k_i'], k_i2=result['k_i2'],
+                                               k_i3=result['k_i3'])
                     print(f'{bcolors.OKBLUE}verifying the calibration on the scale...{bcolors.ENDC}')
                     node.verification = node.verify_with_model(model, args.verify_sample_time)
                     if node.verification is None:

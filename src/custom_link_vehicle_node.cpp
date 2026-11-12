@@ -66,6 +66,9 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<double>("motor_parameters.a1", 0.0);
     this->declare_parameter<double>("motor_parameters.r_eq", 0.0);
     this->declare_parameter<double>("motor_parameters.k_i", 0.0);
+    // I_std(F_std) 三项电流模型的二次/三次项 (2026-11-12 修订; 0 = 线性, 兼容旧 YAML)
+    this->declare_parameter<double>("motor_parameters.k_i2", 0.0);
+    this->declare_parameter<double>("motor_parameters.k_i3", 0.0);
     this->declare_parameter<double>("voltage_lpf_hz", 3.0);
     airsim_enabled = this->declare_parameter<bool>("airsim.enabled", false);
 
@@ -109,7 +112,8 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     // CLI "get motor_idle" 读取 (与飞控实际怠速一致)。
     static const std::set<std::string> kModelKeys{
         "motor_parameters.a3", "motor_parameters.a2", "motor_parameters.a1",
-        "motor_parameters.r_eq", "motor_parameters.k_i"};
+        "motor_parameters.r_eq", "motor_parameters.k_i", "motor_parameters.k_i2",
+        "motor_parameters.k_i3"};
     for (const auto &[name, value] : this->get_node_parameters_interface()->get_parameter_overrides())
     {
         (void)value;
@@ -118,7 +122,8 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
                                         "': u_idle is read from the FC (CLI get motor_idle); remove it");
         if (name.rfind("motor_parameters.", 0) == 0 && !kModelKeys.count(name))
             throw std::invalid_argument("Unsupported parameter '" + name +
-                                        "': motor_parameters now follow fpv_test.md (a3, a2, a1, r_eq, k_i); "
+                                        "': motor_parameters now follow fpv_test.md "
+                                        "(a3, a2, a1, r_eq, k_i, k_i2, k_i3); "
                                         "recalibrate with thrust_test_node");
     }
     this->get_parameter("motor_parameters.a3", propulsion.a3);
@@ -126,6 +131,8 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("motor_parameters.a1", propulsion.a1);
     this->get_parameter("motor_parameters.r_eq", propulsion.r_eq);
     this->get_parameter("motor_parameters.k_i", propulsion.k_i);
+    this->get_parameter("motor_parameters.k_i2", propulsion.k_i2);
+    this->get_parameter("motor_parameters.k_i3", propulsion.k_i3);
     this->get_parameter("voltage_lpf_hz", voltage_lpf_hz);
     propulsion.v_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;     // 6S: 22.20 V
     propulsion.v_min = n_lipo_cells * kBatteryUndervoltagePerCell;       // 6S: 12.0 V
@@ -173,11 +180,12 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
         if (curve_error.empty())
             RCLCPP_INFO(this->get_logger(),
                         "Propulsion model: F_std(u) = %.6g u^3 + %.6g u^2 + %.6g u N (F(1)=%.3f N), "
-                        "V_ref=%.2f V, R_eq=%.4g ohm, k_i=%.4g A/N, V_min=%.1f V, LPF %.1f Hz; "
-                        "u_idle pending FC motor_idle (CLI)",
+                        "V_ref=%.2f V, R_eq=%.4g ohm, I_std(F) = ((%.4g F + %.4g) F + %.4g) F A, "
+                        "V_min=%.1f V, LPF %.1f Hz; u_idle pending FC motor_idle (CLI)",
                         propulsion.a3, propulsion.a2, propulsion.a1,
                         quadratic_thrust_model::standardThrust(propulsion, 1.0), propulsion.v_ref,
-                        propulsion.r_eq, propulsion.k_i, propulsion.v_min, voltage_lpf_hz);
+                        propulsion.r_eq, propulsion.k_i3, propulsion.k_i2, propulsion.k_i,
+                        propulsion.v_min, voltage_lpf_hz);
         else
             RCLCPP_WARN(this->get_logger(),
                         "motor_parameters: \"%s\" at the provisional u_idle=%.4f; re-validated "

@@ -183,6 +183,35 @@ namespace
                 "full form with I_meas, I_std and R_eq");
         require(std::abs(calculateThrottle(full, f, 1.0, voltage, kNan) - u_std * 22.2 / voltage) < 1e-12,
                 "missing current must fall back to first order");
+        // 2026-11-12: 三项电流模型 I_std(F) = ((k_i3·F + k_i2)·F + k_i)·F
+        auto cubic = make(-15.0, 70.0, 6.0, 0.025, 1.188);
+        cubic.k_i2 = 1.04e-3;
+        cubic.k_i3 = 7.6e-5;
+        require(initInverse(cubic) >= 0.0, "inverse re-init after current-model edit");
+        const double f3 = 14.7, cur3 = 20.0, vol3 = 23.2;
+        const double u3 = solveStandardThrottle(cubic, f3);
+        const double i_std = ((7.6e-5 * f3 + 1.04e-3) * f3 + 1.188) * f3;
+        require(std::abs(currentAtThrust(cubic, f3) - i_std) < 1e-12, "currentAtThrust evaluation order");
+        require(std::abs(calculateThrottle(cubic, f3, 1.0, vol3, cur3) -
+                         (u3 * 22.2 + (cur3 - i_std) * 0.025) / vol3) < 1e-12,
+                "three-term current model full form");
+        // 负 k_i 但合成电流非负 -> 合法; 合成电流为负 -> validateModel 拒绝
+        // (直接构造: make() 会先校验, 而这些形态要设完 k_i2/k_i3 才合法/非法)
+        PropulsionModel neg_lin;
+        neg_lin.a3 = -15.0; neg_lin.a2 = 70.0; neg_lin.a1 = 6.0;
+        neg_lin.r_eq = 0.025; neg_lin.k_i = -0.5; neg_lin.k_i2 = 0.05; neg_lin.k_i3 = 1e-4;
+        require(validateModel(neg_lin).empty(), "negative linear term with net-positive current is legal");
+        require(initInverse(neg_lin) >= 0.0, "inverse init for net-positive current model");
+        PropulsionModel neg_i;
+        neg_i.a3 = -15.0; neg_i.a2 = 70.0; neg_i.a1 = 6.0;
+        neg_i.r_eq = 0.025; neg_i.k_i = -1.5;
+        require(validateModel(neg_i).find("current model") != std::string::npos,
+                "net-negative current model must be rejected");
+        PropulsionModel neg_mid;
+        neg_mid.a3 = -15.0; neg_mid.a2 = 70.0; neg_mid.a1 = 6.0;
+        neg_mid.r_eq = 0.025; neg_mid.k_i = 1.5; neg_mid.k_i2 = -0.08; neg_mid.k_i3 = -1e-3;
+        require(validateModel(neg_mid).find("current model") != std::string::npos,
+                "mid-range negative current model must be rejected");
     }
 
     void step4_clip_and_guards()

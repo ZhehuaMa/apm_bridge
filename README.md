@@ -629,8 +629,12 @@ are converted to throttle exactly as fpv_test.md §4 specifies, in
   so Newton usually converges in one step.
 - **Step 3** (`voltage_compensation`) — bus voltage and current from 0x12,
   first-order low-pass at `voltage_lpf_hz` (2–5 Hz, default 3), voltage floored
-  at `lipo_cells·2.0 V` (6S: 12 V). With `r_eq` and `k_i` calibrated:
-  `u_cmd = (u_std·V_ref + (I − I_std)·R_eq)/V`, `I_std = k_i·F_std_target`;
+  at `lipo_cells·2.0 V` (6S: 12 V). With `r_eq` and a calibrated current model:
+  `u_cmd = (u_std·V_ref + (I − I_std)·R_eq)/V` with the three-term current model
+  `I_std = ((k_i3·F + k_i2)·F + k_i)·F` (2026-11-12: the single linear
+  `k_i·F` form is U-shaped in `I/F` on bench data — ~2.7 A/N at idle, ~1.2 at
+  12 N, ~1.9 at full thrust — biasing `I_std` by 20–30 % at verification
+  operating points; `k_i2`/`k_i3` default 0 = linear);
   otherwise `u_cmd = u_std·V_ref/V`.
 - **Step 4** — `u = clip(u_cmd, u_idle, 1.0)`; `F_req ≤ 0.001 N` → `u_idle`
   (= collective 0, the FC idle).
@@ -641,12 +645,15 @@ motor_parameters:      # paste the block produced by thrust_test_node
   a2: …                # N
   a1: …                # N; dF/du > 0 on [u_idle,1] and F_std(u_idle) > 0 are enforced
   r_eq: …              # Ω, identified on the bench (0 = first-order step 3)
-  k_i: …               # A/N, I_std = k_i·F_std (0 = first-order step 3)
+  k_i: …               # A/N, linear term of I_std(F) (all current terms 0 = first-order step 3)
+  k_i2: …              # A/N², quadratic term (2026-11-12; 0/absent = linear, old YAML compatible)
+  k_i3: …              # A/N³, cubic term
 voltage_lpf_hz: 3.0
 ```
 
 The node rejects invalid calibrated-model parameters (non-finite, negative
-`r_eq`/`k_i`, bad `v_ref`/`v_min` ranges) at startup; the curve gate
+`r_eq`, a current model that goes negative on the calibrated thrust range, bad
+`v_ref`/`v_min` ranges) at startup; the curve gate
 (`dF/du > 0` and `F_std(u_idle) > 0` on the commandable window `[u_idle, 1]`,
 where `u_idle` is the FC `motor_idle` — sub-idle dips of convex-prop fits are
 accepted) is re-validated once the FC motor_idle is read, and force commands
@@ -687,16 +694,34 @@ Fit (§3): environment normalization `F0 = F·(P0/P)·(T/T0)`; RMS RPM; least
 squares `u·V = (1/K_v*)·RPM_rms + R_eq·I`; standard-voltage thrust
 `F_std = F0·((u·V_ref − I_std·R_eq)/(u·V − I·R_eq))²` with
 `I_std = I·(V_ref/V)²` (first-order `(V_ref/V)²` when RPM/current are
-missing); zero-intercept cubic via the normal equations; monotonicity check
-(`dF/du > 0` on `[u_idle, 1]` plus `F_std(u_idle) > 0` — the gate window uses
-the FC `motor_idle` read at start-up); `k_i` by least squares of `I_std` on
-`F_std`. Output: CSV with raw and normalized values, `*_result.yaml` with a
-ready-to-paste `motor_parameters` block (written only if the check passes),
-and a PNG. **After the fit, the tool verifies the calibration on the scale
-itself** (§4 online inversion): it requests a few expected thrusts, computes the
-throttle from the live temperature/pressure/voltage (and current), measures the
-actual pull and compares the error (≤ 2 % is a pass; results land in the
-result's `verification` block, `--no-verify` disables).
+missing); zero-intercept cubic by **relative-error weighted** normal equations
+(`w = 1/max(F_std, 1 %·F_max)`, 2026-11-12: the unweighted fit is dominated by
+the high-thrust end and sags +4…24 % below `u ≈ 0.3`, biasing the §4 inversion
+high exactly where the verification levels sit; an unconstrained `a1 < 0` is
+pinned to 0 — near-origin dips are fit artifacts, and F ≈ a1·u < 0 is
+non-physical); monotonicity check (`dF/du > 0` on `[u_idle, 1]` plus
+`F_std(u_idle) > 0` — the gate window uses the FC `motor_idle` read at
+start-up — and a data-level thrust-deadband rejection: any sampled positive
+duty with measured `F_std ≤ 0` means the thrust onset sits above the sampled
+range and the model form is invalid); the current model `I_std(F_std)` is a
+three-term through-origin polynomial `(k_i, k_i2, k_i3)` by least squares of
+`I_std` on `F_std` (falls back to linear on < 4 points or a non-physical fit).
+Output: CSV with raw and normalized values, `*_result.yaml` with the measured
+`tare_kg`, a ready-to-paste `motor_parameters` block (written only if the check
+passes), and a PNG. **After the fit, the tool verifies the calibration on the
+scale itself** (§4 online inversion): it first idles the motors for
+`--verify-cooldown` (default 10 s — the scan ends hot with a sagged battery,
+and the inversion uses the live voltage/current), then requests a few expected
+thrusts (levels at 35/55/75 % of `min(F_std(u_max)/env, (tare −
+critical-weight − 0.3 kg)·g)` — capped both by the calibrated domain in the
+request frame and by the scale lift-off safety line, each level ≥ 0.5 N =
+5× the ~0.1 N scale resolution; verification is skipped with a recorded reason
+if the battery settled below 3.5 V/cell — V/I telemetry on a deeply sagged
+pack is not representative of the thrust sampling window), computes the
+throttle from the live temperature/pressure/voltage (and current, averaged
+over the same window as the thrust), measures the actual pull and compares the
+error (≤ 2 % is a pass; results land in the result's `verification` block,
+`--no-verify` disables).
 
 ```bash
 # real stand, 6S, host takes OFFBOARD via the link (the default; use --no-offboard
@@ -721,7 +746,9 @@ ros2 run apm_bridge thrust_test_node --no-env-comp --no-voltage-comp \
 needed). Like `thrust_test_node` it defaults to the MOTOR_DIRECT (mode_req=1)
 control mode - enabling `custom_link_motor_direct` on the FC via `/fpv/cli` for
 the run and reverting it on exit - so bench vibration does not reach the rate
-PID; `--rates` forces the classic BODY_RATES mode.
+PID; `--rates` forces the classic BODY_RATES mode. After ARM it holds zero
+throttle for `--post-arm-delay` s (default 3) before applying the requested
+thrust, letting the ESCs/FC settle at idle before the thrust load.
 
 ## SITL motor calibration (flight pulses)
 
