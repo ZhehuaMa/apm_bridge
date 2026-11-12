@@ -82,6 +82,10 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<double>("link.diag_rate", 0.2);
     this->declare_parameter<double>("link.rate_limit_dps", 0.0);
     this->declare_parameter<double>("link.angle_limit_deg", 0.0);
+    // raw 通道集体油门成形: EMA 平滑 + 线性斜坡加/减速限速 (0 = 不限制/不平滑)
+    this->declare_parameter<double>("link.throttle_ramp_up_s", 1.0);
+    this->declare_parameter<double>("link.throttle_ramp_down_s", 0.5);
+    this->declare_parameter<int>("link.throttle_ema_window", 10);
     this->declare_parameter<double>("cli.timeout_s", 3.0); // /fpv/cli 响应超时
     this->declare_parameter<bool>("cli.bind_rx_on_connect", false);
 
@@ -375,6 +379,29 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("link.diag_rate", diag_rate);
     this->get_parameter("link.rate_limit_dps", rate_limit_dps);
     this->get_parameter("link.angle_limit_deg", angle_limit_deg);
+    double throttle_ramp_up_s = 1.0, throttle_ramp_down_s = 0.5;
+    int throttle_ema_window = 10;
+    this->get_parameter("link.throttle_ramp_up_s", throttle_ramp_up_s);
+    this->get_parameter("link.throttle_ramp_down_s", throttle_ramp_down_s);
+    this->get_parameter("link.throttle_ema_window", throttle_ema_window);
+    if (!std::isfinite(throttle_ramp_up_s) || throttle_ramp_up_s < 0.0 ||
+        !std::isfinite(throttle_ramp_down_s) || throttle_ramp_down_s < 0.0 || throttle_ema_window < 0)
+        throw std::invalid_argument(
+            "Invalid link.throttle_ramp_up_s/throttle_ramp_down_s (finite >= 0) or "
+            "link.throttle_ema_window (>= 0)");
+    throttle_shaper.configure(throttle_ramp_up_s, throttle_ramp_down_s, throttle_ema_window);
+    shape_dt_cap_s = 5.0 / std::max(0.1, control_rate); // 停顿后单帧最大推进 = 5 控制周期
+    if (throttle_ramp_up_s > 0.0 || throttle_ramp_down_s > 0.0 || throttle_ema_window >= 2)
+        RCLCPP_INFO(this->get_logger(),
+                    "Throttle shaping (raw channel): ramp up %.3g s / down %.3g s full-scale, "
+                    "EMA window %d (tau ~ %.0f ms at %.0f Hz)",
+                    throttle_ramp_up_s, throttle_ramp_down_s, throttle_ema_window,
+                    throttle_ema_window >= 2
+                        ? 500.0 * (throttle_ema_window - 1) / std::max(1.0, control_rate)
+                        : 0.0,
+                    control_rate);
+    else
+        RCLCPP_INFO(this->get_logger(), "Throttle shaping disabled (ramp = 0, EMA window < 2)");
     const auto control_period = custom_link::periodFromRate(control_rate);
 
     std::unique_ptr<custom_link::Transport> transport;
@@ -1055,6 +1082,7 @@ void CustomLinkVehicleNode::pushControl()
     bool fresh = false;
     {
         std::lock_guard<std::mutex> lk(mtx_cmd);
+        throttleShapeMaintenance(); // 油门成形: 帧间隔与上锁/旁路边沿复位 (持 mtx_cmd)
         if (cmd_valid)
         {
             if ((this->now() - cmd_stamp).seconds() < control_timeout)
@@ -1069,6 +1097,7 @@ void CustomLinkVehicleNode::pushControl()
                 {
                     // §4 在线反解 (每个控制周期用最新的环境系数与低通电压/电流):
                     // F_req -> 占空比 u ∈ [u_idle, 1] -> Betaflight 集体油门 (u_idle 对应 c = 0)。
+                    // 力通道不做油门成形: 斜坡进入推力闭环会与上层控制器相互拉扯。
                     std::lock_guard<std::mutex> lk(mtx_kp);
                     const double nan = std::numeric_limits<double>::quiet_NaN();
                     const double duty = quadratic_thrust_model::calculateThrottle(
@@ -1077,8 +1106,18 @@ void CustomLinkVehicleNode::pushControl()
                         voltage_compensation ? current_lpf.value : nan);
                     input.throttle = quadratic_thrust_model::dutyToCollective(duty, propulsion.u_idle);
                 }
-                else
-                    input.throttle = cmd_thrust;
+                // else if (cmd_motor_direct)
+                // {
+                //     // 台架标定直通 (mode_req=1): 阶跃油门是推力曲线的测量激励, 不成形。
+                //     input.throttle = cmd_thrust;
+                // }
+                // else
+                {
+                    // raw 集体油门: EMA 平滑 + 线性斜坡限速 (link.throttle_ramp_* /
+                    // link.throttle_ema_window), 给电机转子/螺旋桨留出建立转速
+                    // 与反电动势的时间, 抑制阶跃大电流冲击。
+                    input.throttle = shapeThrottle(cmd_thrust);
+                }
                 input.angle = cmd_angle;
                 input.motor_direct = cmd_motor_direct;
                 fresh = true;
@@ -1086,6 +1125,11 @@ void CustomLinkVehicleNode::pushControl()
             else
             {
                 cmd_valid = false; // 只作废控制量，arm 请求独立保留
+                // 失效边沿重基线: 失效期间链路上是 arm 保活的中性油门 (油门 0),
+                // 电机已回落怠速 —— 成形基点归零, 恢复后从怠速重新爬坡, 避免
+                // 恢复首帧一步跳回失效前的成形值。
+                throttle_shaper.reset(0.0);
+                shape_bypass_prev = false;
             }
         }
     }
@@ -1114,6 +1158,57 @@ void CustomLinkVehicleNode::pushControl()
         }
     }
     client->setControl(input, fresh);
+}
+
+void CustomLinkVehicleNode::throttleShapeMaintenance()
+{
+    // 帧间隔: 用单调钟实测 (定时器抖动/停顿后依然限速正确), 上限钳制为
+    // 5 个控制周期 —— 控制流中断 (如 rc.control_timeout 作废) 恢复后单帧
+    // 只前进钳制值, 不会借累积 dt 一步跳变。
+    const auto tick = std::chrono::steady_clock::now();
+    shape_dt_s = shape_last_valid
+        ? std::clamp(std::chrono::duration<double>(tick - shape_last_tick).count(), 0.0, shape_dt_cap_s)
+        : 0.0;
+    shape_last_tick = tick;
+    shape_last_valid = true;
+
+    // 上锁边沿: 电机确定停转, 斜坡基点归零 —— 下次解锁后的油门指令从怠速
+    // 附近起爬 (EMA 首样本直通, 输出仍受 ramp 限制)。同时清旁路锁存:
+    // 解锁期间 cmd_force_mode/cmd_motor_direct 保持旧值 (回调在上锁态直接
+    // 返回, 无人清它们), 若不清, 重解锁后首条 raw 指令会触发"旁路退出"边沿
+    // 把基点直通到该指令, 击穿本复位 (台架 MOTOR_DIRECT 会话或力通道着陆
+    // 后再解锁的典型序列)。
+    if (shape_armed_prev && !armed.load())
+    {
+        throttle_shaper.reset(0.0);
+        shape_bypass_prev = false;
+    }
+    shape_armed_prev = armed.load();
+
+    // 旁路 (力通道 / motor_direct) 与成形通道交界: 旁路期间成形器未跟踪
+    // 实际下发的油门, 交界处基点直通到当前指令 (reset 后首个 apply 输出即
+    // 该值), 保证输出连续无跳变、也无从旧基点回抽的凹陷。
+    const bool bypass = cmd_force_mode || cmd_motor_direct;
+    if (bypass != shape_bypass_prev)
+    {
+        throttle_shaper.reset(cmd_thrust);
+        shape_bypass_prev = bypass;
+    }
+}
+
+double CustomLinkVehicleNode::shapeThrottle(double target)
+{
+    // 首次使用一次性判定: 节点在 FC 已解锁时启动 (空中桥重启, 未见过上锁
+    // 边沿) 且此刻判定在空中 —— 电机实际状态未知, 从 0 爬坡会把 ~ramp_up_s
+    // 的近零油门压到旋转中的螺旋桨上, 比阶跃更危险; 基点直通首条指令保连
+    // 续性。地面/未知 (正常上电-解锁流程) 不直通, 油门照常从怠速爬坡。
+    if (shape_first_use)
+    {
+        if (landed_state.load() == mavros_msgs::msg::ExtendedState::LANDED_STATE_IN_AIR)
+            throttle_shaper.reset(target);
+        shape_first_use = false;
+    }
+    return throttle_shaper.apply(target, shape_dt_s);
 }
 
 void CustomLinkVehicleNode::updateGimbalMode()

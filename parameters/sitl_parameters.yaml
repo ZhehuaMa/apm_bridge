@@ -57,6 +57,11 @@ custom_link_bridge:
       diag_rate: 0.2
       rate_limit_dps: 0.0
       angle_limit_deg: 0.0 # Client-side ANGLE-mode roll/pitch clamp (deg, 0 = unlimited).
+      # Raw-channel collective-throttle shaping (EMA + linear ramp); 0 disables.
+      # Mirrors the real-vehicle custom_link_parameters.yaml values for parity.
+      throttle_ramp_up_s: 1.0 # Full-scale up-ramp time (s); 1.0 @100Hz = max +1% per 10 ms.
+      throttle_ramp_down_s: 0.5 # Full-scale down-ramp time (s), regen-current limiting.
+      throttle_ema_window: 5 # EMA window in control cycles (alpha = 2/(N+1)); <2 = off.
     rc:
       control_timeout: 0.5
     landed:

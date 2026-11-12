@@ -471,6 +471,31 @@ requests get an immediate `busy` reply.
 Normal collective thrust is mass-normalized acceleration (m/s2); raw collective
 is BF normalized throttle. Arming, OFFBOARD, watchdog, pilot takeover and
 time synchronization retain the real custom-link client's semantics.
+Raw collective throttle is shaped by an EMA filter followed by a linear
+ramp (acceleration/deceleration slew limiting) before it goes on the wire:
+`link.throttle_ramp_up_s` / `link.throttle_ramp_down_s` are the full-scale
+0->1 / 1->0 ramp times in seconds (defaults 1.0 s / 0.5 s, i.e. at most +1%
+throttle per 10 ms at the default 100 Hz rate for the up direction), and
+`link.throttle_ema_window` is the EMA window in control cycles
+(alpha = 2/(N+1), default 10, ~45 ms time constant at 100 Hz; < 2 disables
+the filter). This gives the motor rotor and propeller time to build RPM and
+back-EMF, taming the current spike and bus-voltage sag of a step throttle
+command, and limits regenerative braking current on fast throttle chops.
+Setting all three to 0 restores passthrough. The shaper only affects the
+raw channel (`~/control_command_raw`); the force channel keeps its thrust
+model output untouched so the shaping never enters the outer thrust loop,
+and `MOTOR_DIRECT` bench commands pass through unshaped (step throttle is
+the measurement stimulus). The ramp base resets to zero on the disarm edge
+and on the command-timeout invalidation edge (in both cases the wire carries
+only neutral idle throttle afterwards, so the base is truthful and the next
+session or recovery stream spools from idle instead of jumping back to the
+pre-gap value). The base snaps to the current command on force/motor-direct
+boundary crossings (continuity, no dip), and on the first shaped command
+after a node start while the FC is already armed and reporting in-air
+(mid-flight bridge restart: the motor state is genuinely unknown, so a
+near-zero ramp would be more dangerous than a step). Between edges the
+elapsed dt is capped at five control cycles, so a stalled timer cannot
+advance the ramp by a accumulated gap.
 `link.control_rate` sets both the latest-command cache push rate and the
 custom-link control-frame transmit rate at startup. Periods use nanosecond
 resolution, including for fractional frequencies; invalid rates fail explicitly.
