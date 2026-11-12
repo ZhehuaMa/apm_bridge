@@ -27,7 +27,7 @@ F_REQ_EPS = 0.001             # §5 零推力保护阈值 (N)
 NEWTON_MAX_ITER = 4           # §4 步骤 2: 3~4 次
 NEWTON_TOL = 1e-5             # §4 步骤 2: 1e-5 精度
 U_PROJECT_MAX = 1.2           # §5 迭代投影区间 [0, 1.2]
-MIN_POINTS_RECOMMENDED = 20   # §3.2 N >= 20
+MIN_POINTS_RECOMMENDED = 10   # §3.2 推荐的最少采样点数
 
 
 def _clamp(x, lo, hi):

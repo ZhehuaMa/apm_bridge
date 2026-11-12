@@ -66,6 +66,7 @@ class FakeBridge(Node):
         self.airsim = airsim
         self.reject_motor_direct_set = reject_motor_direct_set  # 仿真旧固件 (无该设置)
         self.motor_direct_on = False
+        self.numeric_settings = {'failsafe_delay': 15}  # 数值型设置 (固件默认 1.5s)
         self.rearm_after_disarm = 0   # 解锁后到达的 arm=True (解锁/重锁竞争检测)
         self._saw_disarm = False
         self._saw_arm_level = False
@@ -100,12 +101,26 @@ class FakeBridge(Node):
 
     def on_cli(self, request, response):
         # 复刻固件 CLI 通道语义: motor_idle GET + custom_link_motor_direct GET/SET
-        # (MODE_LOOKUP 值只认 ON/OFF 字符串; SET 回读新值)。
+        # (MODE_LOOKUP 值只认 ON/OFF 字符串; SET 回读新值) + 数值型设置。
         response.ok = True
         args = (request.args or '').strip()
+        name = args.split('=', 1)[0].strip()
         if request.cmd == CliCommand.Request.CMD_GET and args == 'motor_idle':
             self.cli_gets.append(args)
             response.status, response.text = 0, f'motor_idle = {FC_MOTOR_IDLE}'
+        elif name in self.numeric_settings and '=' not in args and \
+                request.cmd == CliCommand.Request.CMD_GET:
+            self.cli_gets.append(args)
+            response.status = 0
+            response.text = f'{name} = {self.numeric_settings[name]}'
+        elif name in self.numeric_settings and request.cmd == CliCommand.Request.CMD_SET:
+            try:
+                value = int(args.split('=', 1)[1].strip())
+            except (IndexError, ValueError):
+                response.status, response.text = 1, 'SET FAILED'
+                return response
+            self.numeric_settings[name] = value
+            response.status, response.text = 0, f'{name} = {value}'
         elif args.startswith('custom_link_motor_direct'):
             if self.reject_motor_direct_set:
                 response.status, response.text = 1, 'SET FAILED'
@@ -229,7 +244,8 @@ def hardware_mode(out_dir, results, reject_gate=False, prefix='hw'):
     check(results, f'{prefix}_exit', proc.returncode == 0, f'rc={proc.returncode}')
     check(results, f'{prefix}_arm_disarm', True in arm_calls and False in arm_calls)
     check(results, f'{prefix}_no_rearm_after_disarm', rearm == 0, f'{rearm} rearms')
-    check(results, f'{prefix}_u_idle_from_fc', cli_gets == ['motor_idle'], f'/fpv/cli gets={cli_gets}')
+    check(results, f'{prefix}_u_idle_from_fc', cli_gets[:1] == ['motor_idle'] and 'failsafe_delay' in cli_gets,
+          f'/fpv/cli gets={cli_gets}')
     test_cmds = [msg for _, _, armed, msg in ((t, c, a, m) for t, c, a, m in commands) if armed]
     expected_mode = ControlCommand.BODY_RATES if reject_gate else ControlCommand.MOTOR_DIRECT
     mode_ok = test_cmds and all(m.control_mode == expected_mode for m in test_cmds) and \

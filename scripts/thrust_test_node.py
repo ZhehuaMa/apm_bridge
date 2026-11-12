@@ -65,7 +65,7 @@ try:
 
     from quadrotor_msgs.msg import ControlCommand
     from quadrotor_msgs.srv import CliCommand
-    from mavros_msgs.msg import State
+    from mavros_msgs.msg import RCIn, State
     from sensor_msgs.msg import BatteryState, FluidPressure, Imu, Temperature
     from std_msgs.msg import Bool, Float32MultiArray
 
@@ -127,10 +127,13 @@ def average_window(window, tare_kg, gravity):
 
     rpm = [mean(series) for series in window['rpm']] if window['rpm'] else []
     weight = mean(window['weight'])
+    rssi = [r for r in window['rssi'] if math.isfinite(r)]
     return {'u': window['u'], 'collective': window['collective'],
             'V': mean(window['V']), 'I': mean(window['I']), 'rpm': rpm,
             'F': (tare_kg - weight) * gravity if math.isfinite(weight) else float('nan'),
             'P': mean(window['P']), 't': mean(window['t']),
+            'rssi': mean(rssi) if rssi else float('nan'),
+            'rssi_min': min(rssi) if rssi else float('nan'),
             'weight_kg': weight, 'n_weight': len(window['weight'])}
 
 
@@ -156,7 +159,7 @@ def verification_verify_pass(verification, max_rel_error=0.02):
 
 def new_window(u, collective, n_motors=0):
     return {'u': u, 'collective': collective, 'weight': [], 'V': [], 'I': [],
-            'rpm': [[] for _ in range(n_motors)], 'P': [], 't': []}
+            'rpm': [[] for _ in range(n_motors)], 'P': [], 't': [], 'rssi': []}
 
 
 def cli_command(node, cmd, args, timeout=10.0):
@@ -206,6 +209,7 @@ class ThrustTestNode(Node):
         self.last_current = float('nan')
         self.last_pressure = float('nan')
         self.last_temperature = float('nan')
+        self.last_rssi = float('nan')
         self.tare_samples = None          # 去皮期间收集的稳定重量
         self.window = None                # 当前稳态采样段 (None = 不采集)
         self.quiet = False
@@ -230,6 +234,7 @@ class ThrustTestNode(Node):
         self.create_subscription(BatteryState, '/mavros/battery', self.on_battery, qos_be10)
         self.create_subscription(Float32MultiArray, '/current_weight', self.on_weight, qos_be10)
         self.create_subscription(Imu, '/mavros/imu/data', self.on_imu, qos_be10)
+        self.create_subscription(RCIn, '/mavros/rc/in', self.on_rc_in, qos_be10)  # rssi 逐点记录 (掉链取证)
         self.create_subscription(FluidPressure, '/fpv/static_pressure', self.on_pressure, qos_be10)
         self.create_subscription(Temperature, '/fpv/temperature_baro', self.on_temperature, qos_be10)
         self.create_subscription(Float32MultiArray, '/fpv/motor_rpm', self.on_motor_rpm, qos_be10)
@@ -250,9 +255,11 @@ class ThrustTestNode(Node):
             was_testing, was_armed, disarming = self.testing, self.armed, self.disarming
             self.armed = msg.armed
             self.mode = msg.mode
+            mode = self.mode
         self.state_event.set()
         if was_testing and was_armed and not msg.armed and not disarming:
-            print(f'\n{bcolors.ERROR}*** FC DISARMED during test! Aborting. ***{bcolors.ENDC}')
+            print(f'\n{bcolors.ERROR}*** FC DISARMED during test (last mode: {mode or "--"})! '
+                  f'Aborting. ***{bcolors.ENDC}')
             self.abort_event.set()
 
     def on_battery(self, msg):
@@ -291,6 +298,14 @@ class ThrustTestNode(Node):
     def on_imu(self, msg):
         with self.lock:
             self.orientation = msg.orientation
+
+    def on_rc_in(self, msg):
+        # 桥以 best_effort 发布 /mavros/rc/in (rssi_pct 0..100); 大油门压降/EMI
+        # 击穿接收链路的时刻由此进入数据点 (failsafe 掉链取证)。
+        with self.lock:
+            self.last_rssi = float(msg.rssi)
+            if self.window is not None:
+                self.window['rssi'].append(self.last_rssi)
 
     def on_pressure(self, msg):
         if msg.fluid_pressure > 0.0:
@@ -489,6 +504,11 @@ class ThrustTestNode(Node):
         print(f'\nu={point["u"]:.3f} (c={point["collective"]:.3f}): F={point["F"]:.3f} N, '
               f'V={point["V"]:.2f} V, I={point["I"]:.2f} A, RPMrms={rpm_rms:.0f}, '
               f'P={point["P"]:.0f} Pa, t={point["t"]:.1f} C')
+        if math.isfinite(point['rssi_min']) and point['rssi_min'] < 50:
+            print(f'{bcolors.WARNING}u={point["u"]:.3f}: RC rssi dropped to {point["rssi_min"]:.0f}% '
+                  f'(avg {point["rssi"]:.0f}%) -- receiver link is marginal at this load; '
+                  f'a sustained drop trips failsafe (OFFBOARD loss -> motors stop / disarm)'
+                  f'{bcolors.ENDC}')
 
     def start_testing(self):
         with self.lock:
@@ -581,13 +601,15 @@ def write_outputs(node, args, aborted):
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['u', 'collective', 'V', 'I'] + [f'rpm{k + 1}' for k in range(n_rpm)] +
-                        ['rpm_rms', 'F_N', 'P_Pa', 't_C', 'F0_N', 'F_std_N', 'I_std_A', 'n_weight'])
+                        ['rpm_rms', 'F_N', 'P_Pa', 't_C', 'F0_N', 'F_std_N', 'I_std_A',
+                         'rssi_pct', 'rssi_min_pct', 'n_weight'])
         for r in rows:
             rpm = list(r['rpm']) + [float('nan')] * (n_rpm - len(r['rpm']))
             writer.writerow([f"{r['u']:.6f}", f"{r['collective']:.6f}", f"{r['V']:.4f}", f"{r['I']:.4f}"] +
                             [f'{v:.2f}' for v in rpm] +
                             [f"{r['rpm_rms']:.2f}", f"{r['F']:.4f}", f"{r['P']:.1f}", f"{r['t']:.2f}",
-                             f"{r['F0']:.4f}", f"{r['F_std']:.4f}", f"{r['I_std']:.4f}", r['n_weight']])
+                             f"{r['F0']:.4f}", f"{r['F_std']:.4f}", f"{r['I_std']:.4f}",
+                             f"{r['rssi']:.0f}", f"{r['rssi_min']:.0f}", r['n_weight']])
     print(f'CSV written to {csv_path}')
 
     yaml_path = base + '_result.yaml'
@@ -753,6 +775,11 @@ def parse_args(argv=None):
                              'positive feedback on the bench at high throttle)')
     parser.add_argument('--no-verify', action='store_true',
                         help='skip the post-fit §4 verification on the scale')
+    parser.add_argument('--no-failsafe-stretch', action='store_true',
+                        help='do not stretch failsafe_delay for the session (default stretches the '
+                             'RX-loss stage-1 delay to 5 s via /fpv/cli, RAM-only, restored on exit - '
+                             'bench deep-sag/EMI transients at high throttle otherwise drop OFFBOARD '
+                             'and can disarm mid-scan; the pilot ARM switch still disarms instantly)')
     parser.add_argument('--verify-sample-time', type=float, default=3.0,
                         help='averaging window per verification thrust level [s]; '
                              'the --settle-time wait runs before it, on top')
@@ -847,6 +874,23 @@ def main():
                 args.motor_direct = False
                 print(f'{bcolors.WARNING}motor-direct unavailable ({e}); falling back to BODY_RATES - '
                       f'the rate PID will react to bench vibration at high throttle{bcolors.ENDC}')
+        # 台架放宽 failsafe stage-1 (RX 丢失) 延迟: 大油门深压降/EMI 暂态会击穿接收链路,
+        # 默认 1.5 s 即摘 OFFBOARD (冷却段电机停转) 并可能走到二级解锁中止扫描
+        # (2026-11-11 实测 u>=0.70 复现)。RAM-only, 退出还原; 飞手 ARM 开关仍即时上锁。
+        args.failsafe_delay_orig = None
+        if not args.no_failsafe_stretch:
+            try:
+                text = cli_command(node, CliCommand.Request.CMD_GET, 'failsafe_delay')
+                orig = int(text.rsplit('=', 1)[-1].strip())
+                if orig < 50:
+                    cli_command(node, CliCommand.Request.CMD_SET, 'failsafe_delay = 50')
+                    args.failsafe_delay_orig = orig
+                    print(f'{bcolors.OKGREEN}bench failsafe stretch: failsafe_delay '
+                          f'{orig / 10:.1f}s -> 5.0s (restored on exit; pilot ARM switch '
+                          f'still disarms instantly){bcolors.ENDC}')
+            except (RuntimeError, ValueError) as e:
+                print(f'{bcolors.WARNING}cannot stretch failsafe_delay ({e}); RX-loss '
+                      f'transients may abort the scan{bcolors.ENDC}')
         # 低于 FC u_idle 的阶实际以 c=0 (怠速) 运行并被记录在 u_idle -- 塌缩成
         # 单个怠速数据点, 避免同 u 重复行 (motor_idle 调大时整段阶都会塌缩)。
         collapsed = sorted({round(max(u, node.u_idle), 6) for u in args.levels})
@@ -902,6 +946,13 @@ def main():
             except RuntimeError as e:
                 print(f'{bcolors.WARNING}failed to revert custom_link_motor_direct=OFF '
                       f'({e}); power-cycling the FC also restores the default{bcolors.ENDC}')
+        if getattr(args, 'failsafe_delay_orig', None) is not None:
+            try:
+                cli_command(node, CliCommand.Request.CMD_SET,
+                            f'failsafe_delay = {args.failsafe_delay_orig}')
+            except RuntimeError as e:
+                print(f'{bcolors.WARNING}failed to restore failsafe_delay '
+                      f'({e}); power-cycling the FC also restores it{bcolors.ENDC}')
         print('\nSTOP TESTING')
         executor.remove_node(node)
         rclpy.shutdown()
