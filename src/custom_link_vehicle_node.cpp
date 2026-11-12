@@ -1097,23 +1097,38 @@ void CustomLinkVehicleNode::pushControl()
                 {
                     // §4 在线反解 (每个控制周期用最新的环境系数与低通电压/电流):
                     // F_req -> 占空比 u ∈ [u_idle, 1] -> Betaflight 集体油门 (u_idle 对应 c = 0)。
-                    // 力通道不做油门成形: 斜坡进入推力闭环会与上层控制器相互拉扯。
+                    // 反解结果写入 cmd_thrust, 与 raw 通道统一经下方 shapeThrottle 成形
+                    // (EMA + 斜坡) 后发送 —— 起步阶跃变平滑爬坡 (2026-11-12 无桨实测:
+                    // 0→36% 集体油门 13k rpm 爬坡 0.45s vs 阶跃 0.25s, 稳态完全一致)。
+                    //
+                    // 【成形 vs 控制回路边界提醒】成形器在闭环内引入滞后, "与上层控制器
+                    // 拉扯"(速率饱和极限环)需要: 回路带宽接近成形滞后频率 + 控制器含积分
+                    // + 成形器持续触顶。当前三者皆不满足: 最快外环为垂直通道 a_z=K_az(v_z_des
+                    // -v_z), K_az=4 rad/s, 20ms EMA 在该频率仅 4.6° 相位损失 (速度环相位
+                    // 裕度 ~85°); 推力路径为前馈模型逆, 无积分器; 1/s 斜坡只在 MISSION
+                    // 起步/终止等单发阶跃时绑定, 稳态小修正 (±5 m/s² ≈ ±0.04 油门) 远低于
+                    // 限速。滞后期间外环表现为"等待"(需求保持)而非对抗 —— 台架实测爬坡段
+                    // 需求恒 3.55g 不回拉。
+                    // ⚠ 若终端制导/垂直回路增益提高一个数量级 (带宽 >40 rad/s) 或引入
+                    // 推力/加速度闭环积分, EMA 与斜坡将开始侵蚀相位裕度, 需重新评估
+                    // 本成形器 (缩小 EMA 窗口/加大斜率, 或对力通道旁路成形)。
                     std::lock_guard<std::mutex> lk(mtx_kp);
                     const double nan = std::numeric_limits<double>::quiet_NaN();
                     const double duty = quadratic_thrust_model::calculateThrottle(
                         propulsion, cmd_force, env_factor,
                         voltage_compensation ? voltage_lpf.value : nan,
                         voltage_compensation ? current_lpf.value : nan);
-                    input.throttle = quadratic_thrust_model::dutyToCollective(duty, propulsion.u_idle);
+                    cmd_thrust = quadratic_thrust_model::dutyToCollective(duty, propulsion.u_idle);
                 }
                 // else if (cmd_motor_direct)
                 // {
                 //     // 台架标定直通 (mode_req=1): 阶跃油门是推力曲线的测量激励, 不成形。
+                //     // 较大阶跃油门的瞬态响应，会导致电流冲击和母线电压跌落, 不适合直接发送给电机。
                 //     input.throttle = cmd_thrust;
                 // }
                 // else
                 {
-                    // raw 集体油门: EMA 平滑 + 线性斜坡限速 (link.throttle_ramp_* /
+                    // raw 与力通道共用: EMA 平滑 + 线性斜坡限速 (link.throttle_ramp_* /
                     // link.throttle_ema_window), 给电机转子/螺旋桨留出建立转速
                     // 与反电动势的时间, 抑制阶跃大电流冲击。
                     input.throttle = shapeThrottle(cmd_thrust);
