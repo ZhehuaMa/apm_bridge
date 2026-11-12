@@ -39,6 +39,10 @@ namespace quadratic_thrust_model
         double k_i2 = 0.0;
         double k_i3 = 0.0;
         double v_min = 12.0;  // 欠压保护下限 (cells·2.0, §5)
+        // 动力系统最大集体油门保护上限 [0, 1] (0x10 集体油门域, u_idle 对应 0):
+        // 节点在 pushControl 输出端对力通道与 raw 通道统一限幅; 1.0 = 不限制。
+        // 与推力曲线无关 (非标定量), 仅是输出保护界。
+        double throttle_limit = 1.0;
 
         // §4 步骤 2 初值: 有效油门区间 [u_idle, 1] 上的反函数三次拟合 (initInverse 生成)
         //   u ≈ c0 + c1·w + c2·w² + c3·w³,  w = sqrt(F / F(1))
