@@ -6,6 +6,9 @@
 退出时写 '0P' 停止。发布 /current_weight (std_msgs/Float32MultiArray):
 data = [weight_kg, stable_weight_kg]  # stable 为 NaN 表示未稳定
 
+串口打开失败 (含 USB 适配器拔出/挂死时的 EIO) 周期重试，流中断后自动重连；
+适配器重插后无需重启节点。
+
 用法 (需系统 python, conda 环境请先 deactivate):
   ros2 run apm_bridge scale_reader_node --ros-args -p port:=/dev/ttyUSB0
 """
@@ -76,32 +79,40 @@ class ScaleReaderNode(Node):
         self.thread = None
 
     def open_scale(self):
-        """打开串口并启动连续输出；失败则周期重试直到 stop_event。"""
+        """打开串口并启动连续输出；失败则周期重试直到 stop_event。
+
+        注意 SerialException 是 OSError 的子类，而 USB 适配器拔出/挂死时
+        open 会在 DTR/RTS ioctl 处抛原生 OSError(EIO) (pyserial 不包装)，
+        故这里统一捕获 OSError。
+        """
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
         while not self.stop_event.is_set():
             try:
                 self.comm = serial.Serial(port, baudrate, timeout=1,
                                           parity=serial.PARITY_NONE)
-                break
-            except serial.SerialException as e:
-                self.get_logger().error(f'cannot open {port}: {e}, retry in {RETRY_INTERVAL:.0f}s')
+                self.thread = serial.threaded.ReaderThread(
+                    self.comm, lambda: ScaleProtocol(self.weight_pub))
+                self.thread.start()
+                self.thread._connection_made.wait()
+                if not self.thread.alive:
+                    raise serial.SerialException('connection lost right after open')
+                protocol = self.thread.protocol
+                protocol.write_line('0S')
+                self.stop_event.wait(STARTUP_DELAY)
+                protocol.write_line('CP')
+            except (OSError, RuntimeError, AttributeError) as e:
+                # OSError: 串口打开/读写失败 (含 USB 挂死的原生 EIO);
+                # RuntimeError: ReaderThread.start() 失败 (线程耗尽);
+                # AttributeError: reader 线程刚退出, protocol 已置 None
+                self.get_logger().error(f'cannot open {port}: {e!r}, '
+                                        f'retry in {RETRY_INTERVAL:.0f}s')
+                self.close_scale()
                 self.stop_event.wait(RETRY_INTERVAL)
-        if self.comm is None:
-            return False
-
-        self.thread = serial.threaded.ReaderThread(self.comm,
-                                                   lambda: ScaleProtocol(self.weight_pub))
-        self.thread.start()
-        self.thread._connection_made.wait()
-        if not self.thread.alive:
-            raise RuntimeError('scale connection_lost already called')
-        protocol = self.thread.protocol
-        protocol.write_line('0S')
-        self.stop_event.wait(STARTUP_DELAY)
-        protocol.write_line('CP')
-        self.get_logger().info(f'scale streaming on {port} @ {baudrate}')
-        return True
+                continue
+            self.get_logger().info(f'scale streaming on {port} @ {baudrate}')
+            return True
+        return False
 
     def close_scale(self):
         """停止输出并关闭串口 (幂等)。"""
@@ -110,7 +121,10 @@ class ScaleReaderNode(Node):
                 self.thread.protocol.write_line('0P')
             except Exception:
                 pass
-            self.thread.close()
+            try:
+                self.thread.close()  # 线程从未 start 成功时 join() 会抛 RuntimeError
+            except Exception:
+                pass
             self.thread = None
         if self.comm is not None:
             try:
@@ -125,21 +139,40 @@ def main():
     node = ScaleReaderNode()
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+
+    def _spin():
+        try:
+            executor.spin()
+        except rclpy.executors.ExternalShutdownException:
+            pass  # rclpy.shutdown() 打断 spin 属正常关停路径
+        except KeyboardInterrupt:
+            pass
+
+    spin_thread = threading.Thread(target=_spin, daemon=True)
     spin_thread.start()
     # SIGTERM/SIGINT 都走干净关停，保证向秤写 '0P'
     signal.signal(signal.SIGTERM, lambda *_: node.stop_event.set())
 
     opened = False
     try:
-        opened = node.open_scale()
-        if opened:
-            node.stop_event.wait()
-    except (KeyboardInterrupt, RuntimeError):
+        while not node.stop_event.is_set():
+            if not node.open_scale():
+                break
+            opened = True
+            # 监视流是否断开 (ReaderThread 死亡)，断开则重连
+            while node.thread is not None and node.thread.alive \
+                    and not node.stop_event.is_set():
+                node.stop_event.wait(0.5)
+            if node.stop_event.is_set():
+                break
+            node.get_logger().error('scale stream lost, '
+                                    f'reconnect in {RETRY_INTERVAL:.0f}s')
+            node.close_scale()
+            node.stop_event.wait(RETRY_INTERVAL)
+    except KeyboardInterrupt:
         pass
     finally:
-        if opened:
-            node.close_scale()
+        node.close_scale()
         node.get_logger().info('scale reader exiting')
         executor.remove_node(node)
         rclpy.shutdown()
