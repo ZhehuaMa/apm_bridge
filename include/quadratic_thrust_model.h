@@ -32,7 +32,12 @@ namespace quadratic_thrust_model
         double v_ref = 22.2;  // 基准电压 V_ref (cells·3.7)
         double u_idle = 0.05; // 怠速死区下限 (§4 步骤 4) = 飞控 motor_idle 占空比, 运行时由 CLI 读取
         double r_eq = 0.0;    // 全系统等效集中电阻 (Ω); 0 = 一阶电压补偿
-        double k_i = 0.0;     // I_std = k_i·F_std (A/N, I ∝ RPM² ∝ F); 0 = 一阶电压补偿
+        // 电流模型 I_std(F_std) = ((k_i3·F + k_i2)·F + k_i)·F (A)。§1.4 原线性假设
+        // "I ∝ RPM² ∝ F" 被 2026-11 台架数据否定 (I/F 呈 U 形: 怠速 ~2.7 → 谷底 ~1.2
+        // → 满油门 ~1.9 A/N), k_i2/k_i3 为二次/三次修正项; 三项全 0 = 线性/一阶补偿。
+        double k_i = 0.0;
+        double k_i2 = 0.0;
+        double k_i3 = 0.0;
         double v_min = 12.0;  // 欠压保护下限 (cells·2.0, §5)
 
         // §4 步骤 2 初值: 有效油门区间 [u_idle, 1] 上的反函数三次拟合 (initInverse 生成)
@@ -57,6 +62,17 @@ namespace quadratic_thrust_model
         return (3.0 * m.a3 * u + 2.0 * m.a2) * u + m.a1;
     }
 
+    /// 电流模型 I_std(F_std) (A), 与 propulsion_model.current_at_thrust 逐位一致。
+    inline double currentAtThrust(const PropulsionModel &m, double f_std)
+    {
+        return ((m.k_i3 * f_std + m.k_i2) * f_std + m.k_i) * f_std;
+    }
+
+    inline bool currentModelActive(const PropulsionModel &m)
+    {
+        return m.k_i != 0.0 || m.k_i2 != 0.0 || m.k_i3 != 0.0;
+    }
+
     /// min_{u∈[u_idle,1]} dF/du (端点与驻点; u_idle 先钳到 [0,1], 范围校验见 validateModel)。
     inline double minSlopeOnUnitInterval(const PropulsionModel &m)
     {
@@ -71,20 +87,21 @@ namespace quadratic_thrust_model
         return slope;
     }
 
-    /// 与曲线无关的参数范围校验 (有限性、u_idle/v_ref/v_min/r_eq/k_i 范围); 空串 = 合法。
+    /// 与曲线无关的参数范围校验 (有限性、u_idle/v_ref/v_min/r_eq 范围); 空串 = 合法。
     /// 启动时 u_idle 仅为占位值 (FC motor_idle 未读), 曲线判据须等真实 u_idle
-    /// (validateModel) 再执行, 故拆出此函数。
+    /// (validateModel) 再执行, 故拆出此函数。电流模型只校验有限性: 三项拟合的
+    /// 线性项 k_i 可为负 (合成电流非负即可), 非负性属曲线相关判据 (validateModel)。
     inline std::string validateParameters(const PropulsionModel &m)
     {
-        for (double v : {m.a3, m.a2, m.a1, m.v_ref, m.u_idle, m.r_eq, m.k_i, m.v_min})
+        for (double v : {m.a3, m.a2, m.a1, m.v_ref, m.u_idle, m.r_eq, m.k_i, m.k_i2, m.k_i3, m.v_min})
             if (!std::isfinite(v))
                 return "parameters must be finite";
         if (m.u_idle < 0.0 || m.u_idle >= 1.0)
             return "u_idle must be in [0, 1)";
         if (!(m.v_ref > 0.0) || m.v_min < 0.0 || m.v_min >= m.v_ref)
             return "require v_ref > 0 and 0 <= v_min < v_ref";
-        if (m.r_eq < 0.0 || m.k_i < 0.0)
-            return "r_eq and k_i must be non-negative";
+        if (m.r_eq < 0.0)
+            return "r_eq must be non-negative";
         return {};
     }
 
@@ -103,6 +120,11 @@ namespace quadratic_thrust_model
         if (!(minSlopeOnUnitInterval(m) > 0.0) ||
             (m.u_idle > 0.0 && !(standardThrust(m, m.u_idle) > 0.0)))
             return "thrust curve must satisfy dF/du > 0 on [u_idle, 1] and F_std(u_idle) > 0";
+        const double f_max = standardThrust(m, 1.0);
+        if (f_max > 0.0)
+            for (double s : {0.2, 0.4, 0.6, 0.8, 1.0})
+                if (currentAtThrust(m, s * f_max) < 0.0)
+                    return "current model I_std(F) must stay non-negative on the calibrated thrust range";
         return {};
     }
 
@@ -224,8 +246,9 @@ namespace quadratic_thrust_model
     }
 
     /// §4 步骤 3: 母线电压与电流负载补偿。voltage 为低通后的母线电压, current 为低通后的
-    /// 总电流; 电压无效 (<=0/NaN) 时不补偿。r_eq、k_i 与有效电流齐备时用完整式
-    ///   u_cmd = (u_std·V_ref + (I − I_std)·R_eq) / V,  I_std = k_i·F_std
+    /// 总电流; 电压无效 (<=0/NaN) 时不补偿。r_eq、电流模型 (k_i/k_i2/k_i3 任一非零)
+    /// 与有效电流齐备时用完整式
+    ///   u_cmd = (u_std·V_ref + (I − I_std)·R_eq) / V,  I_std = currentAtThrust(F_std)
     /// 否则用一阶工程式 u_cmd = u_std·V_ref / V。V 先钳到欠压下限 v_min。
     inline double compensate(const PropulsionModel &m, double u_std, double f_std,
                              double voltage, double current = std::numeric_limits<double>::quiet_NaN())
@@ -233,9 +256,9 @@ namespace quadratic_thrust_model
         if (!std::isfinite(voltage) || voltage <= 0.0)
             return u_std;
         const double v = std::max(voltage, m.v_min);
-        if (m.r_eq > 0.0 && m.k_i > 0.0 && std::isfinite(current) && current >= 0.0)
+        if (m.r_eq > 0.0 && currentModelActive(m) && std::isfinite(current) && current >= 0.0)
         {
-            const double i_std = m.k_i * f_std;
+            const double i_std = currentAtThrust(m, f_std);
             return (u_std * m.v_ref + (current - i_std) * m.r_eq) / v;
         }
         return u_std * (m.v_ref / v);

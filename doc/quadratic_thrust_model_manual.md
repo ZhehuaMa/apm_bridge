@@ -67,7 +67,9 @@ $$E_b = K_e \cdot \text{RPM}_{\text{rms}} = u \cdot V_{\text{meas}} - I_{\text{m
 
 $$\text{RPM}_{\text{std}, i} = \text{RPM}_{\text{rms}, i} \cdot \frac{u_i V_{\text{ref}} - I_{\text{std}, i} R_{\text{eq}}}{u_i V_i - I_i R_{\text{eq}}}$$
 
-在空气动力学负载下，稳态转矩与电流成正比，且与转速平方成正比，即 $I \propto \text{RPM}^2$。由此可解出标准状态下的推力虚拟测量值点集 $(u_i, F_{\text{std}, i})$。
+在空气动力学负载下，稳态转矩与电流成正比，且与转速平方成正比。**电流-推力模型（2026-11-12 修订）**：原假设 $I \propto \text{RPM}^2 \propto F$（过原点线性 $I_{\text{std}} = k_i F_{\text{std}}$）被台架实测否定——$I/F$ 随推力呈 U 形（怠速 ~2.7、$F \approx 12\text{ N}$ 谷底 ~1.2、满油门 ~1.9 A/N），单一线性 $k_i$ 在验证工况点带 20~30% 电流偏置，经 §4 步骤 3 的 $(I_{\text{meas}} - I_{\text{std}}) R_{\text{eq}}$ 项放大为随请求推力增长的系统性误差。电流模型改为无截距三次三项式：
+$$I_{\text{std}}(F_{\text{std}}) = \big((k_{i3} F_{\text{std}} + k_{i2}) F_{\text{std}} + k_i\big) F_{\text{std}}$$
+其中 $k_{i2} = k_{i3} = 0$ 时退化为线性（旧参数兼容）。由此可解出标准状态下的推力虚拟测量值点集 $(u_i, F_{\text{std}, i})$。
 
 ---
 
@@ -156,7 +158,7 @@ $$F_{\text{std}}(u) = a_3 u^3 + a_2 u^2 + a_1 u$$
 
 $$F_{\text{std}}(u) = a_3 u^3 + a_2 u^2 + a_1 u$$
 
-构建设计矩阵 $\mathbf{X} \in \mathbb{R}^{N \times 3}$ 和目标向量 $\mathbf{Y} \in \mathbb{R}^{N \times 1}$：
+构建设计矩阵 $\mathbf{X} \in \mathbb{R}^{N \times 3}$、目标向量 $\mathbf{Y} \in \mathbb{R}^{N \times 1}$ 与**相对误差权重**对角阵 $\mathbf{W} = \mathrm{diag}(w_i)$，$w_i = 1/\max(F_{\text{std}, i},\; 0.01 \max_j F_{\text{std}, j})$：
 
 $$\mathbf{X} = \begin{bmatrix}
 u_1^3 & u_1^2 & u_1 \\
@@ -172,9 +174,15 @@ F_{\text{std}, N}
 \end{bmatrix}, \quad
 \mathbf{\Theta} = \begin{bmatrix} a_3 \\ a_2 \\ a_1 \end{bmatrix}$$
 
-通过正则正规方程（Normal Equations）求解参数解向量：
+通过加权正规方程（Weighted Normal Equations）求解参数解向量：
 
-$$\mathbf{\Theta} = (\mathbf{X}^T \mathbf{X})^{-1} \mathbf{X}^T \mathbf{Y}$$
+$$\mathbf{\Theta} = (\mathbf{X}^T \mathbf{W} \mathbf{X})^{-1} \mathbf{X}^T \mathbf{W} \mathbf{Y}$$
+
+**$a_1 \ge 0$ 边界约束**：无约束解 $a_1 < 0$ 时改取 $a_1 = 0$ 的边界最优（即 $[u^3, u^2]$ 两参加权解）。拟合统计（RMS/最大误差/$R^2$）恒按无权物理残差（N）计算，与历史结果同口径。
+
+> **修订说明（2026-11-12）**：原实现为无权正规方程。绝对牛顿残差的等权拟合被大推力端主导，低油门段 $u \lesssim 0.3$ 系统性下凸 +4~24%（0.05 处最甚），而闭环验证档恰落在该区，§4 反解解出偏高的 $u_{\text{std}}$，是验证误差随请求推力增大而负向漂移的主因之一。相对误差权重把该区残差压平约一半。负 $a_1$ 是凸桨数据的逼近伪影（$F \approx a_1 u$ 在原点上方下穿非物理），且加权下下穿更深（实测 $a_1$ 可至 $-5.5$，使 $F_{\text{std}}(u_{\text{idle}}) < 0$ 误拒健康数据）；钳 0 后下文第 3 条的怠速点正推力由构造保证。
+
+**推力死区数据级拒绝**：任一正油门采样点实测 $F_{\text{std}} \le 0$，说明推力起始高于采样下限，无截距三次模型形态无效（死区内模型凭空预测推力，低推力指令系统性失准）——直接拒绝，与拟合形态无关（2026-11-12 修订：原死区拒绝依赖无权拟合负 $a_1$ 下穿 $F_{\text{std}}(u_{\text{idle}}) < 0$ 的伪影，加权钳 0 后不再触发）。
 
 #### 物理合法性与单调性校验
 求得系数向量 $[a_3, a_2, a_1]^T$ 后，必须在**可操作域** $u \in [u_{\text{idle}}, 1]$ 内执行微积分单调性检验（$u < u_{\text{idle}}$ 被 §4 步骤 4 的饱和限幅截止，运行时永远命令不到）：
@@ -247,6 +255,8 @@ $$f'(u) = 3 a_3 u^2 + 2 a_2 u + a_1$$
 求得标准油门 $u_{\text{std}}$ 后，根据反电动势等效原理，实时目标油门 $u_{\text{cmd}}$ 应补偿当前母线跌落及相阻压降：
 
 $$u_{\text{cmd}} = \frac{u_{\text{std}} \cdot 22.20 + (I_{\text{meas}} - I_{\text{std}}) R_{\text{eq}}}{V_{\text{meas}}}$$
+
+其中目标状态电流 $I_{\text{std}}$ 取自 §1.4 的三项电流模型 $I_{\text{std}}(F_{\text{std}}) = ((k_{i3} F + k_{i2}) F + k_i) F$（2026-11-12 修订，原为线性 $k_i F$）；$k_i, k_{i2}, k_{i3}$ 与 $R_{\text{eq}} > 0$ 齐备且电流遥测有效时启用完整式。
 
 若在飞控高速循环（如 $1\text{ kHz}$）中不引入电流反馈，一阶工程电压补偿公式为：
 

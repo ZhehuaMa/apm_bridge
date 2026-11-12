@@ -156,14 +156,79 @@ def test_calibrate_recovers_standard_curve_and_closed_loop():
     res = pm.calibrate(pts, plant.V_REF)
     assert res['monotonic'] and not res['warnings']
     assert res['r_eq'] == pytest.approx(plant.R_EQ, rel=1e-9)
-    assert res['k_i'] > 0.0
-    model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], r_eq=res['r_eq'], k_i=res['k_i'])
+    # 电流模型: 管道系 I_std/F_std ≈ 1.50 带轻微曲率 (I_std ≈ I·(V_ref/V)² 近似 +
+    # 电压归一所致, 并非裸工厂的 K_LOAD/K_AERO = 2.0); 无噪数据精确恢复 LS 解
+    assert res['k_i'] == pytest.approx(1.5001621, rel=1e-6)
+    assert res['k_i2'] == pytest.approx(-1.7950294e-4, rel=1e-5, abs=1e-12)
+    assert res['k_i3'] == pytest.approx(6.2577736e-6, rel=1e-5, abs=1e-12)
+    model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], r_eq=res['r_eq'], k_i=res['k_i'],
+                               k_i2=res['k_i2'], k_i3=res['k_i3'])
     assert model.validate() == ''
     # §4 in closed loop on the physical plant: other altitude/temperature/battery states.
     for p, t, v_oc in ((101325.0, 0.0, 22.2), (85000.0, 30.0, 24.0), (95000.0, -10.0, 21.0)):
         for f_req in (10.0, 25.0, 45.0):
             realized, _ = plant.closed_loop_thrust(model, f_req, p, t, v_oc)
             assert realized == pytest.approx(f_req, rel=0.01), (p, t, v_oc, f_req)
+
+
+def test_fit_current_coefficient_cubic_model():
+    # U 形 I/F 数据 (2026-11-12 台架形态): 三项拟合在验证/飞行工况段 (F>=5) 覆盖
+    # 良好, 单一线性 k_i 在该段平均偏 15%
+    f = np.array([0.8, 2.4, 5.0, 8.2, 12.2, 16.6, 22.0, 27.4, 34.8, 42.0, 49.0, 56.6, 63.8, 71.8, 79.5, 87.5])
+    ratio = np.array([2.75, 1.9, 1.34, 1.23, 1.21, 1.24, 1.24, 1.30, 1.31, 1.34, 1.41, 1.47, 1.58, 1.67, 1.76, 1.85])
+    # 合成数据精确恢复系数
+    truth = (1.2, 0.012, -0.00005)
+    i_syn = ((truth[2] * f + truth[1]) * f + truth[0]) * f
+    assert pm.fit_current_coefficient(f, i_syn) == pytest.approx(truth, rel=1e-6)
+    # U 形实测形态: F>=5 段平均相对残差立方 << 纯线性模型 (旧 §1.4 行为), F>=10 段最大 < 5%
+    i = ratio * f
+    k_i, k_i2, k_i3 = pm.fit_current_coefficient(f, i)
+    k_pure = float(np.sum(f * i) / np.sum(f * f))   # 旧版: 过原点纯线性
+    pred = ((k_i3 * f + k_i2) * f + k_i) * f
+    m5, m10 = f >= 5.0, f >= 10.0
+    assert np.mean(np.abs(pred[m5] - i[m5]) / i[m5]) < 0.2 * np.mean(np.abs(k_pure * f[m5] - i[m5]) / i[m5])
+    assert np.max(np.abs(pred[m10] - i[m10]) / i[m10]) < 0.05
+    # 数据不足回退线性; 无数据回退零
+    assert pm.fit_current_coefficient([1.0, 2.0], [1.0, 2.0]) == pytest.approx((1.0, 0.0, 0.0))
+    assert pm.fit_current_coefficient([], []) == (0.0, 0.0, 0.0)
+
+
+def test_fit_zero_intercept_cubic_weights():
+    u = np.linspace(0.05, 1.0, 20)
+    f = 60.0 * u ** 2.1
+    w = 1.0 / f
+    (a3w, a2w, a1w), stats = pm.fit_zero_intercept_cubic(u, f, weights=w)
+    # 手工加权正规方程一致 (该数据无约束解 a1 < 0 -> 返回的是 a1=0 边界解, 与手工
+    # [u³ u²] 两参加权解一致; 手工三参解用于对照 a1 的符号)
+    x2 = np.stack([u ** 3, u ** 2], axis=1)
+    sw = np.sqrt(w)[:, None]
+    expected2 = np.linalg.solve((x2 * sw).T @ (x2 * sw), (x2 * sw).T @ (f * np.sqrt(w)))
+    assert a1w == 0.0
+    assert (a3w, a2w) == pytest.approx(tuple(expected2), rel=1e-9)
+    x3 = np.stack([u ** 3, u ** 2, u], axis=1)
+    unconstrained = np.linalg.solve((x3 * sw).T @ (x3 * sw), (x3 * sw).T @ (f * np.sqrt(w)))
+    assert unconstrained[2] < 0.0  # 钳位确因无约束解 a1 < 0 而触发
+    # 无约束解为正 a1 的数据: 三参精确一致
+    f_pos = 60.0 * u ** 2.1 + 8.0 * u
+    w_pos = 1.0 / f_pos
+    (a3p, a2p, a1p), _ = pm.fit_zero_intercept_cubic(u, f_pos, weights=w_pos)
+    swp = np.sqrt(w_pos)[:, None]
+    expected3 = np.linalg.solve((x3 * swp).T @ (x3 * swp), (x3 * swp).T @ (f_pos * np.sqrt(w_pos)))
+    assert (a3p, a2p, a1p) == pytest.approx(tuple(expected3), rel=1e-9) and a1p > 0.0
+    # 加权把验证/悬停工况段 (u = 0.15..0.30, 即闭环验证档所在的区域) 的相对残差
+    # 压平约一半; 极端低油门点 (u=0.05, ~1% 量程) 两种拟合都差 (幂律数据本就超出
+    # 三次表达力), 不是本修订的目标区。
+    def rel_resid(coef, uu):
+        return abs((coef[0] * uu ** 3 + coef[1] * uu ** 2 + coef[2] * uu - 60.0 * uu ** 2.1)
+                   / (60.0 * uu ** 2.1))
+    plain, _ = pm.fit_zero_intercept_cubic(u, f)
+    for uu in (0.15, 0.20, 0.25, 0.30):
+        assert rel_resid((a3w, a2w, a1w), uu) < 0.75 * rel_resid(plain, uu), uu
+    assert rel_resid((a3w, a2w, a1w), 0.30) < 0.015
+    # stats 恒为无权物理残差
+    assert stats['n'] == 20 and math.isfinite(stats['rms'])
+    with pytest.raises(ValueError):
+        pm.fit_zero_intercept_cubic(u, f, weights=np.ones(5))
 
 
 def test_calibrate_airsim_mode_without_baro_sag_or_rpm():
@@ -176,20 +241,32 @@ def test_calibrate_airsim_mode_without_baro_sag_or_rpm():
     assert model.throttle(45.0) == pytest.approx(0.5, abs=1e-6)  # no voltage, env = 1
 
 
-def test_calibrate_warns_below_twenty_points():
+def test_calibrate_warns_below_min_points():
     pts = [plant.bench_point(u, 101325.0, 0.0) for u in (0.2, 0.4, 0.6, 0.8)]
     res = pm.calibrate(pts, plant.V_REF)
-    assert any('N >= 20' in w for w in res['warnings'])
+    assert any(f'N >= {pm.MIN_POINTS_RECOMMENDED}' in w for w in res['warnings'])
 
 
-def test_verification_weights_resolvable_and_bounded():
-    # tare 6 kg (58.84 N) -> 25/50/75% 静重推力, 都在标定域内
-    w = tool.verification_weights(6.0, 9.80665, 200.0)
-    assert w == pytest.approx([14.7101, 29.4202, 44.1299], rel=1e-4)
-    # 标定域上界截断 (F_std(1) = 20 N 只覆盖 25% 档)
-    assert tool.verification_weights(6.0, 9.80665, 20.0) == pytest.approx([14.7101], rel=1e-4)
-    # 太轻的静重连最高档都小于台秤 10 g 分辨率 -> 安全跳过 (0.01 kg: 100% < 0.098 N)
-    assert tool.verification_weights(0.01, 9.80665, 200.0) == []
+def test_verification_levels_domain_safety_and_resolution():
+    g = 9.80665
+    frac = tool.VERIFICATION_FRACTIONS
+    safe = (6.0 - 1.0 - 0.3) * g  # (tare - critical - margin)·g
+    # 宽域 + 富余 tare: 档位 = 安全上限的 fractions 比例
+    lv = tool.verification_levels(200.0, 1.0, g, 6.0, 1.0)
+    assert lv == pytest.approx([f * safe for f in frac], rel=1e-6)
+    # 标定域上界折回请求系: f_max/env (2026-11-11 17:58 越界档即漏乘 env)
+    lv = tool.verification_levels(48.44, 1.083, g, 6.0, 1.0)
+    cap = min(safe, 48.44 / 1.083)
+    assert lv == pytest.approx([f * cap for f in frac], rel=1e-6)
+    assert max(lv) * 1.083 <= 48.44 + 1e-9
+    # 域不够覆盖高档 -> 档位被域截断而非静重截断
+    lv = tool.verification_levels(10.0, 1.0, g, 6.0, 1.0)
+    assert lv == pytest.approx([f * 10.0 for f in frac], rel=1e-6)
+    # 轻夹具: 安全上限 (tare-critical-margin)*g 连最低档 0.5 N 都不可分辨 -> 安全跳过
+    assert tool.verification_levels(200.0, 1.0, g, 1.29, 1.0) == []
+    # env 非法按 1 处理
+    assert tool.verification_levels(200.0, float('nan'), g, 6.0, 1.0) == \
+        pytest.approx(tool.verification_levels(200.0, 1.0, g, 6.0, 1.0))
     assert tool.verification_verify_pass([{'rel': 0.01}, {'rel': -0.02}])
     assert not tool.verification_verify_pass([{'rel': 0.03}])
     assert not tool.verification_verify_pass([])
@@ -205,10 +282,21 @@ def test_tool_streams_body_rates_by_default():
 def test_render_param_yaml_is_pasteable():
     import yaml
     args = tool.parse_args(['--yes', '--no-env-comp'])
-    text = tool.render_param_yaml({'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5}, args)
+    res = {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5, 'k_i2': 0.01, 'k_i3': -1e-5}
+    text = tool.render_param_yaml(res, args)
     p = yaml.safe_load(text)['custom_link_bridge']['ros__parameters']
     # u_idle is not a parameter: the node reads the FC motor_idle at link-up
-    assert p['motor_parameters'] == {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03, 'k_i': 1.5}
+    assert p['motor_parameters'] == {'a3': -1.0, 'a2': 2.0, 'a1': 80.0, 'r_eq': 0.03,
+                                     'k_i': 1.5, 'k_i2': 0.01, 'k_i3': -1e-5}
+    # rclcpp 对 double 参数收到 int 会在启动时抛 InvalidParameterTypeException:
+    # 每个值都必须被 YAML 解析为 float (整数值 0/100000 与无小数点科学计数是陷阱)
+    assert all(isinstance(v, float) for v in p['motor_parameters'].values())
+    # 旧式 result dict (无 k_i2/k_i3 键) 渲染为显式 0.0, 不缺键; a1=0 (钳位拟合) 同样安全
+    legacy = tool.render_param_yaml({'a3': -1.0, 'a2': 2.0, 'a1': 0.0, 'r_eq': 0.03,
+                                     'k_i': 1.5, 'k_i2': 0.0, 'k_i3': 0.0}, args)
+    leg = yaml.safe_load(legacy)['custom_link_bridge']['ros__parameters']['motor_parameters']
+    assert leg['k_i2'] == 0.0 and leg['k_i3'] == 0.0 and leg['a1'] == 0.0
+    assert all(isinstance(v, float) for v in leg.values())
     assert p['baro_compensation'] is False and p['voltage_compensation'] is True
     assert len(args.levels) == 20
 
@@ -239,17 +327,18 @@ def test_plot_results_dashes_extrapolation_beyond_calibrated_domain(tmp_path):
 
 
 def test_calibrate_accepts_convex_fit_with_sub_idle_dip(tmp_path):
-    """最小放宽 (spec 3.2, 2026-11-10 修订): 凸推力数据 (F ~ u^2.1, 真实桨典型) 的
-    无截距三次拟合 a1 < 0, 但负斜率区 (u <~ 0.012) 完全落在 u_idle=0.055 之下 --
-    运行时 clamp 不可达, u_idle 传入后应整体放行 (参数片段可出、图不盖章)。"""
+    """最小放宽 (spec 3.2, 2026-11-10 修订) + 2026-11-12 加权/a1 钳 0: 凸推力数据
+    (F ~ u^2.1, 真实桨典型) 的相对误差加权拟合把原先的负 a1 钳到 0 (逼近伪影,
+    见 fit_zero_intercept_cubic), u_idle=0.055 传入后整体放行 (参数片段可出、
+    图不盖章)。"""
     plt = _agg_pyplot()
     pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
             'F': 62.0 * u ** 2.1, 'P': math.nan, 't': math.nan} for u in LEVELS]
     res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
                        environment_normalization=False, u_idle=0.055)
-    assert res['a1'] < 0.0                      # 拟合形态不变, 只是判据窗口收紧
+    assert res['a1'] == 0.0                     # 2026-11-12: 负 a1 钳 0 (原为 -0.7 量级)
     assert res['monotonic'] and res['min_slope'] > 0.0
-    assert not pm.monotonic_check(res['a3'], res['a2'], res['a1'])[0]  # 旧版 [0,1] 仍会拒
+    assert not pm.monotonic_check(res['a3'], res['a2'], res['a1'])[0]  # 旧版 [0,1] 仍会拒 (slope(0)=0)
     model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], u_idle=0.055)
     assert model.validate() == ''               # 运行时同口径放行
     fig = tool.plot_results(res, str(tmp_path / 'accepted.png'))
@@ -259,30 +348,51 @@ def test_calibrate_accepts_convex_fit_with_sub_idle_dip(tmp_path):
 
 def test_plot_results_stamps_rejected_deadband_fit(tmp_path):
     plt = _agg_pyplot()
-    # 负斜率区侵入可操作域的实例: 推力起始死区 (u <~ 0.09 无推力) 的拟合 dip 到
-    # u≈0.068 > u_idle=0.055 -> 仍拒绝; 被拒拟合出图必须盖章 REJECTED。
+    # 推力起始死区 (u <~ 0.09 无推力): 数据级死区判据 (2026-11-12, 正油门点实测
+    # F_std <= 0) 拒绝 —— 与拟合形态无关, 被拒拟合出图必须盖章 REJECTED。
     onset = [62.0 * max(u - 0.09, 0.0) ** 2 / (1 - 0.09) ** 2 for u in LEVELS]
     pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
             'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, onset)]
     res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
                        environment_normalization=False, u_idle=0.055)
-    assert not res['monotonic'] and res['a1'] < 0.0
+    assert not res['monotonic'] and 'deadband' in res['monotonic_reason']
     fig = tool.plot_results(res, str(tmp_path / 'rejected.png'))
     assert fig is not None and 'REJECTED' in fig.axes[0].get_title()
     plt.close(fig)
 
 
+def test_calibrate_rejects_high_throttle_thrust_collapse():
+    """高油门推力塌陷 (桨失速) 的数据级用例 (2026-11-12 评审): 无权拟合靠负 a1 下穿
+    拒绝这类数据, a1 钳 0 后该路径消失 —— 钳位拟合可能通过单调门并以虚高的外推
+    推力放行。判据: 相邻采样点实测 F_std 下降超过 max(0.2 N, 2%) 即拒绝。"""
+    collapse = [62.0 * (u / 0.85) ** 2.1 * (1.0 - 0.35 * max(u - 0.85, 0.0) / 0.15) for u in LEVELS]
+    pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
+            'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, collapse)]
+    res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
+                       environment_normalization=False, u_idle=0.055)
+    assert not res['monotonic']
+    assert 'collapse' in res['monotonic_reason']
+    # 2% 以内的秤噪声级波动不触发
+    noisy = [62.0 * u ** 2.1 * (1.0 + 0.01 * math.sin(i)) for i, u in enumerate(LEVELS)]
+    pts2 = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
+             'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, noisy)]
+    res2 = pm.calibrate(pts2, plant.V_REF, voltage_normalization=False,
+                        environment_normalization=False, u_idle=0.055)
+    assert res2['monotonic']
+
+
 def test_calibrate_rejects_deadband_with_sub_idle_negative_thrust():
-    """F_std(u_idle) > 0 护栏的数据级用例: 推力起始死区略高于 u_idle (onset 0.065
-    vs u_idle 0.055) 时, 窗口斜率仍为正但 F(u_idle) < 0 —— 放行会让反解初值
-    sqrt(负数) 产出 NaN 油门, 必须拒绝且原因指向 F_std(u_idle)。"""
+    """死区护栏的数据级用例 (2026-11-12 修订): 推力起始略高于 u_idle (onset 0.065
+    vs u_idle 0.055) 时, 加权拟合的 a1 已钳 0、F_std(u_idle) > 0 恒成立, 原拟合
+    伪影判据不再触发 —— 拒绝改由数据级判据承担: 正油门采样点实测 F_std <= 0 即
+    模型形态无效 (死区内模型凭空预测推力, 低推力指令系统性失准)。"""
     onset = [62.0 * max(u - 0.065, 0.0) ** 2 / (1 - 0.065) ** 2 for u in LEVELS]
     pts = [{'u': u, 'V': math.nan, 'I': math.nan, 'rpm': [math.nan] * 4,
             'F': f, 'P': math.nan, 't': math.nan} for u, f in zip(LEVELS, onset)]
     res = pm.calibrate(pts, plant.V_REF, voltage_normalization=False,
                        environment_normalization=False, u_idle=0.055)
     assert not res['monotonic']
-    assert res['min_slope'] > 0.0                          # 拒绝不是因为斜率
-    assert 'F_std(u_idle) <= 0' in res['monotonic_reason']  # 而是怠速点推力非正
+    assert res['min_slope'] > 0.0                      # 拒绝不是因为斜率
+    assert 'deadband' in res['monotonic_reason']       # 而是数据级死区判据
     model = pm.PropulsionModel(res['a3'], res['a2'], res['a1'], u_idle=0.055)
-    assert model.validate() and model.inverse is None       # 运行时同口径拒绝, 反函数不安装
+    assert model.validate() == ''                      # 系数本身合法 (a1 钳 0); 拒绝发生在标定数据级

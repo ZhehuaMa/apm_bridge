@@ -72,6 +72,28 @@ def test_step3_full_form_with_current_feedback():
     assert m.throttle(f, 1.0, voltage, math.nan) == pytest.approx(u_std * 22.2 / voltage, abs=1e-12)
 
 
+def test_step3_three_term_current_model():
+    # 2026-11-12: I_std(F) = ((k_i3·F + k_i2)·F + k_i)·F, U 形 I/F 的三项拟合
+    m = model(r_eq=0.025, k_i=1.188, k_i2=1.04e-3, k_i3=7.6e-5)
+    f, current, voltage = 14.7, 20.0, 23.2
+    u_std = m.solve_standard_throttle(f)
+    i_std = ((7.6e-5 * f + 1.04e-3) * f + 1.188) * f
+    expected = (u_std * 22.2 + (current - i_std) * 0.025) / voltage
+    assert m.current_at_thrust(f) == pytest.approx(i_std, abs=1e-12)
+    assert m.throttle(f, 1.0, voltage, current) == pytest.approx(expected, abs=1e-12)
+    assert m.validate() == ''
+    # 线性项为负但合成电流非负 -> 合法 (三项拟合的合法形态)
+    assert model(r_eq=0.025, k_i=-0.5, k_i2=0.05, k_i3=1e-4).validate() == ''
+    # 合成电流在标定段为负 -> 拒绝 (负 I_std 会经 (I_meas−I_std)·R_eq 抬高油门)
+    assert 'current model' in model(r_eq=0.025, k_i=1.5, k_i2=-0.08, k_i3=-1e-3).validate()
+    assert 'current model' in model(r_eq=0.025, k_i=-1.5).validate()
+    # k_i2/k_i3 单独非零也启用完整式 (k_i=0, k_i2>0)
+    m2 = model(r_eq=0.03, k_i=0.0, k_i2=0.05, k_i3=0.0)
+    assert m2.current_model_active() and m2.throttle(f, 1.0, voltage, current) == \
+        pytest.approx((m2.solve_standard_throttle(f) * 22.2 + (current - 0.05 * f * f) * 0.03) / voltage,
+                      abs=1e-12)
+
+
 def test_step4_clip_and_zero_force():
     m = model()
     assert m.throttle(0.0) == m.u_idle
