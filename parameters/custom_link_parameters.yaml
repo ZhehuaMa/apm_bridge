@@ -45,6 +45,39 @@ custom_link_bridge:
       # 与推力曲线标定无关, 只改此值即可; 上限对应推力查 F_std(u_idle+(1-u_idle)*limit)。
       throttle_limit: 0.6
 
+    # EX40 + GFF7036
+    # motor_parameters:
+    #   a3: -107.05714
+    #   a2: 214.864949
+    #   a1: 0.658841702
+    #   r_eq: 0.0385242979
+    #   k_i: 0.696582355
+    #   k_i2: 0.013752226
+    #   k_i3: -3.73656341e-05
+    #   throttle_limit: 0.6
+
+    # F55A ProII + GFF7036
+    # motor_parameters:
+    #   a3: -77.9210026
+    #   a2: 192.619924
+    #   a1: 5.66415517
+    #   r_eq: 0.0255308654
+    #   k_i: 1.2008082
+    #   k_i2: 0.00145679947
+    #   k_i3: 6.48457525e-05
+    #   throttle_limit: 0.8
+
+    # F55A ProII + HQProp 7x4x3
+    # motor_parameters:
+    #   a3: -128.320119
+    #   a2: 254.958971
+    #   a1: 9.83136922
+    #   r_eq: 0.0259991398
+    #   k_i: 1.24829592
+    #   k_i2: -0.000714302163
+    #   k_i3: 0.000106881136
+    #   throttle_limit: 0.7
+
     link:
       # serial: 真机串口; tcp: SITL 仿真 (UART3 = tcp/5763)
       transport: "serial"
