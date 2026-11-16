@@ -50,6 +50,18 @@ namespace apm_bridge
         return {axes[0] ? roll : 0, axes[1] ? pitch : 0, axes[2] ? yaw : 0};
     }
 
+    // 机体 X 轴 (机首) 在世界水平面之上的仰角 (deg, 抬头正)。直接由旋转矩阵首列
+    // 提取: atan2 连续、与 roll/yaw 解耦, 且不经过 ZYX 分解的 roll/yaw 奇异分支
+    // (那里 |pitch|→90° 时 roll/yaw 跳 180°, 仅取 pitch 时用不到但也不必算)。
+    // 数学上与 ZYX euler pitch 同值 (R[2][0] = -sin(pitch), 水平模 = |cos(pitch)|),
+    // 在 |pitch| < 90° 逐位一致; 过垂直后仰角非单调回落 (方向仰角的几何本性,
+    // 方位翻转 180°) —— 调用方在近垂直段需自行处理 (见 AIM 跟随项的冻结守卫)。
+    inline double bodyBoresightElevationDeg(const tf2::Quaternion &body_to_world)
+    {
+        const tf2::Matrix3x3 r(body_to_world.normalized());
+        return std::atan2(r[2][0], std::hypot(r[0][0], r[1][0])) * 180.0 / M_PI;
+    }
+
     // Forward-propagate a body attitude by dt with body-frame angular rates omega (rad/s):
     // q(t+dt) = q(t) * exp(omega*dt). The RIGHT product applies the increment in the body
     // frame (strapdown gyro integration), so an attitude sampled at t1 can be re-epoched to

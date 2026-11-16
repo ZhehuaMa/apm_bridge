@@ -602,9 +602,16 @@ void GimbalControl::run()
                     if (vehicle_stamp != std::chrono::steady_clock::time_point{} &&
                         now - vehicle_stamp <= std::chrono::milliseconds(UAV_DATA_TIMEOUT_MS))
                     {
-                        double roll_c, pitch_c, yaw_c;
-                        tf2::Matrix3x3(vehicle_orientation).getRPY(roll_c, pitch_c, yaw_c);
-                        aim_body_pitch_deg = -pitch_c * 180.0 / M_PI; // FLU 俯仰低头正 → 抬头角
+                        // 机首仰角 (抬头正) 直接由 X 轴世界方向提取: 与 ZYX pitch 同值
+                        // (|pitch| < 90° 逐位一致), 但不计算也不依赖其 roll/yaw 分支
+                        // (那里 |pitch|→90° 时跳 180°)。近垂直 (>= 85°, 机首水平投影
+                        // 退化/方位翻转) 冻结跟随项: 厂商 cam_angle 域连续过顶 (实测
+                        // ±137°), 而仰角过顶后非单调回落 —— 不冻结会让目标语义反转、
+                        // 伺服朝错误方向追。
+                        const double elevation =
+                            apm_bridge::bodyBoresightElevationDeg(vehicle_orientation);
+                        if (std::abs(elevation) < 85.0)
+                            aim_body_pitch_deg = elevation;
                         body_rate_ff = vehicle_pitch_rate_up;
                     }
                 }
