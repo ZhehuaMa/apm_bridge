@@ -7,7 +7,7 @@ the FC; every commanded Betaflight collective is mapped to u = u_idle + (1 − u
 the synthetic plant of propulsion_plant.py (F ∝ ρ·RPM², back-EMF, I ∝ RPM², pack sag).
 It publishes /current_weight, /mavros/battery (V, I), /fpv/motor_rpm,
 /fpv/static_pressure and /fpv/temperature_baro at a non-standard atmosphere.
-The real tool then runs the fpv_test.md section 2 SOP (shortened) and section 3 fit.
+The real tool then runs the quadratic_thrust_model_manual.md section 2 SOP (shortened) and section 3 fit.
 
 Checks:
   hardware mode -- step order + idle cooldowns after u >= 0.70, CSV columns, R_eq/K_v

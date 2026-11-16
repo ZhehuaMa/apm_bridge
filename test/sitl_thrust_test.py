@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SITL end-to-end test for thrust_test_node (fpv_test.md bench SOP, AirSim-style options).
+"""SITL end-to-end test for thrust_test_node (quadratic_thrust_model_manual.md bench SOP, AirSim-style options).
 
 Brings up the Betaflight SITL firmware with the custom link on tcp:5763
 (same provisioning as sitl_custom_link_test.py: ARM on AUX1, OFFBOARD on
@@ -9,7 +9,7 @@ real thrust_test_node as a subprocess and checks:
 
   1. host arm + OFFBOARD takeover **through the link** (no pilot BOXOFFBOARD switch:
      the tool's /fpv/offboard -> mode_req drives the takeover) + motors follow the SOP
-  2. SOP steps appear in the CSV with increasing force and a monotonic fpv_test.md fit
+  2. SOP steps appear in the CSV with increasing force and a monotonic quadratic_thrust_model_manual.md fit
   3. clean shutdown: FC disarmed, OFFBOARD dropped, exit code 0
 
 The synthetic scale is linear in the SITL motor outputs and SITL has no battery sag or
@@ -248,7 +248,7 @@ def main():
         results['motors_spun'] = motor_max > 0.25
         print(f'motor peak: {motor_max:.2f}')
 
-        # 桥发布的环境气压话题 (fpv_test.md §3.1 环境归一化输入)
+        # 桥发布的环境气压话题 (quadratic_thrust_model_manual.md §3.1 环境归一化输入)
         results['pressure_topic'] = observer.pressure_count > 10
         print(f'pressure messages: {observer.pressure_count}')
 

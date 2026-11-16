@@ -69,7 +69,7 @@ namespace custom_link_bridge
         static constexpr double kBatteryLowVoltagePerCell = 3.6;
         static constexpr double kBatteryCriticalVoltagePerCell = 3.3;
         static constexpr double kBatteryInvalidVoltagePerCell = 3.0;
-        static constexpr double kBatteryUndervoltagePerCell = 2.0; // fpv_test.md §5: 6S 12.0 V 欠压保护下限
+        static constexpr double kBatteryUndervoltagePerCell = 2.0; // quadratic_thrust_model_manual.md §5: 6S 12.0 V 欠压保护下限
 
         std::vector<std::string> mode_strings = {
             "ANGLE",
@@ -137,7 +137,7 @@ namespace custom_link_bridge
         std::deque<CliJob> cli_jobs;
         std::atomic_bool cli_worker_running{false};
         bool rx_bind_pending = false;       // 持 cli_job_mtx；link up 时置位
-        // fpv_test.md u_idle = 飞控 motor_idle: link up (及经 /fpv/cli SET motor_idle 后)
+        // quadratic_thrust_model_manual.md u_idle = 飞控 motor_idle: link up (及经 /fpv/cli SET motor_idle 后)
         // 由 CLI 工作线程 "get motor_idle" 读取, 失败按 kIdleQueryRetry 周期重试。持 cli_job_mtx。
         bool idle_query_pending = false;
         std::chrono::steady_clock::time_point idle_query_due{};
@@ -201,7 +201,7 @@ namespace custom_link_bridge
         void publishState(uint32_t mode_flags, bool armed);
 
         // ---- 参数 ----
-        quadratic_thrust_model::PropulsionModel propulsion; // fpv_test.md §4 在线反解模型
+        quadratic_thrust_model::PropulsionModel propulsion; // quadratic_thrust_model_manual.md §4 在线反解模型
         std::atomic_bool motor_idle_known{false}; // propulsion.u_idle 已由飞控 CLI 读回 (持 mtx_kp 写 u_idle 后置位)
         // §3.2 曲线判据 (dF/du>0 on [u_idle,1], 判据窗口依赖 u_idle) 已在真实 FC
         // motor_idle 下复检通过; 未通过时力指令被拒 (raw 通道不受影响)。

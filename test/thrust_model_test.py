@@ -1,4 +1,4 @@
-"""fpv_test.md §4 runtime inference (Python mirror of quadratic_thrust_model.h)."""
+"""quadratic_thrust_model_manual.md §4 runtime inference (Python mirror of quadratic_thrust_model.h)."""
 
 import math
 import os

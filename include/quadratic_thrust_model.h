@@ -1,7 +1,7 @@
 #ifndef QUADRATIC_THRUST_MODEL_H
 #define QUADRATIC_THRUST_MODEL_H
 
-// fpv_test.md 推力-油门模型的在线实时反解 (§4), 与 scripts/propulsion_model.py 同口径。
+// quadratic_thrust_model_manual.md 推力-油门模型的在线实时反解 (§4), 与 scripts/propulsion_model.py 同口径。
 //
 // u 为整机归一化油门开度 (DShot 占空比, F(0)=0)。标准状态 (V_ref = cells·3.7 V,
 // T0 = 273.15 K, P0 = 101325 Pa) 下:  F_std(u) = a3·u³ + a2·u² + a1·u  (总推力, N)。

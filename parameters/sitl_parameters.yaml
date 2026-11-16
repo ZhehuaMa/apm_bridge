@@ -25,7 +25,7 @@ custom_link_bridge:
       roll_hold_exit: 70.0
 
     # Measured on 2026-10-10: 42 steady-state samples, 2 repeats, collective 0.08..0.50
-    # (data: sitl_motor_calibration.csv). Fitted with the fpv_test.md model: zero-intercept
+    # (data: sitl_motor_calibration.csv). Fitted with the quadratic_thrust_model_manual.md model: zero-intercept
     # cubic F_std(u) = a3*u^3 + a2*u^2 + a1*u over the DShot duty u = 0.055 + 0.945*collective
     # (sitl_motor_calibration --fit): R^2=0.99998, max throttle error 0.0016, hover collective 0.1732.
     # AirSim has no baro/voltage sag/RPM feedback: both compensations stay disabled, r_eq = k_i = 0.

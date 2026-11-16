@@ -1,4 +1,4 @@
-"""Synthetic quadrotor propulsion plant consistent with fpv_test.md section 1 (test helper).
+"""Synthetic quadrotor propulsion plant consistent with quadratic_thrust_model_manual.md section 1 (test helper).
 
 Total thrust F = K_aero·(ρ/ρ0)·RPM_rms²; back-EMF K_e·RPM = u·V − I·R_eq; aerodynamic
 current I = k_load·(ρ/ρ0)·RPM²; the measured bus voltage sags across the pack
@@ -36,7 +36,7 @@ def state(u, rho_ratio=1.0, v_oc=V_OC, r_bat=R_BAT):
 
 
 def standard_thrust(u):
-    """Ground-truth thrust in the fpv_test.md standard state (ρ0, constant V_ref)."""
+    """Ground-truth thrust in the quadratic_thrust_model_manual.md standard state (ρ0, constant V_ref)."""
     return state(u, 1.0, V_REF, 0.0)['F']
 
 
@@ -47,7 +47,7 @@ def motor_rpms(rpm_rms):
 
 
 def bench_point(u, pressure_pa, temperature_c, v_oc=V_OC):
-    """One fpv_test.md section 2 data point measured on the synthetic bench."""
+    """One quadratic_thrust_model_manual.md section 2 data point measured on the synthetic bench."""
     s = state(u, density_ratio(pressure_pa, temperature_c), v_oc)
     return {'u': u, 'V': s['V'], 'I': s['I'], 'rpm': motor_rpms(s['rpm']), 'F': s['F'],
             'P': pressure_pa, 't': temperature_c}

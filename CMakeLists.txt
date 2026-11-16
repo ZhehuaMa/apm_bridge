@@ -114,7 +114,7 @@ install(PROGRAMS scripts/bench_pid_tuner.py
   DESTINATION lib/${PROJECT_NAME} RENAME bench_pid_tuner)
 install(FILES scripts/bench_pid_core.py DESTINATION lib/${PROJECT_NAME})
 
-# fpv_test.md 整机拉力测试 (§2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge; AirSim/SITL 兼容):
+# quadratic_thrust_model_manual.md 整机拉力测试 (§2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge; AirSim/SITL 兼容):
 # thrust_test_node 按 SOP 采集并拟合 motor_parameters (依赖 propulsion_model.py),
 # scale_reader_node 读台秤, motor_check_node 链路/电机冒烟。
 install(PROGRAMS scripts/thrust_test_node.py

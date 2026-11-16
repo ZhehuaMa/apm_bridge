@@ -1,4 +1,4 @@
-"""fpv_test.md 推力-油门建模 (§1/§3) 与在线反解 (§4) 的 Python 实现。
+"""quadratic_thrust_model_manual.md 推力-油门建模 (§1/§3) 与在线反解 (§4) 的 Python 实现。
 
 与 include/quadratic_thrust_model.h (节点运行时) 同口径, 供台架标定工具
 (thrust_test_node)、SITL 标定、硬件测试镜像与单元测试共用。
@@ -363,7 +363,7 @@ def calibrate(points, v_ref, voltage_normalization=True, environment_normalizati
     if len(used) < len(rows):
         warnings.append(f'{len(rows) - len(used)} point(s) excluded (no voltage or non-positive back-EMF)')
     if len(used) < MIN_POINTS_RECOMMENDED:
-        warnings.append(f'only {len(used)} points; fpv_test.md recommends N >= {MIN_POINTS_RECOMMENDED}')
+        warnings.append(f'only {len(used)} points; quadratic_thrust_model_manual.md recommends N >= {MIN_POINTS_RECOMMENDED}')
     # 推力死区判据 (2026-11-12 修订, 数据级): 正油门采样点实测 F_std <= 0 说明推力
     # 起始高于采样下限, 无截距三次模型形态无效 —— 拒绝, 不依赖拟合伪影 (原判据
     # 靠无权拟合的负 a1 下穿 F_std(u_idle) < 0; 相对误差加权后 a1 已钳 0, 该伪影
