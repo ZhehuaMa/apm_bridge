@@ -5,7 +5,7 @@
 与 hw_custom_link_rpm_test.py（直连串口、绕过 ROS、raw 油门）互补：本脚本走
 完整 ROS 数据面——launch 启动与话题重映射、/fpv/arm 与 /fpv/offboard 电平
 语义、ControlCommand 集合推力换算（collective_thrust m/s² → 油门，镜像节点
-fpv_test.md §4 在线反解）、节点控制量新鲜度超时（0.5 s 无指令 → 油门归零）。
+quadratic_thrust_model_manual.md §4 在线反解）、节点控制量新鲜度超时（0.5 s 无指令 → 油门归零）。
 
 QuadX 混控符号约定（同 hw_custom_link_rpm_test.py，台架闭环实证）：
   M0 右后 / M1 右前 / M2 左后 / M3 左前（俯视 M0/M3 桨顺时针）
@@ -70,7 +70,7 @@ RIGHT, LEFT, FRONT, REAR, CW, CCW = (0, 1), (2, 3), (1, 3), (0, 2), (0, 3), (1, 
 
 
 class ThrustModel:
-    """custom_link 节点 fpv_test.md §4 在线反解的 Python 镜像 (scripts/propulsion_model.py),
+    """custom_link 节点 quadratic_thrust_model_manual.md §4 在线反解的 Python 镜像 (scripts/propulsion_model.py),
     用于把目标集体油门换算成 ControlCommand.collective_thrust (m/s²)。补偿开关必须
     与节点 YAML 一致 (load_model_params 读出; 电机阶段前 fail-fast 校验)。"""
 
@@ -175,7 +175,7 @@ class Monitor(Node):
         return abs(self.battery.current) if self.battery is not None else None
 
     def env_factor(self):
-        """fpv_test.md §4 步骤 1 的 (P0/P)·(T/T0)。"""
+        """quadratic_thrust_model_manual.md §4 步骤 1 的 (P0/P)·(T/T0)。"""
         if self.pressure_pa is None or self.temp_c is None:
             return None
         return pm.environment_factor(self.pressure_pa, self.temp_c)
@@ -265,7 +265,9 @@ def load_model_params(yaml_path):
     with open(yaml_path) as f:
         cfg = yaml.safe_load(f)
     p = cfg["custom_link_bridge"]["ros__parameters"]
-    return (ThrustModel(p["motor_parameters"], int(p["lipo_cells"]),
+    # 2026-11-16: lipo_cells 改名 battery.cells (旧键兜底仅限迁移期手工文件)
+    cells = int(p.get("battery", {}).get("cells", p.get("lipo_cells", 6)))
+    return (ThrustModel(p["motor_parameters"], cells,
                         voltage_comp=bool(p.get("voltage_compensation", False)),
                         baro_comp=bool(p.get("baro_compensation", True))),
             float(p["mass"]))
@@ -278,7 +280,7 @@ def main():
     ap.add_argument("--port", default="/dev/ttyUSB0", help="FC 定制链路串口")
     ap.add_argument("--parameters", default=os.path.join(default_dir, "..", "parameters",
                                                          "custom_link_parameters.yaml"),
-                    help="桥节点参数 YAML（读取 mass/motor_parameters/lipo_cells）")
+                    help="桥节点参数 YAML（读取 mass/motor_parameters/battery.cells）")
     ap.add_argument("--confirm-props-off", action="store_true",
                     help="确认已拆桨，允许进入电机验证阶段")
     ap.add_argument("--cmd-rate", type=float, default=50.0, help="控制指令发布频率 Hz")
@@ -334,7 +336,7 @@ def main():
     model, mass = load_model_params(args.parameters)
     m = model.model
     if m.validate():
-        print(f"RESULT: FAIL (motor_parameters 未标定/非法: {m.validate()}; 先按 fpv_test.md 跑 thrust_test_node)")
+        print(f"RESULT: FAIL (motor_parameters 未标定/非法: {m.validate()}; 先按 quadratic_thrust_model_manual.md 跑 thrust_test_node)")
         return 1
     print(f"  model: F_std(u)={m.a3:.4g}u^3+{m.a2:.4g}u^2+{m.a1:.4g}u, mass={mass} kg "
           f"(u_idle read from FC motor_idle after link up)")

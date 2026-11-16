@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Collect AirSim throttle/acceleration pulses or fit an existing CSV to the fpv_test.md model.
+"""Collect AirSim throttle/acceleration pulses or fit an existing CSV to the quadratic_thrust_model_manual.md model.
 
 The model is F_std(u) = a3*u^3 + a2*u^2 + a1*u (total thrust, N) over the DShot duty
 u = u_idle + (1 - u_idle) * collective, fitted by the zero-intercept normal
-equations of fpv_test.md section 3.2 (scripts/propulsion_model.py). AirSim has no
+equations of quadratic_thrust_model_manual.md section 3.2 (scripts/propulsion_model.py). AirSim has no
 barometer, battery sag or RPM feedback, so the environment/voltage steps are skipped
 and both node compensations stay disabled.
 """
@@ -150,8 +150,10 @@ def collect(args, config):
     owned, airborne = False, False
     csv_stream = None
     origin = None
-    bootstrap = pm.PropulsionModel.from_parameters(config["motor_parameters"], config.get("lipo_cells", 6),
-                                                   pm.DEFAULT_U_IDLE)
+    bootstrap = pm.PropulsionModel.from_parameters(
+        config["motor_parameters"],
+        config.get("battery", {}).get("cells", config.get("lipo_cells", 6)),
+        pm.DEFAULT_U_IDLE)
     model_error = bootstrap.validate()
     if model_error:
         raise RuntimeError(f"SITL parameters need a valid model to hover: {model_error}")

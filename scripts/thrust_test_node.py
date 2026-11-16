@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""整机拉力测试 (fpv_test.md §2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge)。
+"""整机拉力测试 (quadratic_thrust_model_manual.md §2) 与推力-油门建模 (§3) 台架工具 (custom_link_bridge)。
 
 整机通过夹具固定在台秤上 (DT30X 经 scale_reader_node 发布 /current_weight =
 [weight_kg, stable_weight_kg(NaN=未稳定)])。工具经 /fpv/control_command_raw 直通油门,
@@ -582,7 +582,7 @@ class ThrustTestNode(Node):
             return
         if rate < MIN_SCALE_RATE_HZ:
             print(f'\n{bcolors.WARNING}u={point["u"]:.3f}: scale rate {rate:.1f} Hz < '
-                  f'{MIN_SCALE_RATE_HZ:.0f} Hz required by fpv_test.md{bcolors.ENDC}')
+                  f'{MIN_SCALE_RATE_HZ:.0f} Hz required by quadratic_thrust_model_manual.md{bcolors.ENDC}')
         self.points.append(point)
         rpm_rms = pm.rpm_rms(point['rpm'])
         print(f'\nu={point["u"]:.3f} (c={point["collective"]:.3f}): F={point["F"]:.3f} N, '
@@ -698,7 +698,7 @@ def write_outputs(node, args, aborted):
 
     yaml_path = base + '_result.yaml'
     with open(yaml_path, 'w') as f:
-        f.write('# fpv_test.md thrust test result\n')
+        f.write('# quadratic_thrust_model_manual.md thrust test result\n')
         f.write(f'date: {datetime.datetime.now().isoformat(timespec="seconds")}\n')
         f.write(f'aborted: {str(aborted).lower()}\n')
         f.write(f'points: {len(points)}\n')
@@ -729,7 +729,7 @@ def write_outputs(node, args, aborted):
             f.write('verification_skipped_reason: ' +
                     yaml.safe_dump(node.verification_note, default_flow_style=True).strip() + '\n')
         if verification:
-            f.write('verification:  # fpv_test.md §4 runtime check on the bench scale\n')
+            f.write('verification:  # quadratic_thrust_model_manual.md §4 runtime check on the bench scale\n')
             for v in verification:
                 f.write(f"  - {{f_req_N: {v['f_req']:.4f}, f_meas_N: {v['f_meas']:.4f}, "
                         f"error_N: {v['error']:+.4f}, error_pct: {100 * v['rel']:+.2f}, "
@@ -834,7 +834,7 @@ def plot_results(result, png_path):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='fpv_test.md bench thrust test + propulsion model fit (custom_link_bridge)')
+        description='quadratic_thrust_model_manual.md bench thrust test + propulsion model fit (custom_link_bridge)')
     parser.add_argument('--no-offboard', action='store_true',
                         help='do not publish /fpv/offboard; OFFBOARD stays with the pilot '
                              "holding BOXOFFBOARD (the default takes OFFBOARD via the link)")

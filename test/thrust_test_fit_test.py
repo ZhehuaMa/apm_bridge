@@ -1,4 +1,4 @@
-"""fpv_test.md §2/§3/§4 pipeline tests: SOP schedule, normalization, fit and closed loop.
+"""quadratic_thrust_model_manual.md §2/§3/§4 pipeline tests: SOP schedule, normalization, fit and closed loop.
 
 Pure Python (numpy only): exercises scripts/propulsion_model.py and the SOP helpers of
 scripts/thrust_test_node.py against the synthetic physical plant in propulsion_plant.py.

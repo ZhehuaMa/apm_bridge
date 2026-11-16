@@ -3,21 +3,21 @@ custom_link_bridge:
     gravity_const: 9.8065
     mass: 1.067
 
-    lipo_cells: 6   # V_ref = cells*3.7 (6S 22.20 V), 欠压下限 = cells*2.0 (6S 12.0 V)
-    # 整包容量 (mAh)。/mavros/battery 的 charge/percentage 与 OSD 用量条依据，
-    # 按实际电池修改；0 = 未知 (percentage 发布 NaN)。
+    # 电池: 串数与整包容量。cells 决定 V_ref = cells*3.7 (6S 22.20 V) 与
+    # 欠压下限 = cells*2.0 (6S 12.0 V); capacity_mah (mAh) 是 /mavros/battery 的
+    # charge/percentage 与 OSD 用量条依据, 按实际电池修改; 0 = 未知 (percentage 发布 NaN)。
     battery:
+      cells: 6
       capacity_mah: 1800.0
-    # fpv_test.md §4: 步骤 3 电压/电流补偿 与 步骤 1 气压/温度折算
+    # quadratic_thrust_model_manual.md §4: 步骤 3 电压/电流补偿 与 步骤 1 气压/温度折算
     voltage_compensation: true
     baro_compensation: true
-    voltage_lpf_hz: 3.0   # 母线电压/电流一阶低通截止频率, 文档要求 2~5 Hz
 
     channel_trigger: 9 # CH10 / AUX6 zero-based MISSION trigger channel
 
-    # fpv_test.md 推力模型 (标准状态 V_ref/0°C/101325 Pa, u = DShot 占空比, 总推力 N):
+    # quadratic_thrust_model_manual.md 推力模型 (标准状态 V_ref/0°C/101325 Pa, u = DShot 占空比, 总推力 N):
     #   F_std(u) = a3*u^3 + a2*u^2 + a1*u
-    # 需按 fpv_test.md §2 台架实验重新标定 (thrust_test_node), 结果 YAML 中的整段粘贴到此。
+    # 需按 quadratic_thrust_model_manual.md §2 台架实验重新标定 (thrust_test_node), 结果 YAML 中的整段粘贴到此。
     # a3..a1 全零 = 未标定: 节点拒绝 /fpv/control_command 力指令, 只允许 raw 油门。
     # §4 步骤 4 的怠速下限 u_idle 不是参数: 链路建立后由飞控 CLI "get motor_idle" 读取
     # (550 = 5.5% 占空比, 即集体油门 0), 读到之前同样拒绝力指令。
@@ -96,6 +96,8 @@ custom_link_bridge:
       throttle_ramp_up_s: 1.0    # 0→100% 满量程加速斜坡时间 (s)。1.0 @100Hz 即每 10ms 最多 +1% 油门
       throttle_ramp_down_s: 0.5  # 100%→0 减速斜坡时间 (s), 缺省比加速快一倍 (转子自然减速更快)
       throttle_ema_window: 5    # EMA 平滑窗口 (控制周期样本数, α=2/(N+1)); 10@100Hz 时间常数约 45ms; <2 不平滑
+      # 母线电压/电流一阶低通截止频率 (quadratic_thrust_model_manual.md §4 要求 2~5 Hz), 推力补偿消费
+      voltage_lpf_hz: 3.0
       sync_rate: 1.0        # 四时间戳对时频率
       diag_rate: 0.2        # 链路诊断日志频率
 

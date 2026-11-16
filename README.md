@@ -696,10 +696,10 @@ hardware compass preset. See the Betaflight checkout's
 `src/test/sitl/airsim_compass.cfg` and `airsim_odom_hold_test.py` for native
 POS HOLD/ALT HOLD truth-versus-odometry validation.
 
-## Propulsion model (fpv_test.md)
+## Propulsion model (quadratic_thrust_model_manual.md)
 
 Collective force commands (`~/control_command`, `collective_thrust · mass` = F_req)
-are converted to throttle exactly as fpv_test.md §4 specifies, in
+are converted to throttle exactly as quadratic_thrust_model_manual.md §4 specifies, in
 [`quadratic_thrust_model.h`](include/quadratic_thrust_model.h) (Python mirror and
 §3 fitting pipeline: [`scripts/propulsion_model.py`](scripts/propulsion_model.py)):
 
@@ -756,7 +756,7 @@ or `u_idle`/`motor_idle`, which come from the FC) is rejected at startup. With a
 `~/control_command_raw` still works, which is what the calibration tools use.
 Non-finite `collective_thrust` or body rates are dropped as well.
 
-## Bench thrust test (fpv_test.md §2–§3)
+## Bench thrust test (quadratic_thrust_model_manual.md §2–§3)
 
 `thrust_test_node` runs the whole-craft pull test on a load cell and fits the
 model above. **The shipped hardware parameters are uncalibrated placeholders:
@@ -848,7 +848,8 @@ The shipped [sitl_parameters.yaml](parameters/sitl_parameters.yaml) model comes
 from 42 steady-state FC samples measured in the AirSim/UE simulation on
 2026-10-10 (seven collective levels 0.08–0.50, two repeats;
 `parameters/sitl_motor_calibration.csv`), fitted
-with the fpv_test.md model over the duty `u = 0.055 + 0.945·collective`
+with the [quadratic_thrust_model_manual](doc/quadratic_thrust_model_manual.md)
+model over the duty `u = 0.055 + 0.945·collective`
 (SITL `motor_idle` 550; new `--collect` runs read it via `/fpv/cli` and record it
 in the CSV `u_idle` column, which `--fit` uses):
 
@@ -903,7 +904,7 @@ against the running node and rejects other control publishers.
 ### Tests
 
 `colcon test` covers the model: `quadratic_thrust_model_test` (C++ runtime,
-including agreement with the fpv_test.md §5 reference C code and a closed-loop
+including agreement with the quadratic_thrust_model_manual.md §5 reference C code and a closed-loop
 check on a physical plant), `thrust_model_test` (Python mirror),
 `thrust_test_fit_test` (SOP schedule, §3 pipeline, closed loop < 1 % thrust
 error) and `sitl_bridge_test`. End-to-end runs against a sourced workspace:

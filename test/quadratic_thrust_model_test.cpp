@@ -1,4 +1,4 @@
-// fpv_test.md §4 runtime inference tests for quadratic_thrust_model.h.
+// quadratic_thrust_model_manual.md §4 runtime inference tests for quadratic_thrust_model.h.
 #include "quadratic_thrust_model.h"
 
 #include <cmath>
@@ -19,7 +19,7 @@ namespace
             throw std::runtime_error(message);
     }
 
-    // ---- fpv_test.md §5 C reference implementation, transcribed verbatim as the oracle ----
+    // ---- quadratic_thrust_model_manual.md §5 C reference implementation, transcribed verbatim as the oracle ----
     namespace doc
     {
         typedef struct {
@@ -120,7 +120,7 @@ namespace
                             &ref, static_cast<float>(f), static_cast<float>(t_c), static_cast<float>(p_pa),
                             static_cast<float>(v));
                         const double actual = calculateThrottle(m, f, environmentFactor(p_pa, t_c), v);
-                        require(std::abs(actual - expected) < 5e-4, "differs from fpv_test.md section 5 code");
+                        require(std::abs(actual - expected) < 5e-4, "differs from quadratic_thrust_model_manual.md section 5 code");
                     }
     }
 
@@ -318,7 +318,7 @@ namespace
 
     void closed_loop_on_plant()
     {
-        // Coefficients from the fpv_test.md section 3 pipeline (propulsion_model.calibrate) on
+        // Coefficients from the quadratic_thrust_model_manual.md section 3 pipeline (propulsion_model.calibrate) on
         // 20 bench points of the same plant at 85 kPa / 30 degC (see thrust_test_fit_test.py).
         const auto m = make(-15.852827148889013, 79.76953283285637, 0.9908208740299711,
                             0.029999999999998896, 1.507596558355762);

@@ -55,12 +55,12 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     // ---------------- 参数 ----------------
     this->declare_parameter<double>("gravity_const", 9.80665);
     this->declare_parameter<double>("mass", 2.0);
-    this->declare_parameter<int>("lipo_cells", 6);
+    this->declare_parameter<int>("battery.cells", 6); // V_ref = cells*3.7, 欠压下限 = cells*2.0
     this->declare_parameter<double>("battery.capacity_mah", 13000.0); // 整包容量
     this->declare_parameter<int>("channel_trigger", 6);
     this->declare_parameter<bool>("voltage_compensation", false);
     this->declare_parameter<bool>("baro_compensation", true);
-    // fpv_test.md 模型 F_std(u) = a3·u³ + a2·u² + a1·u (u = DShot 占空比), thrust_test_node 标定
+    // quadratic_thrust_model_manual.md 模型 F_std(u) = a3·u³ + a2·u² + a1·u (u = DShot 占空比), thrust_test_node 标定
     this->declare_parameter<double>("motor_parameters.a3", 0.0);
     this->declare_parameter<double>("motor_parameters.a2", 0.0);
     this->declare_parameter<double>("motor_parameters.a1", 0.0);
@@ -71,7 +71,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->declare_parameter<double>("motor_parameters.k_i3", 0.0);
     // 动力系统最大集体油门保护 [0.0, 1.0]; 1.0 = 不限制 (见 pushControl 输出端限幅)
     this->declare_parameter<double>("motor_parameters.throttle_limit", 1.0);
-    this->declare_parameter<double>("voltage_lpf_hz", 3.0);
+    this->declare_parameter<double>("link.voltage_lpf_hz", 3.0);
     airsim_enabled = this->declare_parameter<bool>("airsim.enabled", false);
 
     this->declare_parameter<std::string>("link.transport", "serial"); // serial | tcp
@@ -104,7 +104,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
 
     this->get_parameter("gravity_const", gravity);
     this->get_parameter("mass", mass);
-    this->get_parameter("lipo_cells", n_lipo_cells);
+    this->get_parameter("battery.cells", n_lipo_cells);
     this->get_parameter("battery.capacity_mah", battery_capacity_mah);
     this->get_parameter("channel_trigger", channel_trigger);
     this->get_parameter("voltage_compensation", voltage_compensation);
@@ -113,7 +113,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("cli.timeout_s", cli_timeout);
     this->get_parameter("cli.bind_rx_on_connect", cli_bind_rx_on_connect);
 
-    // 旧版 A..D/spin_k/vbat 模型已按 fpv_test.md 重建, 键名不兼容: 显式拒绝, 避免
+    // 旧版 A..D/spin_k/vbat 模型已按 quadratic_thrust_model_manual.md 重建, 键名不兼容: 显式拒绝, 避免
     // 旧参数文件被静默忽略后以未标定模型运行。u_idle 不再是参数: 链路建立后由飞控
     // CLI "get motor_idle" 读取 (与飞控实际怠速一致)。
     static const std::set<std::string> kModelKeys{
@@ -128,9 +128,14 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
                                         "': u_idle is read from the FC (CLI get motor_idle); remove it");
         if (name.rfind("motor_parameters.", 0) == 0 && !kModelKeys.count(name))
             throw std::invalid_argument("Unsupported parameter '" + name +
-                                        "': motor_parameters now follow fpv_test.md "
+                                        "': motor_parameters now follow quadratic_thrust_model_manual.md "
                                         "(a3, a2, a1, r_eq, k_i, k_i2, k_i3); "
                                         "recalibrate with thrust_test_node");
+        // 2026-11-16 改名: 旧扁平键显式拒绝, 避免 stale YAML 静默回落默认值
+        if (name == "lipo_cells")
+            throw std::invalid_argument("Unsupported parameter 'lipo_cells': renamed to 'battery.cells'");
+        if (name == "voltage_lpf_hz")
+            throw std::invalid_argument("Unsupported parameter 'voltage_lpf_hz': renamed to 'link.voltage_lpf_hz'");
     }
     this->get_parameter("motor_parameters.a3", propulsion.a3);
     this->get_parameter("motor_parameters.a2", propulsion.a2);
@@ -140,7 +145,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     this->get_parameter("motor_parameters.k_i2", propulsion.k_i2);
     this->get_parameter("motor_parameters.k_i3", propulsion.k_i3);
     this->get_parameter("motor_parameters.throttle_limit", propulsion.throttle_limit);
-    this->get_parameter("voltage_lpf_hz", voltage_lpf_hz);
+    this->get_parameter("link.voltage_lpf_hz", voltage_lpf_hz);
     propulsion.v_ref = n_lipo_cells * kBatteryNominalVoltagePerCell;     // 6S: 22.20 V
     propulsion.v_min = n_lipo_cells * kBatteryUndervoltagePerCell;       // 6S: 12.0 V
     // 油门保护限幅域 = 集体油门 [0, 1] (u_idle 对应 0, 1 = 满占空比)。
@@ -187,7 +192,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
          !std::isfinite(control_timeout) || control_timeout <= 0))
         throw std::invalid_argument("Invalid SITL mass, gravity or timeout");
     if (!std::isfinite(voltage_lpf_hz) || voltage_lpf_hz < 2.0 || voltage_lpf_hz > 5.0)
-        throw std::invalid_argument("voltage_lpf_hz must be within 2..5 Hz (fpv_test.md section 4)");
+        throw std::invalid_argument("link.voltage_lpf_hz must be within 2..5 Hz (quadratic_thrust_model_manual.md section 4)");
     // a3..a1 全零 = 未标定: 只允许 raw 油门通道 (台架标定工具即走 raw); 已标定模型须
     // 通过 §3.2 合法性校验。曲线判据 (dF/du > 0 on [u_idle,1]) 的窗口依赖 FC
     // motor_idle, 此刻 u_idle 只是占位值: 只硬性校验与 u_idle 无关的部分, 曲线判据
@@ -228,7 +233,7 @@ CustomLinkVehicleNode::CustomLinkVehicleNode()
     state_pub = this->create_publisher<mavros_msgs::msg::State>("/mavros/state", 10);
     ext_state_pub = this->create_publisher<mavros_msgs::msg::ExtendedState>("/mavros/extended_state", 10);
     battery_pub = this->create_publisher<sensor_msgs::msg::BatteryState>("/mavros/battery", 10);
-    // 环境气压/温度 (0x11 携带)：对外统一 /fpv 话题，供台架标定工具做 fpv_test.md §3.1 环境归一化
+    // 环境气压/温度 (0x11 携带)：对外统一 /fpv 话题，供台架标定工具做 quadratic_thrust_model_manual.md §3.1 环境归一化
     pressure_pub = this->create_publisher<sensor_msgs::msg::FluidPressure>(
         "/fpv/static_pressure", rclcpp::QoS(rclcpp::KeepLast(10)).best_effort());
     temperature_pub = this->create_publisher<sensor_msgs::msg::Temperature>(
@@ -1581,7 +1586,7 @@ void CustomLinkVehicleNode::scheduleIdleQuery(std::chrono::steady_clock::time_po
 
 bool CustomLinkVehicleNode::queryMotorIdle()
 {
-    // fpv_test.md §4 步骤 4 的 u_idle 即飞控 motor_idle: 集体油门 0 对应的 DShot 占空比
+    // quadratic_thrust_model_manual.md §4 步骤 4 的 u_idle 即飞控 motor_idle: 集体油门 0 对应的 DShot 占空比
     // u = u_idle + (1 - u_idle)·c, 只有读到它才能把反解出的占空比换回集体油门。
     if (!client)
         return false;

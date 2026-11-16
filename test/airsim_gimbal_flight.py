@@ -190,7 +190,7 @@ class FlightObserver(Node):
                     return
             rates = np.clip([4 * (roll_goal - roll), 4 * (pitch_goal - pitch),
                              3 * math.atan2(math.sin(yaw_goal - yaw), math.cos(yaw_goal - yaw))], -.5, .5)
-            rotor_hover = self.model.throttle(2.0 * 9.80665)  # hover DShot duty (fpv_test.md model)
+            rotor_hover = self.model.throttle(2.0 * 9.80665)  # hover DShot duty (quadratic_thrust_model_manual.md model)
             tilt = max(.7, math.cos(roll) * math.cos(pitch))
             idle = self.model.u_idle
             throttle = (rotor_hover / tilt - idle) / (1 - idle) + rotor_hover / .587 * (
