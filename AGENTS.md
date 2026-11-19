@@ -1,11 +1,15 @@
-# apm_bridge repository instructions
+# apm_bridge Project Conventions
 
-- Use C++17 and ROS 2 Humble. Read `AGENTS.local.md` and the parent workspace's local instructions before building.
-- Treat this repository as the ROS bridge for Betaflight custom-link telemetry, flight control and gimbal control. Shared ROS message definitions belong to the adjacent `quadrotor_msgs` repository.
-- Follow [doc/build-and-test.md](doc/build-and-test.md) for current images, toolchains, commands and test prerequisites. Use its supported default image unless another documented build mode is explicitly selected. Determine output architecture from the compiler and toolchain; container architecture does not restrict the target. Keep native builds, cross-compilation and emulation distinct.
-- Build the real adjacent `quadrotor_msgs` source for the same target before this package. `dist/` runtime files are not a development dependency. Do not copy generated message headers or shared libraries into this repository.
-- Mount source read-only and keep build/install/log directories outside source. Keep output architectures and image caches separate.
-- After C++, CMake or dependency changes, build `custom_link_bridge_node`, `gimbal_selftest` and the test executables with `BUILD_TESTING=ON` using the build guide. Discover and run all tests registered with CTest, CMake's test runner, for the selected configuration. Run the additional regressions required by the guide. Compilation or zero discovered tests is not a test pass. Run applicable firmware, time-sync and device checks separately, and report unavailable prerequisites.
-- Keep Betaflight firmware and Cosys-AirSim external. For optional AirSim camera RPC (remote procedure calls), build the real Cosys-AirSim rpclib sources with the selected ROS toolchain. Keep camera RPC dependencies separate from the serial and TCP custom-link transports; consult the build guide and CMake options for configuration.
-- Preserve launch remappings for private `~/control_command`, `~/control_command_raw`, `~/arm`, `~/offboard` and `~/low_level_feedback` topics. Distinguish class defaults from hardware YAML and SITL (software-in-the-loop firmware simulation) YAML overrides when documenting behavior.
-- Physical Betaflight/custom-link and gimbal acceptance requires the actual devices. See [doc/production-deployment.md](doc/production-deployment.md). Report host tests, emulated execution, firmware simulation and physical acceptance separately. Preserve dated board evidence in its original context.
+Read [AGENTS.local.md](AGENTS.local.md) if present before building or running device checks.
+
+## Repository boundaries
+
+- Make shared ROS message and service definition changes in `quadrotor_msgs`. Keep generated interface headers and libraries out of version control. Make Betaflight firmware and Cosys-AirSim changes in their owning repositories.
+- Keep the optional AirSim camera API dependency separate from the serial and TCP custom-link transports.
+- Preserve the five private-to-`/fpv` topic remappings across hardware launch, firmware simulation (SITL) launch and deployment. When documenting parameter behavior, distinguish node defaults from hardware YAML and SITL YAML overrides.
+
+## Verification
+
+- Follow the supported default workflow in the [build and test guide](doc/build-and-test.md) unless a different documented build mode is explicitly selected. Keep outputs and caches separate by build mode and target architecture.
+- After C++, CMake or dependency changes, build `custom_link_bridge_node`, `gimbal_selftest` and the test targets with `BUILD_TESTING=ON`. Discover and run all CTest groups registered by the selected configuration and the additional regressions in the build guide.
+- Report host tests, emulated execution, firmware simulation, serial time-sync checks and physical acceptance separately when applicable. Identify missing prerequisites for checks you could not run. Follow the [production deployment guide](doc/production-deployment.md) for board checks and preserve its dated evidence in the original deployment context.

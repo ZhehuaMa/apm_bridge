@@ -6,6 +6,7 @@
 *.swp
 *sdk.launch
 build.sh
+AGENTS.local.md
 .idea/
 .vscode/
 .claude/
